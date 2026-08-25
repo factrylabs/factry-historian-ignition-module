@@ -16,7 +16,7 @@ plugins {
 
 val sdk_version by extra("8.3.3")
 
-val majorMinor = "1.0"
+val majorMinor = "0.1"
 
 val buildNumberFile = file("build-number.txt")
 val buildNumber = if (buildNumberFile.exists()) {
@@ -115,11 +115,9 @@ ignitionModule {
      * assembled module, and specify the path to the index.html file inside that folder. In this commented-out
      * example, the html files being collected are located in the module root project in `src/docs/`
      */
-    // the files to collect into the documentation dir, with example implementation
-    // documentationFiles.from(project.file("src/docs/"))
-
-    /* The path from the root documentation dir to the index file, or filename if in the root doc dir. */
-    // documentationIndex.set("index.html")
+    documentationFiles.from(project.file("src/docs/"))
+    documentationIndex.set("license.html")
+    license.set("src/docs/license.html")
 
     /*
      * Optional unsigned modl settings. If true, modl signing will be skipped. This is not for production and should
@@ -136,25 +134,33 @@ tasks.register("printVersion") {
     }
 }
 
-// Deploy tasks — copy module to Ignition and restart the container
+// Deploy tasks — copy module to both Ignition instances and restart them
 val ignitionModlDir = file("ignition/data/var/ignition/modl")
+val ignitionRemoteModlDir = file("ignition-remote/data/var/ignition/modl")
 
-// register<Copy> means it is a copy operation, 'from' 'into' 'rename' are the paramters 
 tasks.register<Copy>("copy") {
     group = "deploy"
-    description = "Copy the built module to the Ignition modules directory"
+    description = "Copy the built module to both Ignition modules directories"
     dependsOn("build")
     from(layout.buildDirectory.file("Factry-Historian.modl"))
     into(ignitionModlDir)
     rename { "Factry-Historian.modl" }
 }
 
-// register<Exec> means it is an execution operantion, 'commandLine' is the parameter for the command to execute  
+tasks.register<Copy>("copyRemote") {
+    group = "deploy"
+    description = "Copy the built module to the remote Ignition modules directory"
+    dependsOn("build")
+    from(layout.buildDirectory.file("Factry-Historian.modl"))
+    into(ignitionRemoteModlDir)
+    rename { "Factry-Historian.modl" }
+}
+
 tasks.register<Exec>("restart") {
     group = "deploy"
-    description = "Restart the Ignition Docker container"
-    dependsOn("copy")
-    commandLine("docker", "compose", "restart", "ignition")
+    description = "Restart both Ignition Docker containers"
+    dependsOn("copy", "copyRemote")
+    commandLine("docker", "compose", "restart", "ignition", "ignition-remote")
 }
 
 // Integration tests — delegates to the gateway subproject

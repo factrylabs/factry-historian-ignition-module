@@ -7,7 +7,6 @@
 ## Architecture
 - [Introduction](intro.md) — Few words about Ignition, modules and sdk
 - [Design](design.md) — Guided tour through the codebase, organized by category
-- [Components and Data Flow](data_flow.md) — Low level explanation of the SDK and inheritance
 
 ## Development
 - [Gradle Commands](gradlew_commands.md) — Build, test, and deploy commands

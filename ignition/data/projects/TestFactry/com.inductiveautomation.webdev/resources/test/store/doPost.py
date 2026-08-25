@@ -20,7 +20,15 @@ def doPost(request, session):
 		for t in range(num_timestamps):
 			row = []
 			for tag in range(num_tags):
-				row.append(raw_values[tag][t])
+				v = raw_values[tag][t]
+				if isinstance(v, float):
+					row.append(float(v))
+				elif isinstance(v, (int, long)):
+					row.append(int(v))
+				elif isinstance(v, bool):
+					row.append(bool(v))
+				else:
+					row.append(str(v))
 			values.append(row)
 
 		dates = [system.date.fromMillis(long(ts)) for ts in data['timestamps']]

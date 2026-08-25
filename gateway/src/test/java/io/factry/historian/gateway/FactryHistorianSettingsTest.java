@@ -12,8 +12,6 @@ class FactryHistorianSettingsTest {
         s.setCollectorName("Ignition");
         s.setGrpcHost("historian.example.com");
         s.setGrpcPort(8001);
-        s.setBatchSize(100);
-        s.setBatchIntervalMs(5000);
         return s;
     }
 
@@ -110,51 +108,20 @@ class FactryHistorianSettingsTest {
         assertDoesNotThrow(s::validate);
     }
 
-    // --- batchSize ---
+    // --- custom CA certificate ---
 
     @Test
-    void validate_batchSizeZero() {
+    void validate_blankCustomCaCert_ok() {
         FactryHistorianSettings s = validSettings();
-        s.setBatchSize(0);
-        IllegalArgumentException e = assertThrows(IllegalArgumentException.class, s::validate);
-        assertTrue(e.getMessage().contains("Batch size"));
-    }
-
-    @Test
-    void validate_batchSizeNegative() {
-        FactryHistorianSettings s = validSettings();
-        s.setBatchSize(-10);
-        assertThrows(IllegalArgumentException.class, s::validate);
-    }
-
-    @Test
-    void validate_batchSizeOne() {
-        FactryHistorianSettings s = validSettings();
-        s.setBatchSize(1);
+        s.setCustomCaCert("");
         assertDoesNotThrow(s::validate);
     }
 
-    // --- batchIntervalMs ---
-
     @Test
-    void validate_batchIntervalTooLow() {
+    void validate_invalidCustomCaCert_fails() {
         FactryHistorianSettings s = validSettings();
-        s.setBatchIntervalMs(50);
+        s.setCustomCaCert("-----BEGIN CERTIFICATE-----\nnot base64\n-----END CERTIFICATE-----");
         IllegalArgumentException e = assertThrows(IllegalArgumentException.class, s::validate);
-        assertTrue(e.getMessage().contains("Batch interval"));
-    }
-
-    @Test
-    void validate_batchIntervalZero() {
-        FactryHistorianSettings s = validSettings();
-        s.setBatchIntervalMs(0);
-        assertThrows(IllegalArgumentException.class, s::validate);
-    }
-
-    @Test
-    void validate_batchIntervalMinimum() {
-        FactryHistorianSettings s = validSettings();
-        s.setBatchIntervalMs(100);
-        assertDoesNotThrow(s::validate);
+        assertTrue(e.getMessage().toLowerCase().contains("custom ca certificate"), e.getMessage());
     }
 }

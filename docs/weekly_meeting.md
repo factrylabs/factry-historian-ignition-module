@@ -243,14 +243,145 @@ Next is prepare for version 1.0:
 Meeting at Factry office.
 
 Plan:
-  - test with only downloading the module and installing Ignition
+  + create factry own certificate and add to the cicd
+  + test with only downloading the module and installing Ignition
+  
 
-  - Make Demo working on on Wannes's computer
+  - Make Demo working on on Wannes's computer (running docker compose)
   - Tests:
       - manual
       - automated tests
-  - Doc/Code Review
-  - Making follow-up list
+  + Doc/Code Review
+  + Making follow-up list
+
+Follow-ups:
+  - Wannes: make licence html
+  - Gabor: add suggested values for batch_size 10 and batch interval 5000
+  - Gabor: ignition projects didn't appear
+  - running integrationTest need to be smoother, some failed
+
+  - two ignitions with two different collectors  ( same collector doesn't define unique name: coll1/default/var1 can come form two different ignition)
+  - two ignitions, one with factry historian, one with remote historian
+  - more integrationTest, more unitTest
+  - automatize the setup for integration test. 
+------
+# 8/05/2026
+ 
+Changes:
+  + Gabor: add suggested values for batch_size 10 and batch interval 5000 on the **config**
+  + I added an **numeric array tag** to the tag browser and populated it using the script console, it appeared in historian but as a separate measurement for each index (see screenshot array-test.png)
+  + strange numbers in the metrics logs in ignition << **removed** this was for debugging
+  + warnig for the token, solved with **@NonSecret**
+  + assets in powerchart tag browser in power chart d
+  + docker-compose.yaml
+      JWT_SECRET: "factry-dev-secret-do-not-use-in-production" 
+
+Question: 
+  - the collector token only gives access to its own measurements  
+     I don't get back all the other collectors
+
+  - Wannes: make licence html  
+  - CONTENT NOT FOUND:  https://docs.factry.io/installing-factry-historian-using-docker#installing-your-first-collector
+  
+  https://docs.factry.io/installing-factry-historian-using-docker-for-testing-purposes
+  - What![alt text](image.png)
+     Wannes: collector has to call RegisterCollector to move the from status Initial <br/>
+     grpcClient.registerCollector is called, what is still missing. 
+
+  - new idea: create the store&forward engine automatic, always use it
+     right now: - create db 
+                - every db can be used as store and forward engine
+                - explicitely use it
+
+  - when parsing points return from the historian it looks like you always set quality to Good, the Status we return on a point could potentially be used for this (statusToQuality function in FactryQueryEngine does not seem to be used)   
+
+Still:
+  - easier setup: combination of scripts and manual step 
+  - more tests: both manual and automated      
+  - two ignitions with two different collectors  ( same collector doesn't define unique name: coll1/default/var1 can come form two different ignition)
+  - two ignitions, one with factry historian, one with remote historian   
+
+# 18/05/2026
+
+Solved:
+
+  [+] use GetMeasurementByFilter to get all the measurements of different collectors
+
+  [+] create the store&forward engine automatic
+  
+  [+] FactryQueryEngine query grouped by the status=good << let's plot only the good quality data   
+  
+  [+] array through the store&forward
 
 
+Pending:
 
+  [] licence html  
+  
+  [] grpcClient.registerCollector (no correct effect)
+  
+  [] Collector names (we use collector's uid )
+  
+  [] getMeasurementsByFilter returns with  100 results, suspecious
+
+goal: feature freeze   
+
+# 28/05/2026
+
+Done:
+
+  [+] Collector names (we use collector's uid )
+  [+] pagination for getMeasurementsByFilter
+  [+] test with realfakedata
+
+Questions:
+  
+  - Measurement.collectorUUID isn;t populated by Factry
+    collectorUUID='' for all measuremens
+  - licence html  < add placeholder
+  
+  - remove 'hack' to use historian when the host is localhost
+
+# 01/06/2026
+
++ remove 'hack' to use historian when the host is localhost
++ licence html  < add placeholder
+
+- Measurement.collectorUUID isn;t populated by Factry
+    collectorUUID='' for all measuremens
+
+
+# 08/06/2026
++ Measurement.collectorUUID isn;t populated by Factry
+    collectorUUID='' for all measurements
++ Create a label in ignition designer and assign the value of a factry historian
+
+remark:
+  - failed to make a calculation in Factry
+  - Factry accepting the data even without the setup wizard completed? 
+  - still testing the remote factry historian and cases when factry is down
+
+# 15/06/2026
+
+done:  
+  + flat list for external 
+  + factry is down tested: the store and forward should go to 'storage only', data goes to 'pending' list
+  + manual test: all good
+
+remarks:
+  - not decided when 6000+ measurements:
+     Measurement 1-100
+     Measurement 101-200
+     Measurement 201-300 
+  - new: the delimiter on the settings page is still coming
+  - tweak: create historian dialog:/replace token to the good, still we have to wait sometimes 20 second 
+  - tweak: check the default values if they work with the new release 8.3.6
+  - development environment auto setup is a bit out of scope, but it could be useful for testing new versions of Factry / Ignition 
+  
+# 22/06/2026  
+done:
+  + the delimiter on the settings page is still coming
+  + tweak: create historian dialog:/replace token to the good, still we have to wait sometimes 20 second 
+
+remark:
+  - default values still don't work with new release 8.3.6

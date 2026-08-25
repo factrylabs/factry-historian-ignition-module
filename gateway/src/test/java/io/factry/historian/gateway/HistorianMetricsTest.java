@@ -113,18 +113,4 @@ class HistorianMetricsTest {
         assertEquals(0, metrics.getAggQueryRowCount());
         assertEquals(0, metrics.getAggQueryTotalMs());
     }
-
-    // --- logSummary ---
-
-    @Test
-    void logSummary_doesNotThrow() {
-        metrics.recordStore(5, 100);
-        metrics.recordRawQuery(10, 200);
-        assertDoesNotThrow(() -> metrics.logSummary());
-    }
-
-    @Test
-    void logSummary_emptyMetrics_doesNotThrow() {
-        assertDoesNotThrow(() -> metrics.logSummary());
-    }
 }

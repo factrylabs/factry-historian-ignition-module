@@ -9,20 +9,22 @@ public class FactryHistorianSettings implements HistorianSettings {
 
     private String collectorUUID = "";
     private String collectorName = "";
-    private int batchSize = 100;
-    private int batchIntervalMs = 5000;
-    private String grpcHost = "localhost";
-    private int grpcPort = 9876;
+    private static final String DEFAULT_GRPC_HOST = "localhost";
+    private static final int DEFAULT_GRPC_PORT = 9876;
+    private String grpcHost = DEFAULT_GRPC_HOST;
+    private int grpcPort = DEFAULT_GRPC_PORT;
     private boolean debugLogging = false;
     private boolean useTls = false;
     private boolean skipTlsVerification = false;
     private String token = "";
-
-    /**
-     * Name of the Store & Forward engine to use for buffering.
-     * If empty, S&F is disabled and writes go directly to the gRPC server.
-     */
-    private String storeAndForwardEngine = "";
+    // Optional PEM-encoded CA certificate(s) to trust in addition to the system and bundled
+    // Factry CAs — for Historians fronted by an internal/enterprise CA or a self-signed cert.
+    private String customCaCert = "";
+    // Tag-path delimiter for tree-view splitting in the browser/Power Chart.
+    // Default is empty (flat list). An Ignition 8.3 bug prevents defaultSettings()
+    // from pre-filling the create form, so a blank field must mean what it shows —
+    // flat — rather than silently falling back to "/" (tree). Set "/" for a tree.
+    private String delimiter = "";
 
     public FactryHistorianSettings() {
     }
@@ -41,22 +43,6 @@ public class FactryHistorianSettings implements HistorianSettings {
 
     public void setCollectorName(String collectorName) {
         this.collectorName = collectorName;
-    }
-
-    public int getBatchSize() {
-        return batchSize;
-    }
-
-    public void setBatchSize(int batchSize) {
-        this.batchSize = batchSize;
-    }
-
-    public int getBatchIntervalMs() {
-        return batchIntervalMs;
-    }
-
-    public void setBatchIntervalMs(int batchIntervalMs) {
-        this.batchIntervalMs = batchIntervalMs;
     }
 
     public String getGrpcHost() {
@@ -107,12 +93,20 @@ public class FactryHistorianSettings implements HistorianSettings {
         this.token = token;
     }
 
-    public String getStoreAndForwardEngine() {
-        return storeAndForwardEngine;
+    public String getDelimiter() {
+        return delimiter;
     }
 
-    public void setStoreAndForwardEngine(String storeAndForwardEngine) {
-        this.storeAndForwardEngine = storeAndForwardEngine;
+    public void setDelimiter(String delimiter) {
+        this.delimiter = delimiter;
+    }
+
+    public String getCustomCaCert() {
+        return customCaCert;
+    }
+
+    public void setCustomCaCert(String customCaCert) {
+        this.customCaCert = customCaCert;
     }
 
     /**
@@ -136,13 +130,24 @@ public class FactryHistorianSettings implements HistorianSettings {
                 .orElseThrow(() -> new IllegalArgumentException(
                         "Invalid token: missing collector name. Ensure this is a Factry collector token."));
 
-        this.grpcHost = JwtTokenParser.getHost(payload)
+        // Only apply host/port from token if config still has defaults.
+        String tokenHost = JwtTokenParser.getHost(payload)
                 .orElseThrow(() -> new IllegalArgumentException(
                         "Invalid token: missing host (aud claim). Ensure this is a Factry collector token."));
+        if (DEFAULT_GRPC_HOST.equals(this.grpcHost)) {
+            this.grpcHost = tokenHost;
+        } else {
+            logger.info("Config grpcHost '{}' overrides token host '{}'", this.grpcHost, tokenHost);
+        }
 
-        this.grpcPort = JwtTokenParser.getGrpcPort(payload)
+        int tokenPort = JwtTokenParser.getGrpcPort(payload)
                 .orElseThrow(() -> new IllegalArgumentException(
                         "Invalid token: missing or invalid gRPC port. Ensure this is a Factry collector token."));
+        if (DEFAULT_GRPC_PORT == this.grpcPort) {
+            this.grpcPort = tokenPort;
+        } else {
+            logger.info("Config grpcPort '{}' overrides token port '{}'", this.grpcPort, tokenPort);
+        }
 
         logger.info("Extracted from token: collectorName={}, collectorUUID={}, host={}, port={}",
                 collectorName, collectorUUID, grpcHost, grpcPort);
@@ -165,12 +170,9 @@ public class FactryHistorianSettings implements HistorianSettings {
         if (grpcPort < 1 || grpcPort > 65535) {
             throw new IllegalArgumentException("Port must be between 1 and 65535");
         }
-        if (batchSize < 1) {
-            throw new IllegalArgumentException("Batch size must be at least 1");
-        }
-        if (batchIntervalMs < 100) {
-            throw new IllegalArgumentException("Batch interval must be at least 100 ms");
-        }
+        // Surface a bad custom CA certificate at save time rather than as an opaque TLS
+        // handshake failure later. Throws IllegalArgumentException with a clear message.
+        FactryGrpcClient.parseCaCertificates(customCaCert);
     }
 
     @Override
@@ -180,12 +182,11 @@ public class FactryHistorianSettings implements HistorianSettings {
                 ", collectorUUID='" + collectorUUID + '\'' +
                 ", grpcHost='" + grpcHost + '\'' +
                 ", grpcPort=" + grpcPort +
-                ", batchSize=" + batchSize +
-                ", batchIntervalMs=" + batchIntervalMs +
                 ", debugLogging=" + debugLogging +
                 ", useTls=" + useTls +
                 ", skipTlsVerification=" + skipTlsVerification +
-                ", storeAndForwardEngine='" + storeAndForwardEngine + '\'' +
+                ", delimiter='" + delimiter + '\'' +
+                ", customCaCert='" + (customCaCert == null || customCaCert.isBlank() ? "" : "<set>") + '\'' +
                 '}';
     }
 }

@@ -95,22 +95,40 @@ tasks.register<Test>("integrationTest") {
     // Always re-run — integration tests depend on external services, not just code
     outputs.upToDateWhen { false }
 
-    // Pass system properties from Gradle command line (-P) or env vars
+    // Resolve the Factry collector token, in priority order:
+    //   1. COLLECTOR_TOKEN env var (explicit override)
+    //   2. script/.collector-token file (durable local token — survives UI reconfig,
+    //      which stores the historian token encrypted rather than in plaintext config)
+    //   3. the historian config created by setup-historians.sh
+    val historianConfigDir = file("../ignition/data/config/resources/core/com.inductiveautomation.historian/historian-provider")
+    val tokenFromConfig = findTokenFromHistorianConfig(historianConfigDir)
+    val tokenFile = rootProject.file("script/.collector-token")
+    val tokenFromFile = if (tokenFile.exists()) tokenFile.readText().trim() else ""
+    val resolvedToken = when {
+        !System.getenv("COLLECTOR_TOKEN").isNullOrBlank() -> System.getenv("COLLECTOR_TOKEN")
+        tokenFromFile.isNotBlank() -> tokenFromFile
+        else -> tokenFromConfig
+    }
+
     systemProperty("gateway.url", System.getenv("GATEWAY_URL") ?: "http://localhost:8089")
     systemProperty("webdev.project", System.getenv("WEBDEV_PROJECT") ?: "TestFactry")
-    systemProperty("historian.name", System.getenv("HISTORIAN_NAME") ?: "Factry Historian 1.0")
     systemProperty("grpc.host", System.getenv("GRPC_HOST") ?: "localhost")
     systemProperty("grpc.port", System.getenv("GRPC_PORT") ?: "8001")
-    systemProperty("collector.uuid", System.getenv("COLLECTOR_UUID") ?: "a16cac76-3272-11f1-b9ed-4a5934d93d4f")
-    systemProperty("collector.token", System.getenv("COLLECTOR_TOKEN") ?: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhdWQiOiJodHRwOi8vaGlzdG9yaWFuIiwiZXhwIjoyNTY0MDM2OTAzLCJncnBjLXBvcnQiOiI4MDAxIiwiaWF0IjoxNzc1NjM2OTAzLCJpc3MiOiJmYWN0cnkuaW8iLCJqdGkiOiJjb2xsZWN0b3ItYTE2Y2FjNzYtMzI3Mi0xMWYxLWI5ZWQtNGE1OTM0ZDkzZDRmIiwibmFtZSI6IkluZ2l0aW9uIiwib3JnYW5pemF0aW9uLXV1aWQiOiIxOTMwOTkyMC0zMjY5LTExZjEtYjkwYi04ZTMzMzdkZGM3MjgiLCJyZXN0LXBvcnQiOiI4MDAwIiwidXNlciI6eyJuYW1lIjoiY29sbGVjdG9yLWExNmNhYzc2LTMyNzItMTFmMS1iOWVkLTRhNTkzNGQ5M2Q0ZiIsInV1aWQiOiJhMTZjYWM3Ni0zMjcyLTExZjEtYjllZC00YTU5MzRkOTNkNGYifSwidXVpZCI6ImExNmNhYzc2LTMyNzItMTFmMS1iOWVkLTRhNTkzNGQ5M2Q0ZiJ9.8w_KLgd458TJsnhk8VkKIf1vOc8FUqOWhu5zAUdTHig")
-    systemProperty("gateway.system.name", System.getenv("GATEWAY_SYSTEM_NAME") ?: "Ignition-296a8ca4b6cd")
-    systemProperty("collector.name", System.getenv("COLLECTOR_NAME") ?: "Ingition")
-    systemProperty("historian.name.nosf", System.getenv("HISTORIAN_NAME_NOSF") ?: "")
-    systemProperty("historian.name.sf", System.getenv("HISTORIAN_NAME_SF") ?: "")
+    systemProperty("collector.token", resolvedToken)
+    systemProperty("gateway.system.name", System.getenv("GATEWAY_SYSTEM_NAME") ?: "Ignition-FactryTest")
+    systemProperty("collector.name", System.getenv("COLLECTOR_NAME") ?: "Ignition")
+    systemProperty("historian.name", System.getenv("HISTORIAN_NAME") ?: "Factry Historian")
 
     testLogging {
         events("passed", "skipped", "failed")
         showStandardStreams = true
+        afterSuite(KotlinClosure2<TestDescriptor, TestResult, Unit>({ desc, result ->
+            if (desc.parent == null) {
+                println("\nTest results: ${result.resultType} " +
+                    "(${result.testCount} tests, ${result.successfulTestCount} passed, " +
+                    "${result.failedTestCount} failed, ${result.skippedTestCount} skipped)")
+            }
+        }))
     }
 }
 
@@ -173,4 +191,23 @@ tasks.named<ProcessResources>("processResources") {
     filesMatching("version.properties") {
         expand("moduleVersion" to moduleVersion.get())
     }
+}
+
+/**
+ * Reads the collector token from the first Factry historian config found in the Ignition data folder.
+ * This avoids hardcoding tokens in the build file — the setup scripts create the config.
+ */
+fun findTokenFromHistorianConfig(configDir: File): String {
+    if (!configDir.exists()) return ""
+    configDir.listFiles()?.forEach { dir ->
+        val configFile = File(dir, "config.json")
+        if (configFile.exists()) {
+            val content = configFile.readText()
+            if (content.contains("\"factry-historian\"")) {
+                val match = Regex("\"token\"\\s*:\\s*\"([^\"]+)\"").find(content)
+                if (match != null) return match.groupValues[1]
+            }
+        }
+    }
+    return ""
 }

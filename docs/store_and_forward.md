@@ -72,7 +72,7 @@ The deadline can be adjusted via the `WRITE_DEADLINE_SECONDS` constant in `Factr
 
 ## Ignition S&F Engine Configuration
 
-Configure the S&F engine in the Ignition gateway at **Config → Store & Forward → Engines**.
+The module automatically creates a Store & Forward engine when the historian profile starts. The engine name matches the historian profile name. You can view and tune its settings in the Ignition gateway at **Config → Store & Forward → Engines**.
 
 ### Engine Settings
 
@@ -113,7 +113,7 @@ For typical deployments:
 - **Time Threshold**: `5000` (5 seconds) — flush to disk quickly to minimize data loss on crash
 - **Data Threshold**: `1000` — flush to disk before memory grows too large
 - **Maintenance Values**: `0` (unlimited) — avoid `PREVENT_NEW_DATA` dropping points during long outages
-- **S&F engine name**: Must match the value configured in the Factry Historian settings
+- **S&F engine name**: Created automatically by the module (matches the historian profile name)
 
 ## Monitoring
 

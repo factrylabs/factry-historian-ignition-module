@@ -40,22 +40,29 @@ def doPost(request, session):
 				"rows": rows
 			}}
 		elif hasattr(result, 'getResults'):
-			# Results object — iterate result items
+			# Results object — iterate result items. queryMetadata returns
+			# Results<MetadataPoint>; each item exposes source() (the path) and
+			# value() (a PropertySet of the metadata properties: engUnit, datatype,
+			# name, ...). Flatten each PropertySet into the row.
 			items = list(result.getResults())
 			rows = []
 			for item in items:
 				row = {}
-				if hasattr(item, 'getPath'):
+				if hasattr(item, 'source'):
+					row["path"] = str(item.source())
+				elif hasattr(item, 'getPath'):
 					row["path"] = str(item.getPath())
-				if hasattr(item, 'getType'):
-					row["type"] = str(item.getType())
-				if hasattr(item, 'hasChildren'):
-					row["hasChildren"] = item.hasChildren()
-				# Try to get display path
-				if hasattr(item, 'getDisplayPath'):
-					dp = item.getDisplayPath()
-					if dp is not None:
-						row["displayPath"] = str(dp)
+				ps = item.value() if hasattr(item, 'value') else None
+				if ps is not None:
+					for pv in ps:
+						pname = str(pv.getProperty().getName())
+						pval = pv.getValue()
+						if pval is None:
+							row[pname] = None
+						elif hasattr(pval, "getTime"):
+							row[pname] = pval.getTime()
+						else:
+							row[pname] = str(pval)
 				rows.append(row)
 			columns = list(set(k for r in rows for k in r.keys())) if rows else []
 			return {"json": {

@@ -66,14 +66,25 @@ public class FactryHistorianExtensionPoint extends HistorianExtensionPoint<Factr
     }
 
     /**
-     * Return empty so the frontend's ExtensionPointResourceForm does not call
-     * form.reset(defaultSettings) on mount — that reset wipes config.profile.type
-     * from the form state, causing the edit sidebar to show
-     * "Extension Point Form Not Found".  Schema-level defaults still populate
-     * the create form fields correctly.
+     * Provide populated defaults for the create form.
+     * <p>
+     * NOTE: In Ignition 8.3.3 returning non-empty defaults here triggered
+     * form.reset(defaultSettings) on mount, which wiped config.profile.type from
+     * the form state and broke the edit sidebar with "Extension Point Form Not
+     * Found". We are re-testing this on 8.3.6 to see whether that bug is fixed.
      */
     @Override
     public Optional<FactryHistorianSettings> defaultSettings() {
+        // The commented out code should work, but there is an ignition bug 
+        // if we use the code in the comment, the editing existing historian 
+        // form will be broken with message: Extension Point Form Not Found
+        // FactryHistorianSettings defaults = new FactryHistorianSettings();
+        // defaults.setToken("");
+        // defaults.setUseTls(true);
+        // defaults.setSkipTlsVerification(false);
+        // defaults.setDebugLogging(false);
+        // defaults.setDelimiter("/");
+        // return Optional.of(defaults);
         return Optional.empty();
     }
 

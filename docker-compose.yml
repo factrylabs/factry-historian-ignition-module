@@ -1,7 +1,8 @@
 services:
   ignition:
-    image: inductiveautomation/ignition:8.3.3
+    image: inductiveautomation/ignition:8.3.6
     container_name: factry-historian-ignition
+    hostname: FactryTest
     ports:
       - "8089:8088"   # HTTP - Gateway web interface
       - "8044:8043"   # HTTPS
@@ -30,9 +31,43 @@ services:
       retries: 3
       start_period: 60s
 
+  # Second Ignition gateway — for testing Factry Historian as a remote historian
+  ignition-remote:
+    image: inductiveautomation/ignition:8.3.6
+    container_name: factry-historian-ignition-remote
+    hostname: FactryRemoteTest
+    ports:
+      - "8095:8088"   # HTTP - Gateway web interface
+      - "8048:8043"   # HTTPS
+      - "8066:8060"   # Gateway Network
+      - "8027:8022"   # Java debug port
+    volumes:
+      - ./ignition-remote/data:/usr/local/bin/ignition/data
+    environment:
+      ACCEPT_IGNITION_EULA: "Y"
+      GATEWAY_ADMIN_USERNAME: "admin"
+      GATEWAY_ADMIN_PASSWORD: "password"
+      GATEWAY_NETWORK_0_HOST: "factry-historian-ignition-remote"
+    command: >
+      -n FactryRemoteTest
+      -m 2048
+      --
+      -Dignition.allowunsignedmodules=true
+      -agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=*:8022
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8088/StatusPing"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
   # Factry Historian
   historian:
-    image: registry.gitlab.com/factry/historian/historian-server:v8.2.0-beta-c3c26356e3
+    # image: registry.gitlab.com/factry/historian/historian-server:v8.2.0-beta-c3c26356e3
+    # image: factry-historian-server:v8.1.4
+    image: factry-historian-server:v8.2.0-rc.1-e6d5edcb3e
+    platform: linux/amd64
     container_name: factry-historian
     ports:
       - "8000:8000"   # Web UI
@@ -46,6 +81,8 @@ services:
       HISTORIAN_INFLUXDB_USERNAME: factry
       HISTORIAN_INFLUXDB_PASSWORD: password
       AUTO_MIGRATE: "true"
+      JWT_SECRET: "factry-dev-secret-do-not-use-in-production"
+      OPENAPI_VALIDATION_ENABLED: "false"
     depends_on:
       postgres:
         condition: service_healthy

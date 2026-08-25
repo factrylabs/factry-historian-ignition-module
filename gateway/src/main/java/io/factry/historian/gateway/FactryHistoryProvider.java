@@ -5,11 +5,16 @@ import com.inductiveautomation.historian.gateway.api.query.QueryEngine;
 import com.inductiveautomation.historian.gateway.api.storage.StorageEngine;
 import com.inductiveautomation.historian.gateway.interop.TagHistoryDataSinkBridge;
 import com.inductiveautomation.historian.gateway.interop.TagHistoryStorageEngineBridge;
+import com.inductiveautomation.ignition.common.resourcecollection.ChangeOperation;
+import com.inductiveautomation.ignition.common.resourcecollection.Resource;
+import com.inductiveautomation.ignition.common.resourcecollection.ResourceBuilder;
 import com.inductiveautomation.ignition.gateway.model.GatewayContext;
 import com.inductiveautomation.ignition.gateway.model.ProfileStatus;
 import com.inductiveautomation.ignition.gateway.storeforward.StorageKey;
+import com.inductiveautomation.ignition.gateway.storeforward.engine.EngineInformation;
 import com.inductiveautomation.ignition.gateway.storeforward.quarantine.QuarantineInterface;
 import com.inductiveautomation.ignition.gateway.storeforward.quarantine.QuarantinedDataInfo;
+import com.inductiveautomation.ignition.gateway.storeforward.resource.StoreAndForwardEngineSettings;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -38,6 +43,7 @@ public class FactryHistoryProvider extends AbstractHistorian<FactryHistorianSett
     private TagHistoryStorageEngineBridge storageBridge;
     private TagHistoryDataSinkBridge dataSinkBridge;
     private ScheduledExecutorService scheduledExecutor;
+    private volatile String sfEngineName;
 
     /** Cached status to avoid hitting gRPC on every gateway UI poll. */
     private volatile ProfileStatus cachedStatus = ProfileStatus.UNKNOWN;
@@ -58,7 +64,8 @@ public class FactryHistoryProvider extends AbstractHistorian<FactryHistorianSett
                 settings.getCollectorUUID(),
                 settings.getToken(),
                 settings.isUseTls(),
-                settings.isSkipTlsVerification()
+                settings.isSkipTlsVerification(),
+                settings.getCustomCaCert()
         );
         this.measurementCache = new MeasurementCache();
 
@@ -79,74 +86,101 @@ public class FactryHistoryProvider extends AbstractHistorian<FactryHistorianSett
         logger.debug("Name: {}", historianName);
         logger.debug("Settings: {}", settings);
 
-        measurementCache.refresh(grpcClient);
-        logger.info("Measurement cache pre-populated with {} entries", measurementCache.size());
+        // Register this collector with Factry so it shows as active
+        try {
+            var schema = io.factry.historian.proto.RegisterCollectorSchema.newBuilder()
+                    .setCollectorType("ignition")
+                    .setBuildVersion(FactryHistorianModule.MODULE_VERSION)
+                    .setBuildOs(System.getProperty("os.name", "unknown"))
+                    .setBuildArch(System.getProperty("os.arch", "unknown"))
+                    .build();
+            var collector = grpcClient.registerCollector(schema);
+            logger.info("Collector registered with Factry: uuid={}, type={}, status={}",
+                    collector.getUuid(), collector.getType(), collector.getStatus());
 
-        // Set up Store & Forward if configured
-        String sfEngine = settings.getStoreAndForwardEngine();
-        if (sfEngine != null && !sfEngine.isBlank()) {
-            StorageKey storageKey = StorageKey.of(sfEngine, historianName);
-
-            // Sink bridge: wraps our storage engine, receives data from S&F
-            dataSinkBridge = TagHistoryDataSinkBridge.getOrCreate(
-                    context, storageEngine, storageKey);
-            context.getStoreAndForwardManager().registerSink(dataSinkBridge);
-
-            // Workaround for Ignition 8.3.x: registerSink() only transitions the sink
-            // to STARTED state. The S&F engine doesn't call initialize() on sinks
-            // registered after the engine has started, leaving it stuck in "Storage Only".
-            // Force initialization via reflection so the sink reaches ACCEPTING state.
-            if (!dataSinkBridge.isAccepting()) {
-                try {
-                    Method initMethod = dataSinkBridge.getClass().getSuperclass()
-                            .getDeclaredMethod("initialize");
-                    initMethod.setAccessible(true);
-                    initMethod.invoke(dataSinkBridge);
-                } catch (Exception e) {
-                    logger.error("Failed to initialize S&F data sink bridge", e);
-                }
-            }
-
-            // Storage bridge: replaces direct storage, routes data into S&F
-            storageBridge = TagHistoryStorageEngineBridge.getOrCreate(
-                    context, historianName, sfEngine);
-
-            // Schedule automatic quarantine retry every 30 seconds.
-            // Quarantined data is never retried automatically by S&F,
-            // so we periodically move it back to pending for re-forwarding.
-            scheduledExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
-                Thread t = new Thread(r, "factry-historian-scheduler");
-                t.setDaemon(true);
-                return t;
-            });
-            scheduledExecutor.scheduleWithFixedDelay(
-                    () -> retryQuarantinedData(sfEngine), 30, 30, TimeUnit.SECONDS);
-
-            // Log metrics summary every 30 seconds
-            scheduledExecutor.scheduleWithFixedDelay(
-                    metrics::logSummary, 30, 30, TimeUnit.SECONDS);
-
-            // Periodic measurement cache refresh to detect deleted measurements
-            long refreshInterval = ModuleProperties.getMeasurementCacheRefreshSeconds();
-            scheduledExecutor.scheduleWithFixedDelay(
-                    this::refreshMeasurementCache, refreshInterval, refreshInterval, TimeUnit.SECONDS);
-
-            logger.info("Store-and-forward enabled via engine '{}', sink accepting: {}",
-                    sfEngine, dataSinkBridge.isAccepting());
-        } else {
-            // Even without S&F, schedule metrics logging and cache refresh
-            scheduledExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
-                Thread t = new Thread(r, "factry-historian-scheduler");
-                t.setDaemon(true);
-                return t;
-            });
-            scheduledExecutor.scheduleWithFixedDelay(
-                    metrics::logSummary, 30, 30, TimeUnit.SECONDS);
-
-            long refreshInterval = ModuleProperties.getMeasurementCacheRefreshSeconds();
-            scheduledExecutor.scheduleWithFixedDelay(
-                    this::refreshMeasurementCache, refreshInterval, refreshInterval, TimeUnit.SECONDS);
+            // Set collector state to active/collecting
+            var state = com.google.protobuf.Struct.newBuilder()
+                    .putFields("status", com.google.protobuf.Value.newBuilder()
+                            .setStringValue("Active").build())
+                    .putFields("health", com.google.protobuf.Value.newBuilder()
+                            .setStringValue("Collecting").build())
+                    .build();
+            grpcClient.updateCollectorState(state);
+        } catch (Exception e) {
+            logger.warn("Failed to register collector with Factry: " + e.getMessage());
         }
+
+        try {
+            measurementCache.refresh(grpcClient);
+            logger.info("Measurement cache pre-populated with {} entries", measurementCache.size());
+        } catch (Exception e) {
+            logger.warn("Initial measurement cache refresh failed (Factry may still be starting): {}. " +
+                    "Will retry via scheduled refresh.", e.getMessage());
+        }
+
+        // Set up Store & Forward — always enabled.
+        // The S&F engine name matches the historian profile name because
+        // system.tag.storeTagHistory() looks up the engine by historian name.
+        final String sfEngine = historianName;
+
+        // Ensure the S&F engine exists — create it if missing
+        ensureStoreAndForwardEngine(sfEngine);
+
+        StorageKey storageKey = StorageKey.of(sfEngine, historianName);
+
+        // Sink bridge: wraps our storage engine, receives data from S&F
+        dataSinkBridge = TagHistoryDataSinkBridge.getOrCreate(
+                context, storageEngine, storageKey);
+        context.getStoreAndForwardManager().registerSink(dataSinkBridge);
+
+        // Workaround for Ignition 8.3.x: registerSink() only transitions the sink
+        // to STARTED state. The S&F engine doesn't call initialize() on sinks
+        // registered after the engine has started, leaving it stuck in "Storage Only".
+        // Force initialization via reflection so the sink reaches ACCEPTING state.
+        if (!dataSinkBridge.isAccepting()) {
+            try {
+                Method initMethod = dataSinkBridge.getClass().getSuperclass()
+                        .getDeclaredMethod("initialize");
+                initMethod.setAccessible(true);
+                initMethod.invoke(dataSinkBridge);
+            } catch (Exception e) {
+                logger.error("Failed to initialize S&F data sink bridge", e);
+            }
+        }
+
+        // Storage bridge: replaces direct storage, routes data into S&F
+        storageBridge = TagHistoryStorageEngineBridge.getOrCreate(
+                context, historianName, sfEngine);
+
+        // Schedule automatic quarantine retry every 30 seconds.
+        // Quarantined data is never retried automatically by S&F,
+        // so we periodically move it back to pending for re-forwarding.
+        scheduledExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "factry-historian-scheduler");
+            t.setDaemon(true);
+            return t;
+        });
+        scheduledExecutor.scheduleWithFixedDelay(
+                () -> retryQuarantinedData(sfEngine), 30, 30, TimeUnit.SECONDS);
+
+        // Periodic measurement cache refresh to detect deleted measurements
+        long refreshInterval = ModuleProperties.getMeasurementCacheRefreshSeconds();
+        scheduledExecutor.scheduleWithFixedDelay(
+                this::refreshMeasurementCache, refreshInterval, refreshInterval, TimeUnit.SECONDS);
+
+        this.sfEngineName = sfEngine;
+
+        logger.info("Store-and-forward enabled via engine '{}', sink accepting: {}",
+                sfEngine, dataSinkBridge.isAccepting());
+
+        // Send periodic health updates to Factry (heartbeat)
+        scheduledExecutor.scheduleWithFixedDelay(
+                this::sendHealthUpdate, 0, 30, TimeUnit.SECONDS);
+
+        // Prime the status cache now that the connection has just been exercised
+        // (registerCollector + cache refresh above), so the gateway UI shows the
+        // real status on its first poll instead of waiting for the cache to expire.
+        refreshConnectionStatus();
 
         logger.info("Factry Historian - Startup Complete");
     }
@@ -212,7 +246,8 @@ public class FactryHistoryProvider extends AbstractHistorian<FactryHistorianSett
                     newSettings.getCollectorUUID(),
                     newSettings.getToken(),
                     newSettings.isUseTls(),
-                    newSettings.isSkipTlsVerification()
+                    newSettings.isSkipTlsVerification(),
+                    newSettings.getCustomCaCert()
             );
 
             // Refresh measurement cache from the new endpoint
@@ -223,10 +258,17 @@ public class FactryHistoryProvider extends AbstractHistorian<FactryHistorianSett
             storageEngine.updateSettings(newSettings);
             this.settings = newSettings;
 
+            // Re-test against the new endpoint and refresh the cached status so the
+            // gateway UI reflects the change on its next poll, not up to STATUS_CACHE_MS later.
+            refreshConnectionStatus();
+
             logger.info("Settings change applied successfully");
             return true;
         } catch (Exception e) {
             logger.error("Failed to apply settings change", e);
+            // Reflect the failure immediately rather than serving a stale cached status.
+            cachedStatus = ProfileStatus.ERRORED;
+            statusCheckedAt = System.currentTimeMillis();
             return false;
         }
     }
@@ -242,11 +284,94 @@ public class FactryHistoryProvider extends AbstractHistorian<FactryHistorianSett
             return cachedStatus;
         }
 
-        statusCheckedAt = now;
-        cachedStatus = grpcClient.testConnection()
-                ? ProfileStatus.RUNNING
-                : ProfileStatus.ERRORED;
+        return refreshConnectionStatus();
+    }
+
+    /**
+     * Actively test the Factry connection, update the cached status and its
+     * timestamp, and toggle the S&F sink to match the connection state.
+     * <p>
+     * Called lazily from {@link #getStatus()} when the cache expires, and
+     * eagerly right after startup and settings changes so the gateway UI
+     * reflects the new state on its very next poll instead of waiting out the
+     * {@link #STATUS_CACHE_MS} window (or showing a stale value for up to that long).
+     */
+    private ProfileStatus refreshConnectionStatus() {
+        statusCheckedAt = System.currentTimeMillis();
+        boolean connected = grpcClient.testConnection();
+        cachedStatus = connected ? ProfileStatus.RUNNING : ProfileStatus.ERRORED;
+
+        // Toggle S&F sink: when Factry is down, stop accepting so points stay in pending.
+        // When Factry is back, re-initialize so forwarding resumes.
+        if (dataSinkBridge != null) {
+            if (connected && !dataSinkBridge.isAccepting()) {
+                logger.info("Factry connection restored, re-enabling S&F sink");
+                try {
+                    java.lang.reflect.Method initMethod = dataSinkBridge.getClass().getSuperclass()
+                            .getDeclaredMethod("initialize");
+                    initMethod.setAccessible(true);
+                    initMethod.invoke(dataSinkBridge);
+                } catch (Exception e) {
+                    logger.error("Failed to re-initialize S&F sink", e);
+                }
+            } else if (!connected && dataSinkBridge.isAccepting()) {
+                logger.info("Factry connection lost, pausing S&F sink to buffer points");
+                try {
+                    java.lang.reflect.Method uninitMethod = dataSinkBridge.getClass().getSuperclass()
+                            .getDeclaredMethod("uninitialize");
+                    uninitMethod.setAccessible(true);
+                    uninitMethod.invoke(dataSinkBridge);
+                } catch (Exception e) {
+                    logger.error("Failed to uninitialize S&F sink", e);
+                }
+            }
+        }
+
         return cachedStatus;
+    }
+
+    /**
+     * Ensure that the named S&F engine exists in the gateway configuration.
+     * If not, creates one with sensible defaults (SQLite-backed, matching
+     * Ignition's default engine settings).
+     */
+    private void ensureStoreAndForwardEngine(String engineName) {
+        Optional<EngineInformation> existing =
+                context.getStoreAndForwardManager().getEngineInformation(engineName, true);
+        if (existing.isPresent()) {
+            logger.debug("S&F engine '{}' already exists", engineName);
+            return;
+        }
+
+        // Also check if a resource already exists (covers engines not yet started)
+        List<Resource> sfResources = context.getConfigurationManager()
+                .getResources(StoreAndForwardEngineSettings.getType());
+        for (Resource r : sfResources) {
+            if (r.getResourceName().equalsIgnoreCase(engineName)) {
+                logger.debug("S&F engine resource '{}' already exists (as '{}')",
+                        engineName, r.getResourceName());
+                return;
+            }
+        }
+
+        logger.info("S&F engine '{}' does not exist — creating it automatically", engineName);
+        try {
+            StoreAndForwardEngineSettings engineSettings = new StoreAndForwardEngineSettings();
+
+            ResourceBuilder builder = Resource.newBuilder();
+            builder.setResourceCollectionName("core");
+            builder.setResourcePath(StoreAndForwardEngineSettings.getType().childPath(engineName));
+            builder.setApplicationScope("G");
+            StoreAndForwardEngineSettings.getMeta().getCodec().encode(engineSettings, builder);
+            Resource resource = builder.build();
+
+            ChangeOperation createOp = ChangeOperation.newCreateOp(resource);
+            context.getConfigurationManager().push(List.of(createOp)).get(10, TimeUnit.SECONDS);
+
+            logger.info("S&F engine '{}' created successfully", engineName);
+        } catch (Exception e) {
+            logger.error("Failed to create S&F engine '{}' — store-and-forward may not work", engineName, e);
+        }
     }
 
     private void retryQuarantinedData(String engineName) {
@@ -279,6 +404,21 @@ public class FactryHistoryProvider extends AbstractHistorian<FactryHistorianSett
         }
     }
 
+    private void sendHealthUpdate() {
+        try {
+            var update = io.factry.historian.proto.HealthUpdate.newBuilder()
+                    .setHealth("Collecting")
+                    .setTimestamp(com.google.protobuf.util.Timestamps.fromMillis(System.currentTimeMillis()))
+                    .build();
+            var updates = io.factry.historian.proto.HealthUpdates.newBuilder()
+                    .addHealthUpdates(update)
+                    .build();
+            grpcClient.updateHealth(updates);
+        } catch (Exception e) {
+            logger.warn("Failed to send health update: " + e.getMessage());
+        }
+    }
+
     private void refreshMeasurementCache() {
         try {
             int before = measurementCache.size();
@@ -290,7 +430,7 @@ public class FactryHistoryProvider extends AbstractHistorian<FactryHistorianSett
                 logger.debug("Measurement cache refreshed: {} entries (unchanged)", after);
             }
         } catch (Exception e) {
-            logger.debug("Error refreshing measurement cache", e);
+            logger.warn("Failed to refresh measurement cache: " + e.getMessage());
         }
     }
 

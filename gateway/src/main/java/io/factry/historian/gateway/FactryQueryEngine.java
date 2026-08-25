@@ -36,6 +36,7 @@ import com.inductiveautomation.ignition.gateway.model.GatewayContext;
 
 import io.factry.historian.proto.Aggregation;
 import io.factry.historian.proto.Asset;
+import io.factry.historian.proto.AssetProperty;
 import io.factry.historian.proto.Measurement;
 import io.factry.historian.proto.QueryTimeseriesRequest;
 import io.factry.historian.proto.QueryTimeseriesResponse;
@@ -49,6 +50,9 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.Comparator;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -113,23 +117,17 @@ public class FactryQueryEngine extends AbstractQueryEngine {
             }
 
             if (TagPathUtil.CATEGORY_MEASUREMENTS.equals(category)) {
-                // Measurements: existing hierarchical browse with sys/prov/tag structure
                 String measPrefix = TagPathUtil.stripCategory(prefix);
                 if (!measPrefix.isEmpty() && !measPrefix.endsWith("/")) {
                     measPrefix += "/";
                 }
+                // Tree vs flat is governed uniformly by the configured delimiter
+                // (applied per-measurement in collectMeasurementDisplayToStoredMap),
+                // not by which collector the measurement belongs to.
                 browsePaths(collectMeasurementDisplayToStoredMap(), measPrefix, publisher);
             } else if (TagPathUtil.CATEGORY_ASSETS.equals(category)) {
-                // Assets: hierarchical by "/" in name
                 String assetPrefix = TagPathUtil.stripCategory(prefix);
-                if (!assetPrefix.isEmpty() && !assetPrefix.endsWith("/")) {
-                    assetPrefix += "/";
-                }
-                Map<String, String> assetDisplayToStored = new HashMap<>();
-                for (Asset a : measurementCache.getAllAssets()) {
-                    assetDisplayToStored.put(a.getName(), a.getName());
-                }
-                browsePaths(assetDisplayToStored, assetPrefix, publisher);
+                browseAssets(assetPrefix, publisher);
             } else {
                 // Legacy fallback: browse measurements without category prefix
                 browsePaths(collectMeasurementDisplayToStoredMap(), prefix, publisher);
@@ -141,13 +139,22 @@ public class FactryQueryEngine extends AbstractQueryEngine {
     }
 
     private Map<String, String> collectMeasurementDisplayToStoredMap() {
-        Map<String, String> displayToStored = new HashMap<>();
+        String delimiter = settings.getDelimiter();
+        // Maps a full display path -> the leaf's browse name (the resolution key
+        // used as the tag node id). The browse name is the stored measurement name
+        // transformed by the configured delimiter; toStoredTagPath reverses it.
+        Map<String, String> displayToBrowse = new HashMap<>();
         for (Measurement m : measurementCache.getAllMeasurements()) {
-            // Measurement names are already slash-separated (collectorName/prov/tag),
-            // so display path == stored path.
-            displayToStored.put(m.getName(), m.getName());
+            // Prefix the display path with the collector name so measurements
+            // are grouped under their collector in the browse tree.
+            String collectorName = measurementCache.getCollectorName(m.getUuid());
+            String browseName = TagPathUtil.toBrowseName(m.getName(), delimiter);
+            String displayPath = collectorName != null
+                    ? collectorName + "/" + browseName
+                    : browseName;
+            displayToBrowse.put(displayPath, browseName);
         }
-        return displayToStored;
+        return displayToBrowse;
     }
 
     private void browsePaths(Map<String, String> displayToStored, String prefix, BrowsePublisher publisher) {
@@ -186,6 +193,83 @@ public class FactryQueryEngine extends AbstractQueryEngine {
     }
 
     /**
+     * Browse the asset tree. Uses assetPath for hierarchy and shows asset properties
+     * as leaf tags under each asset.
+     *
+     * @param prefix path segments already navigated (e.g. "" for root, "alma/" for inside asset alma)
+     */
+    private void browseAssets(String prefix, BrowsePublisher publisher) {
+        Map<String, List<Asset>> childrenByParent = buildChildrenByParent(measurementCache.getAllAssets());
+        Map<String, Asset> pathToAsset = new HashMap<>();
+        computeAssetPaths(childrenByParent, "", "", pathToAsset);
+
+        // Determine which assets are direct children at the current prefix level
+        List<Asset> children;
+        if (prefix.isEmpty()) {
+            // Root level: show assets with no parent
+            children = childrenByParent.getOrDefault("", Collections.emptyList());
+        } else {
+            // Find the asset matching this prefix, then show its children
+            String assetPath = prefix.endsWith("/") ? prefix.substring(0, prefix.length() - 1) : prefix;
+            Asset parentAsset = pathToAsset.get(assetPath);
+            if (parentAsset != null) {
+                children = childrenByParent.getOrDefault(parentAsset.getUuid(), Collections.emptyList());
+
+                // Show properties of the current asset as leaf tags
+                List<AssetProperty> props = measurementCache.getPropertiesForAsset(parentAsset.getUuid());
+                for (AssetProperty prop : props) {
+                    Measurement m = measurementCache.getMeasurementByUUID(prop.getMeasurementUUID());
+                    String storedPath = m != null ? m.getName() : prop.getMeasurementUUID();
+                    publisher.newNode("tag", storedPath)
+                            .displayPath(StringPath.of(prop.getName()))
+                            .hasChildren(false)
+                            .add();
+                }
+                logger.debug("Browse assets: published " + props.size() + " properties for asset '" + assetPath + "'");
+            } else {
+                children = Collections.emptyList();
+            }
+        }
+
+        // Publish child assets as folders
+        for (Asset child : children) {
+            List<AssetProperty> props = measurementCache.getPropertiesForAsset(child.getUuid());
+            List<Asset> grandChildren = childrenByParent.getOrDefault(child.getUuid(), Collections.emptyList());
+            boolean hasChildren = !props.isEmpty() || !grandChildren.isEmpty();
+            publisher.newNode("folder", child.getName()).hasChildren(hasChildren).add();
+        }
+
+        logger.debug("Browse assets: prefix='" + prefix + "', " + children.size() + " child assets");
+    }
+
+    /**
+     * Recursively compute full paths for all assets using the parent-child hierarchy.
+     */
+    static void computeAssetPaths(
+            Map<String, List<Asset>> childrenByParent,
+            String parentUUID,
+            String parentPath,
+            Map<String, Asset> pathToAsset) {
+        List<Asset> children = childrenByParent.getOrDefault(parentUUID, Collections.emptyList());
+        for (Asset child : children) {
+            String fullPath = parentPath.isEmpty() ? child.getName() : parentPath + "/" + child.getName();
+            pathToAsset.put(fullPath, child);
+            computeAssetPaths(childrenByParent, child.getUuid(), fullPath, pathToAsset);
+        }
+    }
+
+    /**
+     * Build a map from parentUUID → list of child assets.
+     */
+    static Map<String, List<Asset>> buildChildrenByParent(Collection<Asset> assets) {
+        Map<String, List<Asset>> childrenByParent = new HashMap<>();
+        for (Asset a : assets) {
+            childrenByParent.computeIfAbsent(a.getParentUUID(), k -> new ArrayList<>()).add(a);
+        }
+        return childrenByParent;
+    }
+
+    /**
      * Extract the browse prefix from the root QualifiedPath.
      * Uses AdaptedQualifiedPath.getOriginalPath() via reflection to access
      * the full path including folder: components.
@@ -221,23 +305,38 @@ public class FactryQueryEngine extends AbstractQueryEngine {
         long startMs = System.currentTimeMillis();
 
         try {
-            // Build the processing context and initialize
-            ProcessingContext<RawQueryKey, DataPointType> context =
-                    DefaultProcessingContext.<RawQueryKey, DataPointType>builder().build();
-            if (!processor.onInitialize(context)) {
-                logger.warn("Processor rejected initialization");
+            // Map each query key to its historian node AND initialize the processor with
+            // a context that carries every key's data type (String / Float / Boolean).
+            // This is what tells the framework how to type each result column.
+            //
+            // The previous code built an EMPTY context, so the framework had no type
+            // information and defaulted every column to numeric. A string value then
+            // failed to coerce to a number, and because that coercion happens while the
+            // framework commits the shared result set, it aborted the ENTIRE query —
+            // taking any numeric tags in the same query down with it (0 rows for all).
+            // mapKeysToNodes() populates the context from queryForHistoricalNodes() and
+            // calls processor.onInitialize() for us.
+            Map<RawQueryKey, ? extends HistoricalNode> keyToNode =
+                    mapKeysToNodes(options, processor, RawQueryKey::source);
+
+            // mapKeysToNodes only initializes the processor when it resolves at least one
+            // node. If NOTHING resolved (every tag is unknown), the processor is not
+            // initialized, so calling onKeyFailure/onComplete on it would throw
+            // "Processor not initialized". Nothing to return in that case — report zero rows.
+            if (keyToNode.isEmpty()) {
+                logger.debug("Raw query resolved no measurements; returning 0 rows");
                 return Optional.of(0);
             }
 
             // Map query keys to measurement UUIDs
-            var queryKeys = options.getQueryKeys();
             List<String> measurementUUIDs = new ArrayList<>();
             Map<String, RawQueryKey> uuidToKeyMap = new HashMap<>();
 
-            for (RawQueryKey key : queryKeys) {
+            for (RawQueryKey key : options.getQueryKeys()) {
                 QualifiedPath source = key.source();
                 String tagPath = toStoredTagPath(source);
-                String uuid = lookupUUID(tagPath);
+                // Only query keys that resolved to a node; mapKeysToNodes omits the rest.
+                String uuid = keyToNode.containsKey(key) ? lookupUUID(tagPath) : null;
 
                 if (uuid != null) {
                     measurementUUIDs.add(uuid);
@@ -246,6 +345,8 @@ public class FactryQueryEngine extends AbstractQueryEngine {
                         logger.debug("Mapped " + source + " -> " + tagPath + " -> " + uuid);
                     }
                 } else {
+                    // Node/measurement not found — fail only this key so the framework
+                    // emits nulls for its column instead of aborting the whole query.
                     logger.warn("No measurement UUID found for tag path: " + tagPath);
                     processor.onKeyFailure(key, QualityCode.Bad_NotFound);
                 }
@@ -256,9 +357,13 @@ public class FactryQueryEngine extends AbstractQueryEngine {
                 return Optional.of(0);
             }
 
-            // Build gRPC request using QueryTimeseries (no aggregation = raw)
+            // Build gRPC request using QueryTimeseries (no aggregation = raw). Group by the
+            // per-point status tag so Factry returns one series per quality status; without this
+            // every point comes back in a single series and reads back as Good, losing bad/
+            // uncertain quality.
             QueryTimeseriesRequest.Builder reqBuilder = QueryTimeseriesRequest.newBuilder()
-                    .addAllMeasurementUUIDs(measurementUUIDs);
+                    .addAllMeasurementUUIDs(measurementUUIDs)
+                    .addGroupBy("status");
 
             options.getTimeRange().ifPresent(tr -> {
                 reqBuilder.setStart(Timestamps.fromMillis(tr.startTime().toEpochMilli()));
@@ -267,22 +372,33 @@ public class FactryQueryEngine extends AbstractQueryEngine {
 
             QueryTimeseriesResponse reply = grpcClient.queryTimeseries(reqBuilder.build());
 
-            int totalPoints = 0;
+            // A measurement now spans multiple status-series. Collect all of a measurement's points
+            // (each carrying its series' quality), then merge-sort by timestamp before emitting —
+            // Ignition expects time-ordered points per key.
+            record RawPt(long ts, Object value, QualityCode quality) {}
+            Map<String, List<RawPt>> pointsByUuid = new LinkedHashMap<>();
             for (Series series : reply.getSeriesList()) {
                 String uuid = series.hasMeasurementUUID() ? series.getMeasurementUUID() : "";
-                RawQueryKey key = uuidToKeyMap.get(uuid);
-                if (key == null) {
+                if (!uuidToKeyMap.containsKey(uuid)) {
                     continue;
                 }
-
-                QualifiedPath path = key.source();
-
+                QualityCode quality = statusToQuality(seriesStatus(series));
+                List<RawPt> pts = pointsByUuid.computeIfAbsent(uuid, k -> new ArrayList<>());
                 for (SeriesPoint pt : series.getDataPointsList()) {
-                    Instant timestamp = Instant.ofEpochMilli(pt.getTimestamp());
-                    Object value = protoValueToJava(pt.getValue());
+                    pts.add(new RawPt(pt.getTimestamp(), protoValueToJava(pt.getValue()), quality));
+                }
+            }
 
+            int totalPoints = 0;
+            for (Map.Entry<String, List<RawPt>> entry : pointsByUuid.entrySet()) {
+                RawQueryKey key = uuidToKeyMap.get(entry.getKey());
+                QualifiedPath path = key.source();
+                List<RawPt> pts = entry.getValue();
+                pts.sort(Comparator.comparingLong(RawPt::ts));
+
+                for (RawPt p : pts) {
                     AtomicPoint<?> atomicPoint = DataPointFactory.createAtomicPoint(
-                            value, QualityCode.Good, timestamp, path);
+                            p.value(), p.quality(), Instant.ofEpochMilli(p.ts()), path);
 
                     if (!processor.onPointAvailable(key, atomicPoint)) {
                         processor.onComplete();
@@ -315,10 +431,22 @@ public class FactryQueryEngine extends AbstractQueryEngine {
         long startMs = System.currentTimeMillis();
 
         try {
-            ProcessingContext context =
-                    DefaultProcessingContext.builder().build();
-            if (!processor.onInitialize(context)) {
-                logger.warn("Processor rejected initialization for aggregated query");
+            // Map each query key to its historian node AND initialize the processor with a
+            // context that carries every key's data type (String / Float / Boolean). This is
+            // the same fix applied to doQueryRaw: the previous code built an EMPTY context, so
+            // the framework had no type information and defaulted every column to numeric. A
+            // string value (the type the Perspective Power Chart uses aggregated queries for)
+            // then failed to coerce to a number, and because that coercion happens while the
+            // framework commits the shared result set, it aborted the ENTIRE query. mapKeysToNodes()
+            // populates the context from queryForHistoricalNodes() and calls onInitialize() for us.
+            Map<AggregatedQueryKey, ? extends HistoricalNode> keyToNode =
+                    mapKeysToNodes(options, processor, AggregatedQueryKey::source);
+
+            // mapKeysToNodes only initializes the processor when it resolves at least one node.
+            // If NOTHING resolved, the processor is not initialized, so calling
+            // onKeyFailure/onComplete on it would throw "Processor not initialized".
+            if (keyToNode.isEmpty()) {
+                logger.debug("Aggregated query resolved no measurements; returning 0 rows");
                 return Optional.of(0);
             }
 
@@ -331,7 +459,8 @@ public class FactryQueryEngine extends AbstractQueryEngine {
             for (AggregatedQueryKey key : queryKeys) {
                 QualifiedPath source = key.source();
                 String tagPath = toStoredTagPath(source);
-                String uuid = lookupUUID(tagPath);
+                // Only query keys that resolved to a node; mapKeysToNodes omits the rest.
+                String uuid = keyToNode.containsKey(key) ? lookupUUID(tagPath) : null;
 
                 if (uuid == null) {
                     logger.warn("No measurement UUID found for aggregated query: " + tagPath);
@@ -442,6 +571,26 @@ public class FactryQueryEngine extends AbstractQueryEngine {
             }
         }
 
+        // Custom metadata properties stored via storeMetadata (engUnit, engLow, engHigh,
+        // and any others) round-trip through the measurement's metadata map. Surface any
+        // that weren't already provided above. (The read-side Measurement proto has no
+        // 'description'/'attributes' fields, so the metadata map is the only channel that
+        // round-trips storeMetadata values.)
+        Set<String> existing = new HashSet<>();
+        for (var pv : ps) {
+            existing.add(pv.getProperty().getName());
+        }
+        for (Map.Entry<String, io.factry.historian.proto.MetadataProperty> e : m.getMetadataMap().entrySet()) {
+            String name = e.getKey();
+            if (existing.contains(name)) {
+                continue; // don't clobber a value already provided by engineeringSpecs
+            }
+            Object val = protoValueToJava(e.getValue().getValue());
+            if (val != null) {
+                ps.set(new BasicProperty<>(name, String.class), val.toString());
+            }
+        }
+
         return ps;
     }
 
@@ -456,8 +605,12 @@ public class FactryQueryEngine extends AbstractQueryEngine {
                 .setFillType("none")
                 .build();
 
+        // Group by status so Factry aggregates each quality separately, then keep only the Good
+        // series. Aggregating across all statuses blends bad samples into the value (e.g. a bad
+        // x1000 reading drags the average up); Good-only is faithful and avoids the corruption.
         QueryTimeseriesRequest.Builder reqBuilder = QueryTimeseriesRequest.newBuilder()
                 .addMeasurementUUIDs(uuid)
+                .addGroupBy("status")
                 .setAggregation(aggregation);
 
         options.getTimeRange().ifPresent(tr -> {
@@ -469,6 +622,9 @@ public class FactryQueryEngine extends AbstractQueryEngine {
 
         int count = 0;
         for (Series series : reply.getSeriesList()) {
+            if (!isGoodStatus(seriesStatus(series))) {
+                continue; // drop Bad/Uncertain series so they don't blend into the aggregate
+            }
             for (SeriesPoint pt : series.getDataPointsList()) {
                 Instant timestamp = Instant.ofEpochMilli(pt.getTimestamp());
                 Object value = protoValueToJava(pt.getValue());
@@ -492,12 +648,15 @@ public class FactryQueryEngine extends AbstractQueryEngine {
             String period, AggregatedQueryOptions options,
             AggregatedPointProcessor processor) {
 
-        // Query min and max separately
+        // Query min and max separately, grouped by status and keeping only the Good series so
+        // bad/uncertain samples don't skew the min/max (see querySingleAggregate).
         QueryTimeseriesRequest.Builder minReqBuilder = QueryTimeseriesRequest.newBuilder()
                 .addMeasurementUUIDs(uuid)
+                .addGroupBy("status")
                 .setAggregation(Aggregation.newBuilder().setName("min").setPeriod(period).setFillType("none").build());
         QueryTimeseriesRequest.Builder maxReqBuilder = QueryTimeseriesRequest.newBuilder()
                 .addMeasurementUUIDs(uuid)
+                .addGroupBy("status")
                 .setAggregation(Aggregation.newBuilder().setName("max").setPeriod(period).setFillType("none").build());
 
         options.getTimeRange().ifPresent(tr -> {
@@ -510,17 +669,23 @@ public class FactryQueryEngine extends AbstractQueryEngine {
         QueryTimeseriesResponse minReply = grpcClient.queryTimeseries(minReqBuilder.build());
         QueryTimeseriesResponse maxReply = grpcClient.queryTimeseries(maxReqBuilder.build());
 
-        // Collect min values by timestamp
+        // Collect min values by timestamp (Good series only)
         Map<Long, Object> minValues = new HashMap<>();
         for (Series series : minReply.getSeriesList()) {
+            if (!isGoodStatus(seriesStatus(series))) {
+                continue;
+            }
             for (SeriesPoint pt : series.getDataPointsList()) {
                 minValues.put(pt.getTimestamp(), protoValueToJava(pt.getValue()));
             }
         }
 
-        // Emit min/max pairs for each bucket
+        // Emit min/max pairs for each bucket (Good series only)
         int count = 0;
         for (Series series : maxReply.getSeriesList()) {
+            if (!isGoodStatus(seriesStatus(series))) {
+                continue;
+            }
             for (SeriesPoint pt : series.getDataPointsList()) {
                 long ts = pt.getTimestamp();
                 Instant timestamp = Instant.ofEpochMilli(ts);
@@ -669,23 +834,41 @@ public class FactryQueryEngine extends AbstractQueryEngine {
     }
 
     private String toStoredTagPath(QualifiedPath path) {
-        return TagPathUtil.qualifiedPathToStoredPath(path.toString(), settings.getCollectorName());
+        String pathStr = path.toString();
+        String stored = TagPathUtil.queryPathToStoredPath(pathStr);
+        if (TagPathUtil.isAssetQueryPath(pathStr)) {
+            // Asset property tags carry the measurement's real name (real '/');
+            // never apply the tag-path delimiter reverse to them.
+            return TagPathUtil.restoreFractionSlash(stored);
+        }
+        return TagPathUtil.fromBrowseName(stored, settings.getDelimiter());
     }
 
     static QualityCode statusToQuality(String status) {
-        if (status == null) {
+        // Factry status values are level names with optional subtype suffixes
+        // (e.g. "BadFactryInvalidDataForDatatype", "UncertainInitialValue"). Match by PREFIX so
+        // subtypes don't silently fall through to Good.
+        if (status == null || status.isEmpty()) {
             return QualityCode.Good;
         }
-        switch (status) {
-            case "Good":
-                return QualityCode.Good;
-            case "Uncertain":
-                return QualityCode.Uncertain;
-            case "Bad":
-                return QualityCode.Bad;
-            default:
-                return QualityCode.Good;
+        if (status.startsWith("Uncertain")) {
+            return QualityCode.Uncertain;
         }
+        if (status.startsWith("Bad") || status.startsWith("Error")) {
+            return QualityCode.Bad;
+        }
+        return QualityCode.Good;
+    }
+
+    /** The per-series status tag from a {@code groupBy=["status"]} query, or "" if absent. */
+    private static String seriesStatus(Series series) {
+        var stv = series.getTags().getFieldsMap().get("status");
+        return stv != null ? stv.getStringValue() : "";
+    }
+
+    /** A status that maps to Good quality (Good level, or an untagged series). */
+    private static boolean isGoodStatus(String status) {
+        return statusToQuality(status) == QualityCode.Good;
     }
 
     static Object protoValueToJava(com.google.protobuf.Value value) {

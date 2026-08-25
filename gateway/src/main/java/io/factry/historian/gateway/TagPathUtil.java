@@ -4,9 +4,9 @@ package io.factry.historian.gateway;
  * Utility methods for converting between Ignition QualifiedPath strings
  * and Factry measurement names.
  * <p>
- * Measurement name format: {@code "collectorName/provider/tagPath"}
+ * Measurement name format: {@code "provider/tagPath"}
  * <p>
- * Example: {@code "Ignition/default/FactrySim/ff1"}
+ * Example: {@code "default/FactrySim/ff1"}
  * <p>
  * No Ignition SDK dependencies — pure string operations, easy to unit test.
  */
@@ -44,13 +44,13 @@ final class TagPathUtil {
 
     /**
      * Build the measurement name from components.
-     * Format: {@code "collectorName/prov/tag"}
+     * Format: {@code "prov/tag"}
      *
-     * @return measurement name, e.g. {@code "Ignition/default/FactrySim/ff1"}
+     * @return measurement name, e.g. {@code "default/FactrySim/ff1"}
      */
-    static String buildStoredPath(String collectorName, String prov, String tag) {
+    static String buildStoredPath(String prov, String tag) {
         if (prov == null) prov = "default";
-        return collectorName + "/" + prov + "/" + tag;
+        return prov + "/" + tag;
     }
 
     /**
@@ -58,28 +58,136 @@ final class TagPathUtil {
      * <p>
      * Handles multiple input formats:
      * <ul>
-     *   <li>Storage path: {@code sys:X:/prov:Y:/tag:Z} → {@code collectorName/Y/Z}</li>
+     *   <li>Storage path: {@code sys:X:/prov:Y:/tag:Z} → {@code Y/Z}</li>
      *   <li>Browse with folders: {@code histprov:xxx:/folder:A:/folder:B:/tag:C} → {@code A/B/C}
      *       (category prefix stripped if present)</li>
-     *   <li>Browse without folders: {@code histprov:xxx:/tag:collectorName/prov/tag}
-     *       → {@code collectorName/prov/tag} (already in correct format)</li>
+     *   <li>Browse without folders: {@code histprov:xxx:/tag:prov/tag}
+     *       → {@code prov/tag} (already in correct format)</li>
      * </ul>
      *
      * @param qualifiedPathStr the QualifiedPath.toString() result
-     * @param collectorName    the collector name from the JWT token
      * @return the Factry measurement name
      */
-    static String qualifiedPathToStoredPath(String qualifiedPathStr, String collectorName) {
+    /**
+     * Sentinel substituted for a literal '/' in a measurement name so the browse
+     * tree (which always splits on '/') does not treat it as a path separator.
+     */
+    static final String FRACTION_SLASH = " \u2215 ";
+
+    /**
+     * Restore unicode fraction slash (U+2044) back to real '/' in stored paths.
+     * Used for measurements where '/' was replaced to prevent the browse tree
+     * from splitting the path into segments.
+     */
+    static String restoreFractionSlash(String path) {
+        if (path == null) return null;
+        return path.replace(FRACTION_SLASH, "/").replace('\u2215', '/').replace('\u2044', '/');
+    }
+
+    /**
+     * Convert a stored Factry measurement name into the name used for browsing,
+     * driven by the user-configured tag-path {@code delimiter}.
+     * <p>
+     * The browse tree always splits leaf paths on {@code '/'}, so the delimiter
+     * decides what becomes a tree separator:
+     * <ul>
+     *   <li>{@code "/"} (default): no-op \u2014 Ignition splits the path into a tree as-is.</li>
+     *   <li>empty/null: flat \u2014 every {@code '/'} is escaped to {@link #FRACTION_SLASH}
+     *       so the whole name stays a single leaf.</li>
+     *   <li>any other character (e.g. {@code "."}): escape literal {@code '/'} first,
+     *       then promote the delimiter to {@code '/'} so the tree splits on it.</li>
+     * </ul>
+     * Order matters in the last case: escape before promoting, otherwise the freshly
+     * promoted slashes would be re-escaped.
+     *
+     * @see #fromBrowseName(String, String) for the exact inverse
+     */
+    static String toBrowseName(String name, String delimiter) {
+        if (name == null) return null;
+        if ("/".equals(delimiter)) {
+            return name;
+        }
+        String escaped = name.replace("/", FRACTION_SLASH);
+        if (delimiter == null || delimiter.isEmpty()) {
+            return escaped;
+        }
+        return escaped.replace(delimiter, "/");
+    }
+
+    /**
+     * Inverse of {@link #toBrowseName(String, String)}: reconstruct the stored
+     * measurement name from a browse name resolved out of a query path.
+     * <p>
+     * Mirrors the forward transform in reverse order: former-delimiter {@code '/'}
+     * are restored to the delimiter first, then escaped slashes are restored to
+     * real {@code '/'}.
+     */
+    static String fromBrowseName(String browseName, String delimiter) {
+        if (browseName == null) return null;
+        if ("/".equals(delimiter)) {
+            return browseName;
+        }
+        String result = browseName;
+        if (delimiter != null && !delimiter.isEmpty()) {
+            result = result.replace("/", delimiter);
+        }
+        return restoreFractionSlash(result);
+    }
+
+    /**
+     * True if a query QualifiedPath refers to the Assets tree rather than the
+     * Measurements tree. Asset property tags carry their measurement's real name
+     * (which natively contains '/'), so the delimiter reverse-transform must never
+     * be applied to them.
+     */
+    static boolean isAssetQueryPath(String qualifiedPathStr) {
+        if (qualifiedPathStr == null) return false;
+        if (CATEGORY_ASSETS.equals(extractCategory(parseFolderPrefix(qualifiedPathStr)))) {
+            return true;
+        }
+        String tag = extractComponent(qualifiedPathStr, "tag:");
+        return tag != null && CATEGORY_ASSETS.equals(extractCategory(tag));
+    }
+
+    /**
+     * Convert a storage-pipeline QualifiedPath to the Factry measurement name.
+     * <p>
+     * The tag value is always a genuine path relative to the provider.
+     * No composite-path guessing is needed — the components are trusted as-is.
+     */
+    static String storagePathToStoredPath(String qualifiedPathStr) {
         String prov = extractComponent(qualifiedPathStr, "prov:");
         String tag = extractComponent(qualifiedPathStr, "tag:");
 
-        // 1. Storage path with explicit prov: component → build collectorName/prov/tag
+        if (tag == null) {
+            return qualifiedPathStr;
+        }
+
+        return buildStoredPath(prov, tag);
+    }
+
+    /**
+     * Convert a query/browse QualifiedPath to the Factry measurement name.
+     * <p>
+     * In cross-gateway scenarios the tag value may already be a full measurement
+     * name (prov/tagPath) that must not be wrapped again.
+     */
+    static String queryPathToStoredPath(String qualifiedPathStr) {
+        String prov = extractComponent(qualifiedPathStr, "prov:");
+        String tag = extractComponent(qualifiedPathStr, "tag:");
+
         if (prov != null && tag != null) {
-            return buildStoredPath(collectorName, prov, tag);
+            String sys = extractComponent(qualifiedPathStr, "sys:");
+            if (sys != null) {
+                if (tag.startsWith(prov + "/")) {
+                    return tag;
+                }
+                return buildStoredPath(prov, tag);
+            }
+            return tag;
         }
 
         if (tag != null) {
-            // 2. Browse with folder: components → reconstruct from folders + tag leaf
             String folderPrefix = parseFolderPrefix(qualifiedPathStr);
             if (!folderPrefix.isEmpty()) {
                 String strippedPrefix = stripCategory(folderPrefix);
@@ -93,8 +201,6 @@ final class TagPathUtil {
                 return folderPrefix + tag;
             }
 
-            // 3. Browse without folders — tag already contains the full measurement name
-            //    Strip category prefix if present
             String category = extractCategory(tag);
             if (category != null) {
                 return stripCategory(tag);

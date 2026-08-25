@@ -11,6 +11,8 @@ gradle-app.setting
 # # Work around https://youtrack.jetbrains.com/issue/IDEA-116898
 # gradle/wrapper/gradle-wrapper.properties
 
+# Setup script temp files
+script/.collector-token
 
 
 # From https://github.com/github/gitignore/blob/master/Java.gitignore
@@ -115,6 +117,7 @@ ignition/data/*
 ignition/data/projects/*
 !ignition/data/projects/TestFactry/
 ignition/data/projects/TestFactry/*
+!ignition/data/projects/TestFactry/project.json
 !ignition/data/projects/TestFactry/com.inductiveautomation.webdev/
 
 # Ignition module binaries are build artifacts
@@ -161,3 +164,6 @@ docs/.design/
 
 # Docker image tarballs (loaded locally, not committed)
 docker/
+
+# Remote gateway data (auto-generated)
+ignition-remote/

@@ -44,6 +44,10 @@ public final class ModuleProperties {
         return getLong("measurement.cache.refresh.seconds", 30);
     }
 
+    public static int getMeasurementCachePageSize() {
+        return (int) getLong("measurement.cache.page.size", 5000);
+    }
+
     private static long getLong(String key, long defaultValue) {
         String val = props.getProperty(key);
         if (val != null) {
