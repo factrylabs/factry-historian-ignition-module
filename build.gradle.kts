@@ -16,7 +16,7 @@ plugins {
 
 val sdk_version by extra("8.3.3")
 
-val majorMinor = "1.0"
+val majorMinor = "0.1"
 
 val buildNumberFile = file("build-number.txt")
 val buildNumber = if (buildNumberFile.exists()) {
