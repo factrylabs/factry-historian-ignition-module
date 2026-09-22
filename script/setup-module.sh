@@ -9,7 +9,7 @@ cd "$(dirname "$0")/.."
 
 IGNITION_DATA_DIR="./ignition/data"
 MODULES_JSON="$IGNITION_DATA_DIR/modules.json"
-MODULE_ID="io.factry.historian.FactryHistorian"
+MODULE_ID="io.factry.FactryHistorian"
 MODULE_DIR="$IGNITION_DATA_DIR/var/ignition/modl"
 CERT_FINGERPRINT="df049c75927bae8b1000cc3c9894ab4ecf48244f"
 

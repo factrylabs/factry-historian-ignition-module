@@ -79,7 +79,7 @@ The module has a single subproject:
 ### Module Configuration
 
 Module metadata is defined in root `build.gradle.kts`:
-- **Module ID**: `io.factry.historian.FactryHistorian`
+- **Module ID**: `io.factry.FactryHistorian`
 - **Display Name**: Factry Historian
 - **Ignition SDK Version**: 8.3.1
 - **Target Ignition Version**: 8.3+ (not backward compatible with 8.1/8.2)
