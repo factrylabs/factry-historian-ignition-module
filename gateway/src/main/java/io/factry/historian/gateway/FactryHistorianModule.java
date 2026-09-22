@@ -4,7 +4,7 @@ import java.io.InputStream;
 import java.util.Properties;
 
 public class FactryHistorianModule {
-    public static final String MODULE_ID = "io.factry.historian.FactryHistorian";
+    public static final String MODULE_ID = "io.factry.FactryHistorian";
 
     public static final String MODULE_VERSION;
 

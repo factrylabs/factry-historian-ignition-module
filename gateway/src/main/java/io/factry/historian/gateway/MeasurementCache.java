@@ -209,39 +209,8 @@ public class MeasurementCache {
 
             logger.debug("Creating measurement for '{}' with dataType={}", tagPath, dataType);
 
-            CreateMeasurement.Builder builder = CreateMeasurement.newBuilder()
-                    .setName(tagPath)
-                    .setAutoOnboard(true)
-                    .setDataType(dataType);
-
-            Map<String, String> metadata = pendingMetadata.remove(tagPath);
-            if (metadata != null && !metadata.isEmpty()) {
-                String description = metadata.remove("description");
-                if (description != null) {
-                    builder.setDescription(description);
-                }
-                if (!metadata.isEmpty()) {
-                    // Write remaining properties (engUnit, engLow, engHigh, ...) to BOTH
-                    // the metadata map and the attributes Struct. The metadata map is the
-                    // symmetric read/write channel — it round-trips back via
-                    // Measurement.metadata on queryMetadata (the read-side proto has no
-                    // 'attributes' field, so attributes alone would be write-only). We keep
-                    // attributes too so the values remain visible in the Factry UI.
-                    Struct.Builder attrs = Struct.newBuilder();
-                    for (Map.Entry<String, String> entry : metadata.entrySet()) {
-                        attrs.putFields(entry.getKey(),
-                                Value.newBuilder().setStringValue(entry.getValue()).build());
-                        builder.putMetadata(entry.getKey(), MetadataProperty.newBuilder()
-                                .setDataType(MetadataProperty.DataType.STRING)
-                                .setValue(Value.newBuilder().setStringValue(entry.getValue()).build())
-                                .build());
-                    }
-                    builder.setAttributes(attrs);
-                }
-                logger.debug("Applied cached metadata to new measurement '{}'", tagPath);
-            }
-
-            CreateMeasurement createMeasurement = builder.build();
+            CreateMeasurement createMeasurement = buildCreateMeasurement(
+                    tagPath, dataType, pendingMetadata.remove(tagPath));
 
             CreateMeasurementsRequest request = CreateMeasurementsRequest.newBuilder()
                     .addMeasurements(createMeasurement)
@@ -355,29 +324,8 @@ public class MeasurementCache {
             if (!toCreate.isEmpty()) {
                 CreateMeasurementsRequest.Builder req = CreateMeasurementsRequest.newBuilder();
                 for (String path : toCreate) {
-                    CreateMeasurement.Builder builder = CreateMeasurement.newBuilder()
-                            .setName(path)
-                            .setAutoOnboard(true)
-                            .setDataType(pathToDataType.get(path));
-
-                    Map<String, String> metadata = pendingMetadata.remove(path);
-                    if (metadata != null && !metadata.isEmpty()) {
-                        String description = metadata.remove("description");
-                        if (description != null) builder.setDescription(description);
-                        if (!metadata.isEmpty()) {
-                            Struct.Builder attrs = Struct.newBuilder();
-                            for (Map.Entry<String, String> e : metadata.entrySet()) {
-                                attrs.putFields(e.getKey(),
-                                        Value.newBuilder().setStringValue(e.getValue()).build());
-                                builder.putMetadata(e.getKey(), MetadataProperty.newBuilder()
-                                        .setDataType(MetadataProperty.DataType.STRING)
-                                        .setValue(Value.newBuilder().setStringValue(e.getValue()).build())
-                                        .build());
-                            }
-                            builder.setAttributes(attrs);
-                        }
-                    }
-                    req.addMeasurements(builder.build());
+                    req.addMeasurements(buildCreateMeasurement(
+                            path, pathToDataType.get(path), pendingMetadata.remove(path)));
                 }
                 grpcClient.createMeasurements(req.build());
                 logger.info("Batch-created {} measurements in one gRPC call", toCreate.size());
@@ -524,6 +472,91 @@ public class MeasurementCache {
             return existing;
         });
         logger.debug("Cached metadata for '{}': {}", tagPath, properties);
+    }
+
+    /** Factry derives EngineeringSpecs from a nested "Config" attribute group with these keys. */
+    private static final String CONFIG_GROUP = "Config";
+
+    /** Ignition tag property -> Factry Config attribute key, for the string-valued specs. */
+    private static final Map<String, String> CONFIG_STRING_KEYS = Map.of("engUnit", "UoM");
+
+    /** Ignition tag property -> Factry Config attribute key, for the number-valued specs. */
+    private static final Map<String, String> CONFIG_NUMBER_KEYS = Map.of(
+            "engLow", "ValueMin",
+            "engHigh", "ValueMax");
+
+    /**
+     * Build the CreateMeasurement for a new tag, mapping the cached Ignition metadata onto the
+     * shape Factry expects.
+     *
+     * Factry does not store engineering specs as a field. The server derives EngineeringSpecs from
+     * a nested "Config" attribute group (UoM, ValueMin, ValueMax, LimitLo, LimitHi), the same shape
+     * the Excel measurement importer writes. So the known Ignition properties go into that group,
+     * numeric ones as numbers. LimitLo and LimitHi have no plain Ignition tag property equivalent
+     * (those values live in alarm setpoints) and stay unset.
+     *
+     * Every other property goes to the metadata map, which stays the channel for arbitrary extras:
+     * it is the only one that round-trips back on read, since the read-side Measurement proto has
+     * no 'attributes' field. On read, Config-derived engineeringSpecs wins over the metadata map.
+     */
+    static CreateMeasurement buildCreateMeasurement(String tagPath, String dataType,
+                                                    Map<String, String> metadata) {
+        CreateMeasurement.Builder builder = CreateMeasurement.newBuilder()
+                .setName(tagPath)
+                .setAutoOnboard(true)
+                .setDataType(dataType);
+
+        if (metadata == null || metadata.isEmpty()) {
+            return builder.build();
+        }
+
+        Struct.Builder config = Struct.newBuilder();
+        for (Map.Entry<String, String> entry : metadata.entrySet()) {
+            String name = entry.getKey();
+            String value = entry.getValue();
+            if (value == null) {
+                continue;
+            }
+
+            if ("description".equals(name)) {
+                builder.setDescription(value);
+                continue;
+            }
+
+            String stringKey = CONFIG_STRING_KEYS.get(name);
+            if (stringKey != null) {
+                config.putFields(stringKey, Value.newBuilder().setStringValue(value).build());
+                continue;
+            }
+
+            String numberKey = CONFIG_NUMBER_KEYS.get(name);
+            if (numberKey != null) {
+                try {
+                    config.putFields(numberKey, Value.newBuilder()
+                            .setNumberValue(Double.parseDouble(value.trim()))
+                            .build());
+                    continue;
+                } catch (NumberFormatException nfe) {
+                    logger.debug("Property '{}' of '{}' is not numeric ('{}'), keeping it in metadata",
+                            name, tagPath, value);
+                }
+            }
+
+            builder.putMetadata(name, MetadataProperty.newBuilder()
+                    .setDataType(MetadataProperty.DataType.STRING)
+                    .setValue(Value.newBuilder().setStringValue(value).build())
+                    .build());
+        }
+
+        if (config.getFieldsCount() > 0) {
+            builder.setAttributes(Struct.newBuilder()
+                    .putFields(CONFIG_GROUP, Value.newBuilder()
+                            .setStructValue(config.build())
+                            .build()));
+        }
+
+        logger.debug("Applied cached metadata to new measurement '{}'", tagPath);
+        return builder.build();
     }
 
     static String toFactryDataType(Object value) {

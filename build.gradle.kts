@@ -45,7 +45,7 @@ ignitionModule {
     /*
      * Unique identifier for the module.  Reverse domain convention is recommended (e.g.: com.mycompany.charting-module)
      */
-    id.set("io.factry.historian.FactryHistorian")
+    id.set("io.factry.FactryHistorian")
 
     /*
      * Version of the module.  Here being set to the same version that gradle uses, up above in this file.

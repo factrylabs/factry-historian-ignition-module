@@ -571,11 +571,11 @@ public class FactryQueryEngine extends AbstractQueryEngine {
             }
         }
 
-        // Custom metadata properties stored via storeMetadata (engUnit, engLow, engHigh,
-        // and any others) round-trip through the measurement's metadata map. Surface any
-        // that weren't already provided above. (The read-side Measurement proto has no
-        // 'description'/'attributes' fields, so the metadata map is the only channel that
-        // round-trips storeMetadata values.)
+        // Properties stored via storeMetadata that Factry has no engineering spec for round-trip
+        // through the measurement's metadata map. Surface any that weren't already provided above:
+        // the Config-derived engineeringSpecs wins for engUnit/engLow/engHigh. (The read-side
+        // Measurement proto has no 'description'/'attributes' fields, so the metadata map is the
+        // only channel that round-trips arbitrary storeMetadata values.)
         Set<String> existing = new HashSet<>();
         for (var pv : ps) {
             existing.add(pv.getProperty().getName());
