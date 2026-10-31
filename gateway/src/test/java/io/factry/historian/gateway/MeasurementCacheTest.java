@@ -56,7 +56,7 @@ class MeasurementCacheTest {
         }
 
         @Test
-        void unknownPropertiesStillRoundTripThroughMetadata() {
+        void unknownPropertiesGoToTheMetadataMap() {
             Map<String, String> metadata = new LinkedHashMap<>();
             metadata.put("engUnit", "bar");
             metadata.put("documentation", "Boiler pressure");
