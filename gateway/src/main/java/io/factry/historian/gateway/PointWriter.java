@@ -5,6 +5,7 @@ import com.google.protobuf.util.Timestamps;
 import com.inductiveautomation.historian.common.model.data.AtomicPoint;
 import com.inductiveautomation.historian.common.model.data.StorageResult;
 import com.inductiveautomation.ignition.common.model.values.QualityCode;
+import io.factry.historian.proto.Measurement;
 import io.factry.historian.proto.Point;
 import io.factry.historian.proto.Points;
 import io.factry.historian.proto.QueryTimeseriesRequest;
@@ -17,6 +18,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
+import java.util.EnumMap;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -37,6 +39,7 @@ class PointWriter {
     private final FactryGrpcClient grpcClient;
     private final MeasurementCache measurementCache;
     private final HistorianMetrics metrics;
+    private final RefusalLog refusalLog = new RefusalLog();
 
     PointWriter(FactryGrpcClient grpcClient, MeasurementCache measurementCache, HistorianMetrics metrics) {
         this.grpcClient = grpcClient;
@@ -52,12 +55,36 @@ class PointWriter {
         return sendPoints(points, true);
     }
 
+    /** Forget which refusals were logged, for new settings: they are logged afresh. */
+    void clearRefusals() {
+        refusalLog.clear();
+    }
+
+    RefusalLog refusalLog() {
+        return refusalLog;
+    }
+
+    /**
+     * The flush is done: everything was sent, except points that were skipped (null value,
+     * unsupported type) or discarded because Factry has no measurement the module may write
+     * them to (see {@link MeasurementCache.WriteRefusal}). Those count as handled, so store
+     * and forward neither retries nor quarantines them.
+     */
+    private StorageResult<AtomicPoint<?>> stored(List<AtomicPoint<?>> points, BuildResult built) {
+        metrics.recordDiscarded(built.discardedPoints);
+        return StorageResult.success(points);
+    }
+
     /**
      * Build and send points to Factry. If the call fails with a server rejection
      * (e.g. deleted measurement) and {@code retryOnRejection} is true, evict the
-     * affected measurement UUIDs from the cache and retry once — the retry will
-     * trigger {@link MeasurementCache#getOrCreateUUID} which re-creates the
-     * measurement in Factry.
+     * affected measurement UUIDs from the cache and retry once. The retry resolves
+     * them again through {@link MeasurementCache#batchGetOrCreateUUIDs} (array
+     * measurements through {@link MeasurementCache#getOrCreateUUID}), which looks
+     * each measurement up in Factry first and only re-creates it if Factry no
+     * longer has it. If Factry does not answer one of those lookups in time, the
+     * rest is left unresolved, so the retry costs one write deadline, not one per
+     * evicted measurement.
      */
     private StorageResult<AtomicPoint<?>> sendPoints(List<AtomicPoint<?>> points, boolean retryOnRejection) {
         BuildResult built = buildPoints(points);
@@ -77,15 +104,15 @@ class PointWriter {
                 return StorageResult.exception(
                         new RuntimeException("Measurement creation failed, retry later"), points);
             }
-            if (measurementCache.size() == 0) {
+            if (measurementCache.size() == 0 && built.discardedPoints == 0) {
                 // All points skipped because measurement cache is empty (Factry likely down).
                 // Return exception so S&F keeps them in pending for retry.
                 logger.warn("No points to send, measurement cache empty — S&F will retry");
                 return StorageResult.exception(
                         new RuntimeException("Measurement cache empty, cannot resolve UUIDs"), points);
             }
-            logger.debug("No points to send (all skipped)");
-            return StorageResult.success(points);
+            logger.debug("No points to send (all skipped or discarded)");
+            return stored(points, built);
         }
 
         try {
@@ -104,7 +131,7 @@ class PointWriter {
                 return StorageResult.exception(
                         new RuntimeException("Array measurement(s) being created, retry later"), points);
             }
-            return StorageResult.success(points);
+            return stored(points, built);
 
         } catch (StatusRuntimeException e) {
             Status.Code code = e.getStatus().getCode();
@@ -133,13 +160,16 @@ class PointWriter {
         final Set<String> usedUUIDs;
         final boolean hasSkippedArrays;
         final boolean hasFailedCreations;
+        /** Points not sent because their measurement refuses them (see {@link #refusal}). */
+        final int discardedPoints;
 
         BuildResult(Points.Builder pointsBuilder, Set<String> usedUUIDs,
-                    boolean hasSkippedArrays, boolean hasFailedCreations) {
+                    boolean hasSkippedArrays, boolean hasFailedCreations, int discardedPoints) {
             this.pointsBuilder = pointsBuilder;
             this.usedUUIDs = usedUUIDs;
             this.hasSkippedArrays = hasSkippedArrays;
             this.hasFailedCreations = hasFailedCreations;
+            this.discardedPoints = discardedPoints;
         }
     }
 
@@ -161,6 +191,9 @@ class PointWriter {
         Points.Builder pointsBuilder = Points.newBuilder();
         Set<String> usedUUIDs = new HashSet<>();
         boolean hasFailedCreations = false;
+        int discardedPoints = 0;
+        Map<MeasurementCache.WriteRefusal, List<String>> newlyRefused =
+                new EnumMap<>(MeasurementCache.WriteRefusal.class);
         // Array element changes are collected here and merged into full snapshots below.
         Map<String, List<ArrayPointMerger.ArrayElement>> arrayElementsByPath = new HashMap<>();
 
@@ -211,6 +244,8 @@ class PointWriter {
                 if (MeasurementCache.toFactryDataType(value) == null) {
                     logger.debug("Skipping point for '" + tagPath + "': unsupported value type "
                             + value.getClass().getName());
+                } else if (refusal(tagPath, measurementCache.writeTarget(tagPath), newlyRefused) != null) {
+                    discardedPoints++;
                 } else {
                     logger.debug("Deferring point for '" + tagPath + "': measurement not created yet");
                     hasFailedCreations = true;
@@ -218,6 +253,7 @@ class PointWriter {
                 continue;
             }
 
+            written(tagPath);
             Point.Builder pb = Point.newBuilder()
                     .setMeasurementUUID(measurementUUID)
                     .setTimestamp(Timestamps.fromMillis(point.timestamp().toEpochMilli()))
@@ -247,8 +283,14 @@ class PointWriter {
             // Any element serves to detect the array's element type for async creation.
             ArrayPointMerger.ArrayElement firstElement = byTimestamp.firstEntry().getValue().firstEntry().getValue();
 
-            // Non-blocking: only check the cache, don't create
-            String measurementUUID = measurementCache.getUUID(basePath);
+            // Non-blocking: only check the cache, don't create. The target is looked up once,
+            // so a cache refresh in between cannot change it under us.
+            Measurement target = measurementCache.writeTarget(basePath);
+            if (refusal(basePath, target, newlyRefused) != null) {
+                discardedPoints += entry.getValue().size();
+                continue;
+            }
+            String measurementUUID = target != null ? target.getUuid() : null;
             if (measurementUUID == null || measurementUUID.isEmpty()) {
                 // Trigger async measurement creation if not already in progress
                 if (asyncArrayCreations.add(basePath)) {
@@ -269,6 +311,7 @@ class PointWriter {
                 continue;
             }
 
+            written(basePath);
             // Merge the incoming (possibly partial) element changes into the last-known
             // full array so unchanged elements are preserved, then store one row per
             // timestamp (see ArrayPointMerger.mergeUpdates).
@@ -305,7 +348,43 @@ class PointWriter {
             usedUUIDs.add(measurementUUID);
         }
 
-        return new BuildResult(pointsBuilder, usedUUIDs, hasSkippedArrays, hasFailedCreations);
+        newlyRefused.forEach((refusal, tagPaths) -> logger.warn(summary(refusal),
+                tagPaths.size(), RefusalLog.names(tagPaths, 5)));
+        return new BuildResult(pointsBuilder, usedUUIDs, hasSkippedArrays, hasFailedCreations, discardedPoints);
+    }
+
+    /**
+     * Why values for {@code tagPath} are not written to {@code target}, its measurement in the
+     * cache, or null when they may be (or the measurement is still to be resolved). A refusal
+     * the log has not reported yet is added to {@code newlyRefused}, for one warning per kind
+     * and flush.
+     */
+    private MeasurementCache.WriteRefusal refusal(String tagPath, Measurement target,
+            Map<MeasurementCache.WriteRefusal, List<String>> newlyRefused) {
+        MeasurementCache.WriteRefusal refusal = MeasurementCache.writeRefusal(target);
+        if (refusal != null && refusalLog.refused(tagPath, refusal)) {
+            newlyRefused.computeIfAbsent(refusal, k -> new ArrayList<>()).add(tagPath);
+            logger.debug("Not writing values for '{}' ({}): measurement {} has status '{}'",
+                    tagPath, refusal, target.getUuid(), target.getStatus());
+        }
+        return refusal;
+    }
+
+    /** The warning for the tags newly refused in a flush; takes their count and names. */
+    private static String summary(MeasurementCache.WriteRefusal refusal) {
+        switch (refusal) {
+            case NOT_ACTIVE:
+            default:
+                return "The Factry measurement of {} tag(s) exists but is not Active (for example"
+                        + " Discovered): {}. Their values are discarded until it is Active, from the first"
+                        + " cache refresh after that; it is not created again, which would only add a"
+                        + " duplicate. Logged once per tag.";
+        }
+    }
+
+    /** Record that {@code tagPath} was written, so a later refusal is logged again. */
+    private void written(String tagPath) {
+        refusalLog.written(tagPath);
     }
 
     /** Append a Java value to a protobuf ListValue as the matching Value kind. */

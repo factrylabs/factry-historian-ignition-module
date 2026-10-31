@@ -123,6 +123,11 @@ public class FactryStorageEngine extends AbstractStorageEngine {
         this.settings = newSettings;
     }
 
+    /** Forget the refusals of writes that were logged, for new settings. */
+    void clearRefusals() {
+        pointWriter.clearRefusals();
+    }
+
     public void shutdown() {
         logger.info("Shutting down Factry Storage Engine");
     }

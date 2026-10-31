@@ -12,6 +12,8 @@ import io.factry.historian.proto.Measurements;
 import io.factry.historian.proto.Points;
 import io.factry.historian.proto.QueryTimeseriesRequest;
 import io.factry.historian.proto.QueryTimeseriesResponse;
+import io.grpc.Status;
+import io.grpc.StatusRuntimeException;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -26,6 +28,13 @@ class FakeFactry extends FactryGrpcClient {
     final List<Measurement> measurements = new ArrayList<>();
     final List<String> createdNames = new ArrayList<>();
     final List<Points> sent = new ArrayList<>();
+    /** Number of single-name lookup calls (pages) made. */
+    int lookups = 0;
+    /** How many of the next single-name lookups fail, and with which gRPC status. */
+    int lookupFailures = 0;
+    Status lookupFailure = Status.INVALID_ARGUMENT;
+    /** Runs inside each create, after the measurements were added. */
+    Runnable onCreate = () -> { };
 
     FakeFactry() {
         super("localhost", 1, "collector", "token", false, false, null);
@@ -41,6 +50,16 @@ class FakeFactry extends FactryGrpcClient {
 
     void setStatus(String uuid, String status) {
         measurements.replaceAll(m -> m.getUuid().equals(uuid) ? m.toBuilder().setStatus(status).build() : m);
+    }
+
+    @Override
+    public Measurements getMeasurementsByFilterWithDeadline(GetMeasurementsByFilterRequest request) {
+        lookups++;
+        if (lookupFailures > 0) {
+            lookupFailures--;
+            throw new StatusRuntimeException(lookupFailure);
+        }
+        return getMeasurementsByFilter(request);
     }
 
     @Override
@@ -69,6 +88,7 @@ class FakeFactry extends FactryGrpcClient {
                 add(m.getName(), "new-" + m.getName());
             }
         }
+        onCreate.run();
         return CreateMeasurementsReply.getDefaultInstance();
     }
 
