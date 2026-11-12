@@ -131,6 +131,15 @@ class PointWriter {
                 return StorageResult.exception(
                         new RuntimeException("Array measurement(s) being created, retry later"), points);
             }
+            if (built.hasFailedCreations) {
+                // Some points were sent, but others have no measurement yet (Factry did not
+                // answer in time, or the creation failed). Return exception so S&F retries the
+                // whole batch — the sent points will be re-sent (idempotent) — instead of
+                // acknowledging the deferred points and losing them.
+                logger.warn("Could not create measurement(s) for new tag(s) — S&F will retry the flush");
+                return StorageResult.exception(
+                        new RuntimeException("Measurement creation failed, retry later"), points);
+            }
             return stored(points, built);
 
         } catch (StatusRuntimeException e) {

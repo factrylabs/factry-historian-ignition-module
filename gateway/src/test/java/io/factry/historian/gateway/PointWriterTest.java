@@ -60,6 +60,33 @@ class PointWriterTest {
     }
 
     @Test
+    void aFlushWithAPointWhoseMeasurementCouldNotBeCreatedIsRetriedWhole() {
+        factry.add("default/Tank/Level", "level-uuid");
+        cache.refresh(factry);
+        factry.lookupFailures = 1;
+        factry.lookupFailure = io.grpc.Status.UNAVAILABLE;
+
+        StorageResult<AtomicPoint<?>> result = writer.write(List.of(point("Tank/Level", 2.0), point("Tank/New", 1.0)));
+
+        assertEquals(StorageResult.Type.EXCEPTION, result.type(), "the deferred point must not be acknowledged");
+        assertEquals(List.of("level-uuid"), sentUUIDs(), "the other points were sent, and are re-sent on retry");
+        assertTrue(factry.createdNames.isEmpty());
+    }
+
+    @Test
+    void aFlushWhoseOnlyMeasurementCannotBeCreatedIsKeptForRetry() {
+        factry.add("default/Tank/Level", "level-uuid");
+        cache.refresh(factry);
+        factry.lookupFailures = 1;
+        factry.lookupFailure = io.grpc.Status.UNAVAILABLE;
+
+        StorageResult<AtomicPoint<?>> result = writer.write(List.of(point("Tank/New", 1.0)));
+
+        assertEquals(StorageResult.Type.EXCEPTION, result.type());
+        assertTrue(factry.sent.isEmpty());
+    }
+
+    @Test
     void anArrayIsSentAsOneMergedValue() {
         factry.add("default/Tank/Profile", "profile-uuid");
         cache.refresh(factry);
