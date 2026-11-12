@@ -15,6 +15,8 @@ public class HistorianMetrics {
     private final AtomicLong storeErrorCount = new AtomicLong();
     /** Points discarded because Factry has no measurement the module may write them to. */
     private final AtomicLong discardedPointCount = new AtomicLong();
+    /** Points dropped because their measurement is Paused in Factry. */
+    private final AtomicLong pausedDroppedPointCount = new AtomicLong();
 
     // Raw query metrics
     private final AtomicLong rawQueryCount = new AtomicLong();
@@ -40,6 +42,10 @@ public class HistorianMetrics {
         discardedPointCount.addAndGet(points);
     }
 
+    public void recordPausedDropped(int points) {
+        pausedDroppedPointCount.addAndGet(points);
+    }
+
     public void recordRawQuery(int rows, long elapsedMs) {
         rawQueryCount.incrementAndGet();
         rawQueryRowCount.addAndGet(rows);
@@ -58,6 +64,7 @@ public class HistorianMetrics {
         storeTotalMs.set(0);
         storeErrorCount.set(0);
         discardedPointCount.set(0);
+        pausedDroppedPointCount.set(0);
         rawQueryCount.set(0);
         rawQueryRowCount.set(0);
         rawQueryTotalMs.set(0);
@@ -71,6 +78,7 @@ public class HistorianMetrics {
     public long getStoreTotalMs() { return storeTotalMs.get(); }
     public long getStoreErrorCount() { return storeErrorCount.get(); }
     public long getDiscardedPointCount() { return discardedPointCount.get(); }
+    public long getPausedDroppedPointCount() { return pausedDroppedPointCount.get(); }
     public long getRawQueryCount() { return rawQueryCount.get(); }
     public long getRawQueryRowCount() { return rawQueryRowCount.get(); }
     public long getRawQueryTotalMs() { return rawQueryTotalMs.get(); }

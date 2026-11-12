@@ -330,4 +330,80 @@ class PointWriterTest {
             assertNull(cache.writeRefusal("default/Tank/Temp", FakeFactry.OWN));
         }
     }
+
+    @Nested
+    class PausedMeasurement {
+
+        @Test
+        void itsPointsAreDroppedAndCountAsStoredAndTheOthersSent() {
+            factry.add("default/Tank/Temp", "temp-uuid", "Paused");
+            factry.add("default/Tank/Level", "level-uuid");
+            cache.refresh(factry);
+
+            StorageResult<AtomicPoint<?>> result = writer.write(List.of(
+                    point("Tank/Temp", 21.5), point("Tank/Level", 3.2), point("Tank/Temp", 22.0, 2_000L)));
+
+            assertEquals(StorageResult.Type.SUCCESS, result.type(), "not held in store and forward");
+            assertEquals(List.of("level-uuid"), sentUUIDs());
+            assertEquals(2, metrics.getPausedDroppedPointCount());
+            assertEquals(0, metrics.getDiscardedPointCount());
+            assertTrue(factry.createdNames.isEmpty());
+        }
+
+        @Test
+        void aFlushOfOnlyPausedPointsIsDoneEvenWithNoActiveMeasurementCached() {
+            factry.add("default/Tank/Temp", "temp-uuid", "Paused");
+            cache.refresh(factry);
+            assertEquals(0, cache.size());
+
+            StorageResult<AtomicPoint<?>> result = writer.write(List.of(point("Tank/Temp", 21.5)));
+
+            assertEquals(StorageResult.Type.SUCCESS, result.type(), "not 'measurement cache empty, retry'");
+            assertTrue(factry.sent.isEmpty());
+            assertEquals(1, metrics.getPausedDroppedPointCount());
+        }
+
+        @Test
+        void itIsLoggedOnceAndAgainAfterAResume() {
+            factry.add("default/Tank/Temp", "temp-uuid", "Paused");
+            cache.refresh(factry);
+            RefusalLog log = writer.refusalLog();
+
+            writer.write(List.of(point("Tank/Temp", 21.5)));
+            assertTrue(log.isReported("default/Tank/Temp"));
+            writer.write(List.of(point("Tank/Temp", 21.6, 1_500L)));
+            assertTrue(log.isReported("default/Tank/Temp"));
+
+            factry.setStatus("temp-uuid", "Active");
+            cache.refresh(factry);
+            writer.write(List.of(point("Tank/Temp", 22.0, 2_000L)));
+
+            assertFalse(log.isReported("default/Tank/Temp"), "pausing it again is logged again");
+            assertEquals(List.of("temp-uuid"), sentUUIDs());
+        }
+
+        @Test
+        void anArrayKeepsItsChangesWhilePausedForTheFirstValueAfterTheResume() {
+            factry.add("default/Tank/Profile", "profile-uuid");
+            cache.refresh(factry);
+            writer.write(List.of(point("Tank/Profile[0]", 1, 1_000L), point("Tank/Profile[1]", 2, 1_000L),
+                    point("Tank/Profile[2]", 3, 1_000L)));
+
+            factry.setStatus("profile-uuid", "Paused");
+            cache.refresh(factry);
+            writer.write(List.of(point("Tank/Profile[0]", 9, 2_000L)));
+
+            factry.setStatus("profile-uuid", "Active");
+            cache.refresh(factry);
+            writer.write(List.of(point("Tank/Profile[1]", 5, 3_000L)));
+
+            assertEquals(2, factry.sent.size(), "nothing sent while paused");
+            Point last = factry.sent.get(1).getPoints(0);
+            List<Double> values = last.getValue().getListValue().getValuesList().stream()
+                    .map(com.google.protobuf.Value::getNumberValue)
+                    .collect(Collectors.toList());
+            assertEquals(List.of(9.0, 5.0, 3.0), values);
+            assertEquals(1, metrics.getPausedDroppedPointCount());
+        }
+    }
 }

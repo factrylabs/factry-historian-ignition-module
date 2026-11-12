@@ -70,12 +70,14 @@ class PointWriter {
 
     /**
      * The flush is done: everything was sent, except points that were skipped (null value,
-     * unsupported type) or discarded because Factry has no measurement the module may write
-     * them to (see {@link MeasurementCache.WriteRefusal}). Those count as handled, so store
-     * and forward neither retries nor quarantines them.
+     * unsupported type), discarded because Factry has no measurement the module may write
+     * them to, or dropped because the measurement is Paused (see
+     * {@link MeasurementCache.WriteRefusal}). Those count as handled, so store and forward
+     * neither retries nor quarantines them.
      */
     private StorageResult<AtomicPoint<?>> stored(List<AtomicPoint<?>> points, BuildResult built) {
         metrics.recordDiscarded(built.discardedPoints);
+        metrics.recordPausedDropped(built.pausedPoints);
         return StorageResult.success(points);
     }
 
@@ -108,7 +110,7 @@ class PointWriter {
                 return StorageResult.exception(
                         new RuntimeException("Measurement creation failed, retry later"), points);
             }
-            if (measurementCache.size() == 0 && built.discardedPoints == 0) {
+            if (measurementCache.size() == 0 && built.discardedPoints + built.pausedPoints == 0) {
                 // All points skipped because measurement cache is empty (Factry likely down).
                 // Return exception so S&F keeps them in pending for retry.
                 logger.warn("No points to send, measurement cache empty — S&F will retry");
@@ -175,14 +177,17 @@ class PointWriter {
         final boolean hasFailedCreations;
         /** Points not sent because their measurement refuses them (see {@link #refusal}). */
         final int discardedPoints;
+        /** Points not sent because their measurement is Paused. */
+        final int pausedPoints;
 
-        BuildResult(Points.Builder pointsBuilder, Set<String> usedUUIDs,
-                    boolean hasSkippedArrays, boolean hasFailedCreations, int discardedPoints) {
+        BuildResult(Points.Builder pointsBuilder, Set<String> usedUUIDs, boolean hasSkippedArrays,
+                    boolean hasFailedCreations, int discardedPoints, int pausedPoints) {
             this.pointsBuilder = pointsBuilder;
             this.usedUUIDs = usedUUIDs;
             this.hasSkippedArrays = hasSkippedArrays;
             this.hasFailedCreations = hasFailedCreations;
             this.discardedPoints = discardedPoints;
+            this.pausedPoints = pausedPoints;
         }
     }
 
@@ -205,6 +210,7 @@ class PointWriter {
         Set<String> usedUUIDs = new HashSet<>();
         boolean hasFailedCreations = false;
         int discardedPoints = 0;
+        int pausedPoints = 0;
         Map<MeasurementCache.WriteRefusal, List<String>> newlyRefused =
                 new EnumMap<>(MeasurementCache.WriteRefusal.class);
         // Array element changes are collected here and merged into full snapshots below.
@@ -257,8 +263,13 @@ class PointWriter {
                 if (MeasurementCache.toFactryDataType(value) == null) {
                     logger.debug("Skipping point for '" + tagPath + "': unsupported value type "
                             + value.getClass().getName());
-                } else if (refusal(tagPath, measurementCache.writeTarget(tagPath, grpcClient.getCollectorUUID()),
-                        newlyRefused) != null) {
+                    continue;
+                }
+                MeasurementCache.WriteRefusal refusal = refusal(tagPath,
+                        measurementCache.writeTarget(tagPath, grpcClient.getCollectorUUID()), newlyRefused);
+                if (refusal == MeasurementCache.WriteRefusal.PAUSED) {
+                    pausedPoints++;
+                } else if (refusal != null) {
                     discardedPoints++;
                 } else {
                     logger.debug("Deferring point for '" + tagPath + "': measurement not created yet");
@@ -301,7 +312,15 @@ class PointWriter {
             // so a cache refresh in between cannot change it under us.
             String collectorUUID = grpcClient.getCollectorUUID();
             Measurement target = measurementCache.writeTarget(basePath, collectorUUID);
-            if (refusal(basePath, target, newlyRefused) != null) {
+            MeasurementCache.WriteRefusal refusal = refusal(basePath, target, newlyRefused);
+            if (refusal == MeasurementCache.WriteRefusal.PAUSED) {
+                // Keep the merged array current, so the first value after the resume is the
+                // whole array as it is then; only the rows are dropped.
+                mergeArray(basePath, target.getUuid(), byTimestamp);
+                pausedPoints += entry.getValue().size();
+                continue;
+            }
+            if (refusal != null) {
                 discardedPoints += entry.getValue().size();
                 continue;
             }
@@ -328,21 +347,7 @@ class PointWriter {
             }
 
             written(basePath);
-            // Merge the incoming (possibly partial) element changes into the last-known
-            // full array so unchanged elements are preserved, then store one row per
-            // timestamp (see ArrayPointMerger.mergeUpdates).
-            java.util.TreeMap<Integer, Object> state =
-                    lastArrayValues.computeIfAbsent(basePath, k -> new java.util.TreeMap<>());
-            List<ArrayPointMerger.ArraySnapshot> snapshots;
-            synchronized (state) {
-                if (state.isEmpty()) {
-                    // Cache miss (first store for this array, or first after a restart) —
-                    // seed from Factry's last stored value so a partial update from Ignition
-                    // doesn't truncate the array.
-                    seedArrayStateFromFactry(basePath, measurementUUID, state);
-                }
-                snapshots = ArrayPointMerger.mergeUpdates(state, byTimestamp);
-            }
+            List<ArrayPointMerger.ArraySnapshot> snapshots = mergeArray(basePath, measurementUUID, byTimestamp);
 
             for (ArrayPointMerger.ArraySnapshot snap : snapshots) {
                 // Build a ListValue from the full merged array, in index order.
@@ -366,7 +371,28 @@ class PointWriter {
 
         newlyRefused.forEach((refusal, tagPaths) -> logger.warn(summary(refusal),
                 tagPaths.size(), RefusalLog.names(tagPaths, 5)));
-        return new BuildResult(pointsBuilder, usedUUIDs, hasSkippedArrays, hasFailedCreations, discardedPoints);
+        return new BuildResult(pointsBuilder, usedUUIDs, hasSkippedArrays, hasFailedCreations,
+                discardedPoints, pausedPoints);
+    }
+
+    /**
+     * Merge the incoming (possibly partial) element changes into the last-known full array so
+     * unchanged elements are preserved, and return one row per timestamp (see
+     * {@link ArrayPointMerger#mergeUpdates}).
+     */
+    private List<ArrayPointMerger.ArraySnapshot> mergeArray(String basePath, String measurementUUID,
+            java.util.TreeMap<Long, java.util.TreeMap<Integer, ArrayPointMerger.ArrayElement>> byTimestamp) {
+        java.util.TreeMap<Integer, Object> state =
+                lastArrayValues.computeIfAbsent(basePath, k -> new java.util.TreeMap<>());
+        synchronized (state) {
+            if (state.isEmpty()) {
+                // Cache miss (first store for this array, or first after a restart) —
+                // seed from Factry's last stored value so a partial update from Ignition
+                // doesn't truncate the array.
+                seedArrayStateFromFactry(basePath, measurementUUID, state);
+            }
+            return ArrayPointMerger.mergeUpdates(state, byTimestamp);
+        }
     }
 
     /**
@@ -391,6 +417,10 @@ class PointWriter {
     /** The warning for the tags newly refused in a flush; takes their count and names. */
     private static String summary(MeasurementCache.WriteRefusal refusal) {
         switch (refusal) {
+            case PAUSED:
+                return "The Factry measurement of {} tag(s) is Paused: {}. Values are dropped while it is"
+                        + " Paused; from the first cache refresh after it is Active again, new values are"
+                        + " stored. Logged once per tag.";
             case OTHER_COLLECTOR:
                 return "The Factry measurement of {} tag(s) belongs to another collector: {}. Factry would"
                         + " answer OK and drop their values, so they are discarded. Rename the tags, or move"
@@ -406,7 +436,9 @@ class PointWriter {
 
     /** Record that {@code tagPath} was written, so a later refusal is logged again. */
     private void written(String tagPath) {
-        refusalLog.written(tagPath);
+        if (refusalLog.written(tagPath) == MeasurementCache.WriteRefusal.PAUSED) {
+            logger.info("The Factry measurement of '{}' is Active again; its new values are stored", tagPath);
+        }
     }
 
     /** Append a Java value to a protobuf ListValue as the matching Value kind. */

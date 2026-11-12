@@ -529,4 +529,131 @@ class MeasurementCacheTest {
             assertNull(MeasurementCache.writeRefusal((Measurement) null, "abc-123"));
         }
     }
+
+    @Nested
+    class PausedMeasurement {
+
+        private static final String TEMP = "[default]Tank/Temp";
+
+        @Test
+        void isNeitherWrittenToNorCreatedNorLookedUp() {
+            FakeFactry factry = fakeFactry();
+            MeasurementCache cache = new MeasurementCache(NO_WAIT);
+            factry.add(TEMP, "own-uuid", "Paused");
+            cache.refresh(factry);
+
+            assertTrue(cache.batchGetOrCreateUUIDs(Map.of(TEMP, 21.5), factry).isEmpty());
+            assertEquals("", cache.getOrCreateUUID(TEMP, factry, 21.5));
+            assertTrue(factry.createdNames.isEmpty(), "creating would add a Discovered duplicate");
+            assertEquals(0, factry.lookups, "known from the refresh, no gRPC call per flush");
+            assertEquals(MeasurementCache.WriteRefusal.PAUSED, cache.writeRefusal(TEMP, FakeFactry.OWN));
+        }
+
+        @Test
+        void theLookupBeforeCreateFindsItToo() {
+            FakeFactry factry = fakeFactry();
+            MeasurementCache cache = new MeasurementCache(NO_WAIT);
+            // Paused after the cache was last refreshed, then evicted (or never cached).
+            factry.add(TEMP, "own-uuid", "Paused");
+
+            assertTrue(cache.batchGetOrCreateUUIDs(Map.of(TEMP, 21.5), factry).isEmpty());
+            assertTrue(factry.createdNames.isEmpty());
+            assertEquals(MeasurementCache.WriteRefusal.PAUSED, cache.writeRefusal(TEMP, FakeFactry.OWN));
+        }
+
+        @Test
+        void isWrittenToAgainFromTheRefreshAfterItIsActive() {
+            FakeFactry factry = fakeFactry();
+            MeasurementCache cache = new MeasurementCache(NO_WAIT);
+            factry.add(TEMP, "own-uuid", "Paused");
+            cache.refresh(factry);
+            factry.setStatus("own-uuid", "Active");
+
+            assertEquals(MeasurementCache.WriteRefusal.PAUSED, cache.writeRefusal(TEMP, FakeFactry.OWN),
+                    "until the next refresh");
+
+            cache.refresh(factry);
+
+            assertNull(cache.writeRefusal(TEMP, FakeFactry.OWN));
+            assertEquals(Map.of(TEMP, "own-uuid"), cache.batchGetOrCreateUUIDs(Map.of(TEMP, 21.5), factry));
+        }
+
+        @Test
+        void isPausedAgainFromTheRefreshAfterItIsPaused() {
+            FakeFactry factry = fakeFactry();
+            MeasurementCache cache = new MeasurementCache(NO_WAIT);
+            factry.add(TEMP, "own-uuid");
+            cache.refresh(factry);
+            factry.setStatus("own-uuid", "Paused");
+
+            cache.refresh(factry);
+
+            assertEquals(MeasurementCache.WriteRefusal.PAUSED, cache.writeRefusal(TEMP, FakeFactry.OWN));
+            assertTrue(cache.batchGetOrCreateUUIDs(Map.of(TEMP, 21.5), factry).isEmpty());
+            assertTrue(factry.createdNames.isEmpty());
+        }
+
+        @Test
+        void browseAndQueryDoNotSeeIt() {
+            FakeFactry factry = fakeFactry();
+            MeasurementCache cache = new MeasurementCache(NO_WAIT);
+            factry.add(TEMP, "own-uuid", "Paused");
+            cache.refresh(factry);
+
+            assertNull(cache.getMeasurementByName(TEMP));
+            assertNull(cache.getUUID(TEMP));
+            assertTrue(cache.getAllMeasurements().isEmpty());
+            assertEquals(0, cache.size());
+        }
+
+        @Test
+        void anotherCollectorsPausedMeasurementIsNotPausedForUs() {
+            FakeFactry factry = fakeFactry();
+            MeasurementCache cache = new MeasurementCache(NO_WAIT);
+            factry.add(TEMP, "other-uuid", FakeFactry.OTHER, "Paused");
+            cache.refresh(factry);
+
+            assertNull(cache.writeRefusal(TEMP, FakeFactry.OWN), "another collector's: create once first");
+            cache.batchGetOrCreateUUIDs(Map.of(TEMP, 21.5), factry);
+            assertEquals(MeasurementCache.WriteRefusal.NOT_ACTIVE, cache.writeRefusal(TEMP, FakeFactry.OWN));
+        }
+
+        @Test
+        void theOwnPausedMeasurementWinsOverOtherMeasurementsWithTheName() {
+            FakeFactry factry = fakeFactry();
+            MeasurementCache cache = new MeasurementCache(NO_WAIT);
+            factry.add(TEMP, "other-uuid", FakeFactry.OTHER, "Active");
+            factry.add(TEMP, "duplicate-uuid", "Discovered");
+            factry.add(TEMP, "own-uuid", "Paused");
+            factry.add(TEMP, "other-discovered", FakeFactry.OTHER, "Discovered");
+            cache.refresh(factry);
+
+            assertEquals(MeasurementCache.WriteRefusal.PAUSED, cache.writeRefusal(TEMP, FakeFactry.OWN));
+            assertTrue(cache.batchGetOrCreateUUIDs(Map.of(TEMP, 21.5), factry).isEmpty());
+            assertTrue(factry.createdNames.isEmpty());
+            // Browse and query still see the Active one.
+            assertEquals("other-uuid", cache.getUUID(TEMP));
+        }
+
+        @Test
+        void pollingStopsWhenTheCreatedMeasurementIsPaused() {
+            FakeFactry factry = fakeFactry();
+            MeasurementCache cache = new MeasurementCache(NO_WAIT);
+            factry.createdStatus = "Paused";
+
+            assertTrue(cache.batchGetOrCreateUUIDs(Map.of(TEMP, 21.5), factry).isEmpty());
+            assertEquals(2, factry.lookups, "the lookup before create and one poll");
+            assertEquals(MeasurementCache.WriteRefusal.PAUSED, cache.writeRefusal(TEMP, FakeFactry.OWN));
+        }
+
+        @Test
+        void refusalIsJudgedOnOwnershipFirst() {
+            Measurement paused = Measurement.newBuilder().setName("x").setUuid("u")
+                    .setCollectorUUID("abc-123").setStatus("Paused").build();
+
+            assertEquals(MeasurementCache.WriteRefusal.PAUSED, MeasurementCache.writeRefusal(paused, "abc-123"));
+            assertEquals(MeasurementCache.WriteRefusal.OTHER_COLLECTOR,
+                    MeasurementCache.writeRefusal(paused, "def-456"));
+        }
+    }
 }

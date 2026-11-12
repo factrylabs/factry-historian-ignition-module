@@ -112,7 +112,7 @@ public class MeasurementCache {
                         putPreferringOwn(freshByName, m, ownCollectorUUID);
                         freshMeasurements.put(m.getUuid(), m);
                     } else {
-                        putPreferringOwn(freshInactive, m, ownCollectorUUID);
+                        putInactive(freshInactive, m, ownCollectorUUID);
                     }
                 }
                 offset += pageCount;
@@ -436,7 +436,8 @@ public class MeasurementCache {
      * properties), so a burst of new tags doesn't trigger repeated full reloads on the
      * store-and-forward thread. The keyword filter matches substrings, so a common name can
      * have many matches: it reads further pages until an Active measurement with the name
-     * that this collector may write to turns up, up to {@link #LOOKUP_MAX_PAGES}.
+     * that this collector may write to, or its Paused one, turns up, up to
+     * {@link #LOOKUP_MAX_PAGES}.
      *
      * Returns every measurement with exactly that name, of any status; empty when Factry has
      * none. A connection error (UNAVAILABLE, DEADLINE_EXCEEDED) is thrown, so the caller
@@ -464,7 +465,8 @@ public class MeasurementCache {
                 offset += count;
                 boolean more = count == LOOKUP_PAGE_SIZE
                         && (response.getTotal() == 0 || offset < response.getTotal());
-                if (!more || matches.stream().anyMatch(m -> writeRefusal(m, collectorUUID) == null)) {
+                if (!more || matches.stream().anyMatch(m -> writeRefusal(m, collectorUUID) == null
+                        || writeRefusal(m, collectorUUID) == WriteRefusal.PAUSED)) {
                     break;
                 }
                 if (page == LOOKUP_MAX_PAGES) {
@@ -508,7 +510,7 @@ public class MeasurementCache {
                 tagPathToUUID.put(m.getName(), m.getUuid());
             }
         } else {
-            putPreferringOwn(inactiveByName, m, collectorUUID);
+            putInactive(inactiveByName, m, collectorUUID);
         }
     }
 
@@ -529,7 +531,14 @@ public class MeasurementCache {
          * Active measurement to write to. If not, Factry adds a Discovered duplicate, which also
          * tells later lookups and refreshes, after a restart too, that the module has tried.
          */
-        OTHER_COLLECTOR
+        OTHER_COLLECTOR,
+        /**
+         * This collector's measurement is Paused: Factry's way to tell collectors to stop
+         * collecting it without deleting it. Its values are dropped, as Factry's own collectors
+         * stop collecting, and it is never created again; from the first cache refresh after it
+         * is Active again, new values are stored.
+         */
+        PAUSED
     }
 
     /**
@@ -545,7 +554,10 @@ public class MeasurementCache {
         if (!isOwnedBy(m, collectorUUID)) {
             return WriteRefusal.OTHER_COLLECTOR;
         }
-        return isActive(m) ? null : WriteRefusal.NOT_ACTIVE;
+        if (isActive(m)) {
+            return null;
+        }
+        return "paused".equalsIgnoreCase(m.getStatus()) ? WriteRefusal.PAUSED : WriteRefusal.NOT_ACTIVE;
     }
 
     private static boolean isOwnedBy(Measurement m, String collectorUUID) {
@@ -554,13 +566,20 @@ public class MeasurementCache {
     }
 
     /**
-     * The cached measurement the write path judges for {@code tagPath}: the Active one (this
-     * collector's if several have the name), else one in another status (this collector's
-     * if several); or null when the cache has none.
+     * The cached measurement the write path judges for {@code tagPath}: this collector's
+     * Active one, else its Paused one, else another Active one, else one in another status
+     * (this collector's if several); or null when the cache has none.
      */
     Measurement writeTarget(String tagPath, String collectorUUID) {
         Measurement active = getMeasurementByName(tagPath);
-        return active != null ? active : inactiveByName.get(tagPath);
+        if (active != null && isOwnedBy(active, collectorUUID)) {
+            return active;
+        }
+        Measurement inactive = inactiveByName.get(tagPath);
+        if (inactive != null && writeRefusal(inactive, collectorUUID) == WriteRefusal.PAUSED) {
+            return inactive;
+        }
+        return active != null ? active : inactive;
     }
 
     /**
@@ -613,6 +632,22 @@ public class MeasurementCache {
     /** Forget the create attempts of this process, for a new collector or new settings. */
     public void clearWriteRefusals() {
         ownCreationTried.clear();
+    }
+
+    /**
+     * Put a non-Active {@code m} under its name, unless a better one has it: this collector's
+     * Paused measurement, else another of its own, else another collector's.
+     */
+    private static void putInactive(Map<String, Measurement> byName, Measurement m, String collectorUUID) {
+        Measurement current = byName.get(m.getName());
+        if (current == null || inactiveRank(m, collectorUUID) >= inactiveRank(current, collectorUUID)) {
+            byName.put(m.getName(), m);
+        }
+    }
+
+    private static int inactiveRank(Measurement m, String collectorUUID) {
+        WriteRefusal refusal = writeRefusal(m, collectorUUID);
+        return refusal == WriteRefusal.PAUSED ? 2 : refusal == WriteRefusal.OTHER_COLLECTOR ? 0 : 1;
     }
 
     /**

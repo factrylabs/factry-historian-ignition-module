@@ -42,8 +42,9 @@ class FakeFactry extends FactryGrpcClient {
     Runnable onCreate = () -> { };
     /** Whether existing measurements with the name of a new one are in another database. */
     boolean existingInOtherDatabase = false;
-    /** The collector Factry gives a created measurement. */
+    /** The collector and status Factry gives a created measurement. */
     String createdCollector = OWN;
+    String createdStatus = "Active";
     /** When set, creates fail with this gRPC status. */
     Status createFailure = null;
 
@@ -104,7 +105,7 @@ class FakeFactry extends FactryGrpcClient {
         for (CreateMeasurement m : request.getMeasurementsList()) {
             createdNames.add(m.getName());
             if (measurements.stream().noneMatch(e -> e.getName().equals(m.getName()))) {
-                add(m.getName(), "new-" + m.getName(), createdCollector, "Active");
+                add(m.getName(), "new-" + m.getName(), createdCollector, createdStatus);
             } else if (existingInOtherDatabase) {
                 add(m.getName(), "own-" + m.getName(), createdCollector, "Active");
             } else {
