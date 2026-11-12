@@ -154,6 +154,7 @@ In-memory cache of Factry measurements and assets. Both the storage engine and q
 - `refresh(grpcClient)` — fetches all measurements from Factry, replaces the maps. Only keeps measurements with `status=Active`
 - `getOrCreateUUID(tagPath, grpcClient, value)` — cache lookup with auto-creation: on miss, creates the measurement in Factry, polls until visible, returns UUID. Includes concurrent creation prevention (`pendingCreations` set) and data type detection from the value
 - `evictByUUID(uuid)` — removes a measurement so it gets re-created on next write (used when Factry rejects points for deleted measurements)
+- Before creating a measurement, the write path looks its exact name up in Factry and reuses an Active one. Measurements that are not Active (Discovered, ...) are kept in `inactiveByName`, for the write path only. Values for a tag whose measurement exists only in another status are discarded (`WriteRefusal.NOT_ACTIVE`): counted as handled, so store and forward does not retry them, with one warning per flush naming the newly refused tags and a count in `HistorianMetrics.getDiscardedPointCount()`. The measurement is not created again
 
 **Refreshed every 30 seconds** by `FactryHistoryProvider`'s scheduled executor.
 
@@ -270,6 +271,8 @@ Extends `AbstractStorageEngine`. Receives data points from Ignition's tag system
 5. Maps Ignition `QualityCode` to status string ("Good", "Uncertain", "Bad")
 6. Sends `CreatePoints` gRPC call
 7. On failure: distinguishes connection errors (UNAVAILABLE, DEADLINE_EXCEEDED) from server rejections. On rejection, evicts the measurement UUID and retries once (handles deleted measurements)
+
+Steps 2 to 7 live in `PointWriter`, which the engine calls; it uses no Ignition gateway classes, so unit tests can run it against a fake Factry client.
 
 **`isEngineUnavailable()`** — returns `true` when the gRPC connection is down. This is how S&F knows to buffer instead of attempting writes.
 
