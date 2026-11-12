@@ -271,6 +271,8 @@ Extends `AbstractStorageEngine`. Receives data points from Ignition's tag system
 6. Sends `CreatePoints` gRPC call
 7. On failure: distinguishes connection errors (UNAVAILABLE, DEADLINE_EXCEEDED) from server rejections. On rejection, evicts the measurement UUID and retries once (handles deleted measurements)
 
+Steps 2 to 7 live in `PointWriter`, which the engine calls; it uses no Ignition gateway classes, so unit tests can run it against a fake Factry client.
+
 **`isEngineUnavailable()`** — returns `true` when the gRPC connection is down. This is how S&F knows to buffer instead of attempting writes.
 
 **`doStoreMetadata()`** / **`doStoreSourceChange()`** — no-ops. Metadata is managed on the Factry platform, not pushed from Ignition.
