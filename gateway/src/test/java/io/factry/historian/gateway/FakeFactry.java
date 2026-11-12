@@ -20,11 +20,16 @@ import java.util.List;
 
 /**
  * Stands in for Factry in unit tests: the gRPC channel is never used, because the calls the
- * module makes are overridden. Like Factry, the keyword filter matches substrings and pages its
- * answer, and a create with a name that already exists does not return the existing measurement.
- * Call {@link #shutdown()} after the test.
+ * module makes are overridden. The module writes as collector {@link #OWN}. Like Factry, the
+ * keyword filter matches substrings and pages its answer, and a create with a name that already
+ * exists does not return the existing measurement: it adds a Discovered duplicate, or, when the
+ * existing one is in another time-series database, an Active measurement. Call
+ * {@link #shutdown()} after the test.
  */
 class FakeFactry extends FactryGrpcClient {
+    static final String OWN = "collector";
+    static final String OTHER = "other-collector";
+
     final List<Measurement> measurements = new ArrayList<>();
     final List<String> createdNames = new ArrayList<>();
     final List<Points> sent = new ArrayList<>();
@@ -35,9 +40,15 @@ class FakeFactry extends FactryGrpcClient {
     Status lookupFailure = Status.INVALID_ARGUMENT;
     /** Runs inside each create, after the measurements were added. */
     Runnable onCreate = () -> { };
+    /** Whether existing measurements with the name of a new one are in another database. */
+    boolean existingInOtherDatabase = false;
+    /** The collector Factry gives a created measurement. */
+    String createdCollector = OWN;
+    /** When set, creates fail with this gRPC status. */
+    Status createFailure = null;
 
     FakeFactry() {
-        super("localhost", 1, "collector", "token", false, false, null);
+        super("localhost", 1, OWN, "token", false, false, null);
     }
 
     void add(String name, String uuid) {
@@ -45,7 +56,12 @@ class FakeFactry extends FactryGrpcClient {
     }
 
     void add(String name, String uuid, String status) {
-        measurements.add(Measurement.newBuilder().setName(name).setUuid(uuid).setStatus(status).build());
+        add(name, uuid, OWN, status);
+    }
+
+    void add(String name, String uuid, String collectorUUID, String status) {
+        measurements.add(Measurement.newBuilder().setName(name).setUuid(uuid)
+                .setCollectorUUID(collectorUUID).setStatus(status).build());
     }
 
     void setStatus(String uuid, String status) {
@@ -82,10 +98,17 @@ class FakeFactry extends FactryGrpcClient {
 
     @Override
     public CreateMeasurementsReply createMeasurements(CreateMeasurementsRequest request) {
+        if (createFailure != null) {
+            throw new StatusRuntimeException(createFailure);
+        }
         for (CreateMeasurement m : request.getMeasurementsList()) {
             createdNames.add(m.getName());
             if (measurements.stream().noneMatch(e -> e.getName().equals(m.getName()))) {
-                add(m.getName(), "new-" + m.getName());
+                add(m.getName(), "new-" + m.getName(), createdCollector, "Active");
+            } else if (existingInOtherDatabase) {
+                add(m.getName(), "own-" + m.getName(), createdCollector, "Active");
+            } else {
+                add(m.getName(), "duplicate-" + m.getName(), createdCollector, "Discovered");
             }
         }
         onCreate.run();

@@ -12,6 +12,7 @@ import org.junit.jupiter.api.Test;
 
 import java.time.Instant;
 import java.util.List;
+import java.util.Map;
 import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -208,6 +209,125 @@ class PointWriterTest {
             writer.clearRefusals();
 
             assertFalse(writer.refusalLog().isReported("default/Tank/Temp"));
+        }
+    }
+
+    @Nested
+    class MeasurementOfAnotherCollector {
+
+        /** Let the module try once to create its own, so the refusal is settled. */
+        void settle(String name) {
+            cache.batchGetOrCreateUUIDs(Map.of(name, 1.0), factry);
+            assertEquals(MeasurementCache.WriteRefusal.OTHER_COLLECTOR, cache.writeRefusal(name, FakeFactry.OWN));
+        }
+
+        @Test
+        void itsPointsAreDiscardedAndTheOthersSent() {
+            factry.add("default/Tank/Temp", "other-uuid", FakeFactry.OTHER, "Active");
+            factry.add("default/Tank/Level", "level-uuid");
+            cache.refresh(factry);
+            settle("default/Tank/Temp");
+
+            StorageResult<AtomicPoint<?>> result = writer.write(List.of(
+                    point("Tank/Temp", 21.5), point("Tank/Level", 3.2), point("Tank/Temp", 22.0, 2_000L)));
+
+            assertEquals(StorageResult.Type.SUCCESS, result.type(), "handled, so never retried or quarantined");
+            assertEquals(List.of("level-uuid"), sentUUIDs());
+            assertEquals(2, metrics.getDiscardedPointCount());
+        }
+
+        @Test
+        void theFirstFlushTriesOnceAndDiscards() {
+            factry.add("default/Tank/Temp", "other-uuid", FakeFactry.OTHER, "Active");
+            factry.add("default/Tank/Level", "level-uuid");
+            cache.refresh(factry);
+
+            StorageResult<AtomicPoint<?>> result = writer.write(List.of(point("Tank/Temp", 21.5), point("Tank/Level", 3.2)));
+
+            assertEquals(StorageResult.Type.SUCCESS, result.type());
+            assertEquals(List.of("level-uuid"), sentUUIDs());
+            assertEquals(List.of("default/Tank/Temp"), factry.createdNames);
+            assertEquals(1, metrics.getDiscardedPointCount());
+        }
+
+        @Test
+        void anotherCollectorsPausedNameAloneOrMixedIsDiscarded() {
+            factry.add("default/Tank/Temp", "op-uuid", FakeFactry.OTHER, "Paused");
+            factry.add("default/Tank/Level", "level-uuid");
+            cache.refresh(factry);
+
+            assertEquals(StorageResult.Type.SUCCESS, writer.write(List.of(point("Tank/Temp", 1.0))).type());
+            StorageResult<AtomicPoint<?>> mixed = writer.write(List.of(point("Tank/Temp", 1.0, 2_000L),
+                    point("Tank/Level", 2.0, 2_000L)));
+
+            assertEquals(StorageResult.Type.SUCCESS, mixed.type());
+            assertEquals(List.of("level-uuid"), sentUUIDs());
+            assertEquals(List.of("default/Tank/Temp"), factry.createdNames, "tried once");
+        }
+
+        @Test
+        void refusedPointsNextToACreationToRetryLeaveTheFlushToRetry() {
+            factry.add("default/Tank/Temp", "other-uuid", FakeFactry.OTHER, "Active");
+            cache.refresh(factry);
+            settle("default/Tank/Temp");
+            factry.lookupFailures = 1;
+            factry.lookupFailure = io.grpc.Status.UNAVAILABLE;
+
+            StorageResult<AtomicPoint<?>> result = writer.write(List.of(
+                    point("Tank/Temp", 21.5), point("Tank/New", 1.0)));
+
+            assertEquals(StorageResult.Type.EXCEPTION, result.type());
+            assertTrue(factry.sent.isEmpty());
+            assertEquals(0, metrics.getDiscardedPointCount(), "counted when the flush is done, not per retry");
+        }
+
+        @Test
+        void itsArrayElementsAreDiscarded() {
+            factry.add("default/Tank/Profile", "other-uuid", FakeFactry.OTHER, "Active");
+            cache.refresh(factry);
+            settle("default/Tank/Profile");
+
+            StorageResult<AtomicPoint<?>> result = writer.write(List.of(
+                    point("Tank/Profile[0]", 1), point("Tank/Profile[1]", 2)));
+
+            assertEquals(StorageResult.Type.SUCCESS, result.type());
+            assertTrue(factry.sent.isEmpty());
+            assertEquals(2, metrics.getDiscardedPointCount());
+            assertEquals(1, factry.createdNames.size(), "no array creation beyond the settling try");
+        }
+
+        @Test
+        void theRefusalIsLoggedOnceUntilTheTagIsWrittenAgain() {
+            factry.add("default/Tank/Temp", "other-uuid", FakeFactry.OTHER, "Active");
+            cache.refresh(factry);
+            settle("default/Tank/Temp");
+            RefusalLog log = writer.refusalLog();
+
+            writer.write(List.of(point("Tank/Temp", 21.5)));
+            assertTrue(log.isReported("default/Tank/Temp"));
+
+            // The measurement moves to this collector.
+            factry.measurements.clear();
+            factry.add("default/Tank/Temp", "own-uuid");
+            cache.refresh(factry);
+            writer.write(List.of(point("Tank/Temp", 22.0)));
+
+            assertFalse(log.isReported("default/Tank/Temp"), "a later refusal is logged again");
+            assertEquals(List.of("own-uuid"), sentUUIDs());
+        }
+
+        @Test
+        void newSettingsForgetTheRefusals() {
+            factry.add("default/Tank/Temp", "other-uuid", FakeFactry.OTHER, "Active");
+            cache.refresh(factry);
+            factry.createFailure = io.grpc.Status.ALREADY_EXISTS;
+            settle("default/Tank/Temp");
+            writer.write(List.of(point("Tank/Temp", 21.5)));
+
+            writer.clearRefusals();
+
+            assertFalse(writer.refusalLog().isReported("default/Tank/Temp"));
+            assertNull(cache.writeRefusal("default/Tank/Temp", FakeFactry.OWN));
         }
     }
 }

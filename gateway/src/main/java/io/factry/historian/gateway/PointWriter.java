@@ -55,9 +55,13 @@ class PointWriter {
         return sendPoints(points, true);
     }
 
-    /** Forget which refusals were logged, for new settings: they are logged afresh. */
+    /**
+     * Forget which refusals were logged and which create attempts were made, for new
+     * settings (the collector may have changed): they are judged and logged afresh.
+     */
     void clearRefusals() {
         refusalLog.clear();
+        measurementCache.clearWriteRefusals();
     }
 
     RefusalLog refusalLog() {
@@ -253,7 +257,8 @@ class PointWriter {
                 if (MeasurementCache.toFactryDataType(value) == null) {
                     logger.debug("Skipping point for '" + tagPath + "': unsupported value type "
                             + value.getClass().getName());
-                } else if (refusal(tagPath, measurementCache.writeTarget(tagPath), newlyRefused) != null) {
+                } else if (refusal(tagPath, measurementCache.writeTarget(tagPath, grpcClient.getCollectorUUID()),
+                        newlyRefused) != null) {
                     discardedPoints++;
                 } else {
                     logger.debug("Deferring point for '" + tagPath + "': measurement not created yet");
@@ -294,12 +299,14 @@ class PointWriter {
 
             // Non-blocking: only check the cache, don't create. The target is looked up once,
             // so a cache refresh in between cannot change it under us.
-            Measurement target = measurementCache.writeTarget(basePath);
+            String collectorUUID = grpcClient.getCollectorUUID();
+            Measurement target = measurementCache.writeTarget(basePath, collectorUUID);
             if (refusal(basePath, target, newlyRefused) != null) {
                 discardedPoints += entry.getValue().size();
                 continue;
             }
-            String measurementUUID = target != null ? target.getUuid() : null;
+            String measurementUUID = MeasurementCache.writeRefusal(target, collectorUUID) == null
+                    ? (target != null ? target.getUuid() : null) : null;
             if (measurementUUID == null || measurementUUID.isEmpty()) {
                 // Trigger async measurement creation if not already in progress
                 if (asyncArrayCreations.add(basePath)) {
@@ -370,11 +377,13 @@ class PointWriter {
      */
     private MeasurementCache.WriteRefusal refusal(String tagPath, Measurement target,
             Map<MeasurementCache.WriteRefusal, List<String>> newlyRefused) {
-        MeasurementCache.WriteRefusal refusal = MeasurementCache.writeRefusal(target);
+        String collectorUUID = grpcClient.getCollectorUUID();
+        MeasurementCache.WriteRefusal refusal = measurementCache.writeRefusal(tagPath, target, collectorUUID);
         if (refusal != null && refusalLog.refused(tagPath, refusal)) {
             newlyRefused.computeIfAbsent(refusal, k -> new ArrayList<>()).add(tagPath);
-            logger.debug("Not writing values for '{}' ({}): measurement {} has status '{}'",
-                    tagPath, refusal, target.getUuid(), target.getStatus());
+            logger.debug("Not writing values for '{}' ({}): measurement {} has status '{}' and belongs to"
+                    + " collector {}; this collector is {}", tagPath, refusal, target.getUuid(),
+                    target.getStatus(), target.getCollectorUUID(), collectorUUID);
         }
         return refusal;
     }
@@ -382,6 +391,10 @@ class PointWriter {
     /** The warning for the tags newly refused in a flush; takes their count and names. */
     private static String summary(MeasurementCache.WriteRefusal refusal) {
         switch (refusal) {
+            case OTHER_COLLECTOR:
+                return "The Factry measurement of {} tag(s) belongs to another collector: {}. Factry would"
+                        + " answer OK and drop their values, so they are discarded. Rename the tags, or move"
+                        + " the measurements to this collector in Factry. Logged once per tag.";
             case NOT_ACTIVE:
             default:
                 return "The Factry measurement of {} tag(s) exists but is not Active (for example"

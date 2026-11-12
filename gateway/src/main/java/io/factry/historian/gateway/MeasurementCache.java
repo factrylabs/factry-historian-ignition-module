@@ -48,6 +48,11 @@ public class MeasurementCache {
      * exists only in another status costs no lookup per flush.
      */
     private volatile ConcurrentHashMap<String, Measurement> inactiveByName = new ConcurrentHashMap<>();
+    /**
+     * Tag paths for which this collector has asked Factry once to create its own measurement,
+     * although another collector's had the name (see {@link WriteRefusal#OTHER_COLLECTOR}).
+     */
+    private final Set<String> ownCreationTried = ConcurrentHashMap.newKeySet();
 
     private volatile ConcurrentHashMap<String, String> assetNameToUUID = new ConcurrentHashMap<>();
     private volatile ConcurrentHashMap<String, Asset> uuidToAsset = new ConcurrentHashMap<>();
@@ -76,8 +81,9 @@ public class MeasurementCache {
 
     public void refresh(FactryGrpcClient grpcClient) {
         try {
+            String ownCollectorUUID = grpcClient.getCollectorUUID();
             // Fetch all measurements using pagination
-            Map<String, String> freshPaths = new HashMap<>();
+            Map<String, Measurement> freshByName = new HashMap<>();
             Map<String, Measurement> freshMeasurements = new HashMap<>();
             Map<String, Measurement> freshInactive = new HashMap<>();
             long offset = 0;
@@ -103,19 +109,25 @@ public class MeasurementCache {
 
                 for (Measurement m : response.getMeasurementsList()) {
                     if ("active".equalsIgnoreCase(m.getStatus())) {
-                        freshPaths.put(m.getName(), m.getUuid());
+                        putPreferringOwn(freshByName, m, ownCollectorUUID);
                         freshMeasurements.put(m.getUuid(), m);
                     } else {
-                        freshInactive.put(m.getName(), m);
+                        putPreferringOwn(freshInactive, m, ownCollectorUUID);
                     }
                 }
                 offset += pageCount;
             }
 
+            Map<String, String> freshPaths = new HashMap<>();
+            for (Measurement m : freshByName.values()) {
+                freshPaths.put(m.getName(), m.getUuid());
+            }
+
             // Swap in freshly-built maps by reference so deleted measurements don't linger and
-            // concurrent readers never observe a half-filled map.
-            tagPathToUUID = new ConcurrentHashMap<>(freshPaths);
+            // concurrent readers never observe a half-filled map. The UUID map goes first, so a
+            // name found in the new path map always has its measurement.
             uuidToMeasurement = new ConcurrentHashMap<>(freshMeasurements);
+            tagPathToUUID = new ConcurrentHashMap<>(freshPaths);
             inactiveByName = new ConcurrentHashMap<>(freshInactive);
             logger.info("Measurement cache refreshed, {} active of {} total from Factry",
                     freshPaths.size(), serverTotal == Long.MAX_VALUE ? offset : serverTotal);
@@ -200,7 +212,7 @@ public class MeasurementCache {
 
     private String getOrCreateUUID(String tagPath, FactryGrpcClient grpcClient, Object value, String explicitDataType) {
         // Fast path: already cached ("" when values for it are not written, see WriteRefusal)
-        String uuid = writeUUID(tagPath);
+        String uuid = writeUUID(tagPath, grpcClient.getCollectorUUID());
         if (uuid != null) {
             logger.debug("Cache hit for '{}': uuid={}", tagPath, uuid);
             return uuid;
@@ -228,20 +240,21 @@ public class MeasurementCache {
      *                       data-type inference — the actual written values come from
      *                       the caller)
      * @return map from tag path to UUID; absent entries mean either that values for the
-     *         path are not written (see {@link #writeRefusal(String)}) or that the
+     *         path are not written (see {@link #writeRefusal(String, String)}) or that the
      *         measurement could not be resolved or created (caller should mark those points
      *         for S&amp;F retry)
      */
     public Map<String, String> batchGetOrCreateUUIDs(
             Map<String, Object> tagPathToValue, FactryGrpcClient grpcClient) {
 
+        String collectorUUID = grpcClient.getCollectorUUID();
         Map<String, String> result = new HashMap<>();
 
         // Split into cache hits and paths that need a UUID.
         Map<String, String> pathToDataType = new LinkedHashMap<>();
         for (Map.Entry<String, Object> entry : tagPathToValue.entrySet()) {
             String path = entry.getKey();
-            String uuid = writeUUID(path);
+            String uuid = writeUUID(path, collectorUUID);
             if (uuid != null) {
                 if (!uuid.isEmpty()) {
                     result.put(path, uuid);
@@ -270,10 +283,12 @@ public class MeasurementCache {
      * not return the existing measurement but adds a duplicate in status Discovered. What the
      * lookup finds is cached. An Active measurement with the name is used; a name that exists
      * only in another status is refused ({@link WriteRefusal#NOT_ACTIVE}) and not created
-     * again. The names Factry does not have are batched into a single
-     * {@code CreateMeasurementsRequest}; then all missing paths (newly created plus those
-     * delegated to another thread) are polled together with the same lookup, until a
-     * measurement with the name turns up.
+     * again. When the measurement with the name is another collector's, this collector's own
+     * is created once per tag ({@link WriteRefusal#OTHER_COLLECTOR}). The names Factry does
+     * not have are batched into a single {@code CreateMeasurementsRequest}; then all missing
+     * paths (newly created plus those delegated to another thread) are polled together with
+     * the same lookup: until a measurement with the name turns up, or, for a name another
+     * collector had, until one of this collector's turns up.
      *
      * If Factry does not answer a lookup in time (UNAVAILABLE or DEADLINE_EXCEEDED), the
      * rest is abandoned: nothing is created, and only the paths resolved so far are returned.
@@ -282,7 +297,12 @@ public class MeasurementCache {
      * @return map from tag path to UUID; absent entries were refused or could not be resolved
      */
     private Map<String, String> resolveMissing(Map<String, String> pathToDataType, FactryGrpcClient grpcClient) {
+        String collectorUUID = grpcClient.getCollectorUUID();
         Map<String, String> result = new HashMap<>();
+        // Paths created although another collector's measurement has the name, and those of
+        // them whose creation Factry answered (or refused): tried, once the polling is done.
+        Set<String> clashes = new HashSet<>();
+        Set<String> triedClashes = new HashSet<>();
 
         // Separate paths this call will create from ones another thread is already
         // handling (pendingCreations guards against duplicate-creation races).
@@ -298,10 +318,17 @@ public class MeasurementCache {
                 // even if the lookup throws.
                 toCreate.add(path);
                 // Double-check the cache after acquiring the creation slot, then Factry itself.
-                String uuid = writeUUID(path);
+                String uuid = writeUUID(path, collectorUUID);
                 if (uuid == null) {
-                    lookUpByName(path, grpcClient).forEach(this::cacheMeasurement);
-                    uuid = writeUUID(path);
+                    lookUpByName(path, grpcClient).forEach(m -> cacheMeasurement(m, collectorUUID));
+                    uuid = writeUUID(path, collectorUUID);
+                    Measurement other = writeTarget(path, collectorUUID);
+                    if (uuid == null && other != null) {
+                        logger.info("Measurement '{}' belongs to another collector ({}); asking Factry"
+                                + " once to create one for this collector", path, other.getCollectorUUID());
+                        clashes.add(path);
+                        continue;
+                    }
                 }
                 if (uuid != null) {
                     logger.debug("Measurement '{}' already exists in Factry: '{}'", path, uuid);
@@ -321,7 +348,15 @@ public class MeasurementCache {
                     req.addMeasurements(buildCreateMeasurement(
                             path, pathToDataType.get(path), pendingMetadata.remove(path)));
                 }
-                grpcClient.createMeasurements(req.build());
+                try {
+                    grpcClient.createMeasurements(req.build());
+                } catch (RuntimeException e) {
+                    if (!FactryGrpcClient.isConnectionError(e)) {
+                        triedClashes.addAll(clashes);
+                    }
+                    throw e;
+                }
+                triedClashes.addAll(clashes);
                 logger.info("Batch-created {} measurements in one gRPC call", toCreate.size());
             }
 
@@ -339,10 +374,12 @@ public class MeasurementCache {
                     break;
                 }
                 stillMissing.removeIf(path -> {
-                    lookUpByName(path, grpcClient).forEach(this::cacheMeasurement);
-                    String uuid = writeUUID(path);
+                    lookUpByName(path, grpcClient).forEach(m -> cacheMeasurement(m, collectorUUID));
+                    String uuid = writeUUID(path, collectorUUID);
                     if (uuid == null) {
-                        return false;
+                        // Another collector's turned up: done, unless this is the clash we are
+                        // creating ours for, which waits for one of this collector's.
+                        return !clashes.contains(path) && writeTarget(path, collectorUUID) != null;
                     }
                     if (!uuid.isEmpty()) {
                         result.put(path, uuid);
@@ -358,8 +395,10 @@ public class MeasurementCache {
                         stillMissing.size());
                 refresh(grpcClient);
                 for (String path : stillMissing) {
-                    String uuid = writeUUID(path);
-                    if (uuid == null) {
+                    String uuid = writeUUID(path, collectorUUID);
+                    if (uuid == null && clashes.contains(path)) {
+                        logger.info("Factry made no measurement '{}' for this collector", path);
+                    } else if (uuid == null) {
                         logger.warn("Measurement not found after batch create + full refresh: '{}'", path);
                     } else if (!uuid.isEmpty()) {
                         result.put(path, uuid);
@@ -376,6 +415,7 @@ public class MeasurementCache {
             }
         } finally {
             toCreate.forEach(pendingCreations::remove);
+            ownCreationTried.addAll(triedClashes);
         }
 
         return result;
@@ -396,7 +436,7 @@ public class MeasurementCache {
      * properties), so a burst of new tags doesn't trigger repeated full reloads on the
      * store-and-forward thread. The keyword filter matches substrings, so a common name can
      * have many matches: it reads further pages until an Active measurement with the name
-     * turns up, up to {@link #LOOKUP_MAX_PAGES}.
+     * that this collector may write to turns up, up to {@link #LOOKUP_MAX_PAGES}.
      *
      * Returns every measurement with exactly that name, of any status; empty when Factry has
      * none. A connection error (UNAVAILABLE, DEADLINE_EXCEEDED) is thrown, so the caller
@@ -404,6 +444,7 @@ public class MeasurementCache {
      * ends the lookup with the matches so far, so the measurement is created as before.
      */
     private List<Measurement> lookUpByName(String tagPath, FactryGrpcClient grpcClient) {
+        String collectorUUID = grpcClient.getCollectorUUID();
         List<Measurement> matches = new ArrayList<>();
         try {
             long offset = 0;
@@ -423,7 +464,7 @@ public class MeasurementCache {
                 offset += count;
                 boolean more = count == LOOKUP_PAGE_SIZE
                         && (response.getTotal() == 0 || offset < response.getTotal());
-                if (!more || matches.stream().anyMatch(MeasurementCache::isActive)) {
+                if (!more || matches.stream().anyMatch(m -> writeRefusal(m, collectorUUID) == null)) {
                     break;
                 }
                 if (page == LOOKUP_MAX_PAGES) {
@@ -457,14 +498,17 @@ public class MeasurementCache {
     /**
      * Insert a measurement found by a lookup into the live maps, so later flushes hit the
      * cache: an Active one into the maps browse and query use, any other into
-     * {@code inactiveByName}.
+     * {@code inactiveByName}; under its name only if this collector's does not have it already.
      */
-    private void cacheMeasurement(Measurement m) {
+    private void cacheMeasurement(Measurement m, String collectorUUID) {
         if (isActive(m)) {
             uuidToMeasurement.put(m.getUuid(), m);
-            tagPathToUUID.put(m.getName(), m.getUuid());
+            Measurement cached = getMeasurementByName(m.getName());
+            if (cached == null || !isOwnedBy(cached, collectorUUID) || isOwnedBy(m, collectorUUID)) {
+                tagPathToUUID.put(m.getName(), m.getUuid());
+            }
         } else {
-            inactiveByName.put(m.getName(), m);
+            putPreferringOwn(inactiveByName, m, collectorUUID);
         }
     }
 
@@ -475,44 +519,112 @@ public class MeasurementCache {
          * Creating another would only add a Discovered duplicate, so the values are discarded
          * until the measurement is Active, from the first cache refresh after that.
          */
-        NOT_ACTIVE
+        NOT_ACTIVE,
+        /**
+         * The measurement with the name belongs to another collector. Factry answers OK to
+         * CreatePoints for it but drops the points ("measurements were not defined on
+         * collector"). Measurement names are unique per time-series database, and nothing in
+         * the gRPC API tells which database a measurement is in, so the module asks Factry once
+         * per tag to create its own: if the other one is in another database, that gives an
+         * Active measurement to write to. If not, Factry adds a Discovered duplicate, which also
+         * tells later lookups and refreshes, after a restart too, that the module has tried.
+         */
+        OTHER_COLLECTOR
     }
 
     /**
-     * The one check of whether the module may write to a measurement: null when it may (or
-     * when {@code m} is null), else why not. Every write path uses it.
+     * The one check of whether this collector may write to a measurement: null when it may (or
+     * when {@code m} is null), else why not. A measurement without a collector UUID, or a
+     * client without one, counts as this collector's, as before. Every write path uses it;
+     * browse and query keep every collector's measurements.
      */
-    static WriteRefusal writeRefusal(Measurement m) {
-        return m == null || isActive(m) ? null : WriteRefusal.NOT_ACTIVE;
+    static WriteRefusal writeRefusal(Measurement m, String collectorUUID) {
+        if (m == null) {
+            return null;
+        }
+        if (!isOwnedBy(m, collectorUUID)) {
+            return WriteRefusal.OTHER_COLLECTOR;
+        }
+        return isActive(m) ? null : WriteRefusal.NOT_ACTIVE;
+    }
+
+    private static boolean isOwnedBy(Measurement m, String collectorUUID) {
+        return collectorUUID == null || collectorUUID.isEmpty() || m.getCollectorUUID().isEmpty()
+                || collectorUUID.equalsIgnoreCase(m.getCollectorUUID());
     }
 
     /**
-     * The cached measurement the write path judges for {@code tagPath}: the Active one, else
-     * one in another status; or null when the cache has none.
+     * The cached measurement the write path judges for {@code tagPath}: the Active one (this
+     * collector's if several have the name), else one in another status (this collector's
+     * if several); or null when the cache has none.
      */
-    Measurement writeTarget(String tagPath) {
+    Measurement writeTarget(String tagPath, String collectorUUID) {
         Measurement active = getMeasurementByName(tagPath);
         return active != null ? active : inactiveByName.get(tagPath);
     }
 
     /**
-     * Why values for {@code tagPath} are not written, judged from the cache: null when they
-     * may be, or when the cache has no measurement with that name.
+     * Why values for {@code tagPath} are not written to {@code target}, its measurement in
+     * the cache: null when they may be, when there is no target, or when the target is another
+     * collector's and this collector has not yet tried to create its own.
      */
-    public WriteRefusal writeRefusal(String tagPath) {
-        return writeRefusal(writeTarget(tagPath));
+    public WriteRefusal writeRefusal(String tagPath, Measurement target, String collectorUUID) {
+        WriteRefusal refusal = writeRefusal(target, collectorUUID);
+        if (refusal == WriteRefusal.OTHER_COLLECTOR && !hasTriedOwnCreation(tagPath, collectorUUID)) {
+            return null;
+        }
+        return refusal;
+    }
+
+    /** {@link #writeRefusal(String, Measurement, String)} for the cached target of {@code tagPath}. */
+    public WriteRefusal writeRefusal(String tagPath, String collectorUUID) {
+        return writeRefusal(tagPath, writeTarget(tagPath, collectorUUID), collectorUUID);
+    }
+
+    /**
+     * Whether this collector has tried to create its own measurement for {@code tagPath}: in
+     * this process, or before, as a measurement of its own with that name in another status
+     * (the Discovered duplicate such a try leaves) shows.
+     */
+    private boolean hasTriedOwnCreation(String tagPath, String collectorUUID) {
+        if (ownCreationTried.contains(tagPath)) {
+            return true;
+        }
+        Measurement inactive = inactiveByName.get(tagPath);
+        return inactive != null && isOwnedBy(inactive, collectorUUID);
     }
 
     /**
      * What the cache says about writing {@code tagPath}'s values: the UUID to write them to,
-     * "" when they are refused, or null when the cache has no measurement with that name.
+     * "" when they are refused, or null when the cache has no measurement with that name or
+     * this collector has yet to try creating its own.
      */
-    String writeUUID(String tagPath) {
-        Measurement m = writeTarget(tagPath);
+    String writeUUID(String tagPath, String collectorUUID) {
+        Measurement m = writeTarget(tagPath, collectorUUID);
         if (m == null) {
             return null;
         }
-        return writeRefusal(m) == null ? m.getUuid() : "";
+        if (writeRefusal(m, collectorUUID) == null) {
+            return m.getUuid();
+        }
+        return writeRefusal(tagPath, m, collectorUUID) != null ? "" : null;
+    }
+
+    /** Forget the create attempts of this process, for a new collector or new settings. */
+    public void clearWriteRefusals() {
+        ownCreationTried.clear();
+    }
+
+    /**
+     * Put {@code m} under its name, unless this collector's measurement already has that name.
+     * Names are unique per time-series database, not per organisation, so several collectors
+     * may have one; the write path must find this collector's.
+     */
+    private static void putPreferringOwn(Map<String, Measurement> byName, Measurement m, String collectorUUID) {
+        Measurement current = byName.get(m.getName());
+        if (current == null || !isOwnedBy(current, collectorUUID) || isOwnedBy(m, collectorUUID)) {
+            byName.put(m.getName(), m);
+        }
     }
 
     /**
