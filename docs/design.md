@@ -133,14 +133,15 @@ The single point of contact with Factry. Wraps a gRPC `ManagedChannel` and expos
 | `createMeasurements(CreateMeasurementsRequest)` | `CreateMeasurements` | Auto-onboard new measurements |
 | `queryTimeseries(QueryTimeseriesRequest)` | `QueryTimeseries` | Read raw or aggregated data |
 | `getAssets()` | `GetAssets` | List all assets |
-| `testConnection()` | `GetMeasurements` (lightweight) | Connection health check |
+| `testConnection()` | `GetCollector` (5 s deadline) | Connection and token check; not `GetMeasurements`, which is too slow on large sites |
 
 **Key design points:**
 - **TLS modes**: plain text, TLS with bundled CA cert, TLS with insecure trust (skip verification), fallback to system trust store
 - **Connection tracking**: `connected` flag set to `false` on `createPoints()` failure, checked by `StorageEngine.isEngineUnavailable()` so S&F can buffer without hitting the network
-- **Write deadline**: 3-second timeout on writes (configurable via `ModuleProperties`)
+- **Deadlines**: every call has one, so a Factry that never answers cannot hang the module: 3 s for store lookups, 3 s plus 1 ms per point or measurement (at most 30 s) for writes and measurement creation, 30 s for history queries, each cache refresh page and the asset fetches, 10 s for the other small calls (configurable via `ModuleProperties`). The connection test has a fixed 5 s
+- **Dead connections**: no keepalive pings, because Factry closes a connection that pings without a call running (`too_many_pings`). When `testConnection()` times out, the channel drops its connection with `enterIdle()` so the next call opens a new one
 - **Auth headers**: every call includes `collectoruuid` + `authorization: Bearer <token>` metadata
-- **Read/write lock**: prevents race conditions during `reconfigure()` — old channel is shut down and replaced atomically
+- **Read/write lock**: prevents race conditions during `reconfigure()` — old channel is shut down and replaced atomically. `reconfigure()` and `shutdown()` wait at most 3 s for running calls, then cancel them
 - **Reconfiguration**: `handleSettingsChange()` calls `reconfigure()` to swap the channel without restarting the module
 
 ### `MeasurementCache.java`
@@ -154,6 +155,9 @@ In-memory cache of Factry measurements and assets. Both the storage engine and q
 - `refresh(grpcClient)` — fetches all measurements from Factry, replaces the maps. Only keeps measurements with `status=Active`
 - `getOrCreateUUID(tagPath, grpcClient, value)` — cache lookup with auto-creation: on miss, creates the measurement in Factry, polls until visible, returns UUID. Includes concurrent creation prevention (`pendingCreations` set) and data type detection from the value
 - `evictByUUID(uuid)` — removes a measurement so it gets re-created on next write (used when Factry rejects points for deleted measurements)
+- Before creating a measurement, the write path looks its exact name up in Factry and reuses an Active one. Measurements that are not Active (Discovered, ...) are kept in `inactiveByName`, for the write path only. Values for a tag whose measurement exists only in another status are discarded (`WriteRefusal.NOT_ACTIVE`): counted as handled, so store and forward does not retry them, with one warning per flush naming the newly refused tags and a count in `HistorianMetrics.getDiscardedPointCount()`. The measurement is not created again
+- `writeRefusal(measurement, collectorUUID)` — the one check of whether the module may write to a measurement. Factry answers OK to points written to another collector's measurement and drops them, so the write paths only use measurements of the module's own collector (or without a collector UUID). Browse and query keep every collector's measurements; when several have the same name (one per time-series database), the cache keeps the module's own under that name, so query by name prefers it too. When the measurement with a tag's name is another collector's (`WriteRefusal.OTHER_COLLECTOR`), the module asks Factry once per tag to create its own, since the other may be in another database, and polls until one of its own appears. If none Active appears, the tag's values are discarded like a `NOT_ACTIVE` tag's. A measurement of its own with that name in another status (the Discovered duplicate such a try leaves) counts as tried, so a restart does not try again
+- Paused measurements of the module's own collector (Factry's way to tell collectors to stop collecting) are refused as `WriteRefusal.PAUSED`: values for them are dropped and counted as handled (`HistorianMetrics.getPausedDroppedPointCount()`), with one warning per flush naming the newly paused tags and one info line when a tag is written again. The measurement is never created again. Array tags keep merging their element changes while paused, so the first value after the resume is the whole current array. From the first cache refresh after the measurement is Active again, new values are stored. Another collector's Paused measurement counts as `OTHER_COLLECTOR`
 
 **Refreshed every 30 seconds** by `FactryHistoryProvider`'s scheduled executor.
 
@@ -248,8 +252,14 @@ Loads tuning values from `factry-historian.properties` (bundled in the .modl). T
 
 | Property | Default | Controls |
 |----------|---------|----------|
-| `grpc.write.deadline.seconds` | 3 | Timeout on `createPoints()` calls |
-| `status.cache.ms` | 30000 | How long to cache historian status (avoids gRPC poll on every UI refresh) |
+| `grpc.write.deadline.seconds` | 3 | Timeout on store lookups; base timeout on `createPoints()` and `createMeasurements()` |
+| `grpc.write.deadline.ms.per.point` | 1 | Added to the `createPoints()` timeout per point, and to the `createMeasurements()` timeout per measurement |
+| `grpc.write.deadline.max.seconds` | 30 | Ceiling on the `createPoints()` and `createMeasurements()` timeouts |
+| `grpc.write.gzip` | true | Send `createPoints()` gzip-compressed. If Factry has no gzip decompressor, the client resends the batch uncompressed and stops using gzip until the historian settings are saved |
+| `grpc.read.deadline.seconds` | 30 | Timeout on history queries, on each page of the measurement cache refresh, and on the asset and asset property fetches |
+| `grpc.call.deadline.seconds` | 10 | Timeout on the small calls: collectors, health, collector state |
+| `grpc.shutdown.grace.seconds` | 3 | How long a settings save or shutdown waits for running calls before it cancels them |
+| `status.cache.ms` | 30000 | How often the connection check runs; it pauses S&F while Factry is unreachable and resumes it when it is back |
 | `measurement.cache.refresh.seconds` | 30 | How often to reload measurements from Factry |
 
 ---
@@ -270,6 +280,8 @@ Extends `AbstractStorageEngine`. Receives data points from Ignition's tag system
 5. Maps Ignition `QualityCode` to status string ("Good", "Uncertain", "Bad")
 6. Sends `CreatePoints` gRPC call
 7. On failure: distinguishes connection errors (UNAVAILABLE, DEADLINE_EXCEEDED) from server rejections. On rejection, evicts the measurement UUID and retries once (handles deleted measurements)
+
+Steps 2 to 7 live in `PointWriter`, which the engine calls; it uses no Ignition gateway classes, so unit tests can run it against a fake Factry client.
 
 **`isEngineUnavailable()`** — returns `true` when the gRPC connection is down. This is how S&F knows to buffer instead of attempting writes.
 
@@ -366,10 +378,11 @@ Extends `AbstractHistorian<FactryHistorianSettings>`. The orchestrator that ties
    - Metrics logging (every 30s)
    - Measurement cache refresh (every 30s)
    - Quarantine retry (every 30s, S&F only)
+   - Connection check (every 30s, `GetCollector`): pauses the S&F sink while Factry is unreachable, resumes it when it is back
 
 **`getStorageEngine()`** — returns S&F bridge if configured, otherwise the direct storage engine
 
-**`getStatus()`** — cached gRPC health check (30s TTL)
+**`getStatus()`** — returns the result of the last scheduled connection check
 
 **`handleSettingsChange()`** — reconfigures gRPC client, refreshes cache, updates engines. No restart needed.
 
