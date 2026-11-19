@@ -36,6 +36,18 @@ public final class ModuleProperties {
         return getLong("grpc.write.deadline.seconds", 3);
     }
 
+    public static long getWriteDeadlineMillisPerPoint() {
+        return getLong("grpc.write.deadline.ms.per.point", 1);
+    }
+
+    public static long getWriteDeadlineMaxSeconds() {
+        return getLong("grpc.write.deadline.max.seconds", 30);
+    }
+
+    public static boolean isWriteGzip() {
+        return Boolean.parseBoolean(props.getProperty("grpc.write.gzip", "true").trim());
+    }
+
     public static long getReadDeadlineSeconds() {
         return getLong("grpc.read.deadline.seconds", 30);
     }
