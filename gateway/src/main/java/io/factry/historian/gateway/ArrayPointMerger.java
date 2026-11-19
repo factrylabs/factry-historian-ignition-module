@@ -123,8 +123,14 @@ final class ArrayPointMerger {
                 state.put(e.getKey(), e.getValue().value);
             }
 
-            // Snapshot the full merged array at this timestamp, in index order.
-            snapshots.add(new ArraySnapshot(ts, new ArrayList<>(state.values()), qualityCode));
+            // Snapshot the full merged array at this timestamp, in index order. An index nobody
+            // knows the value of (Factry's last value could not be read) stays as null, so the
+            // known elements keep their position instead of shifting to the front.
+            List<Object> values = new ArrayList<>();
+            for (int i = 0; i <= state.lastKey(); i++) {
+                values.add(state.get(i));
+            }
+            snapshots.add(new ArraySnapshot(ts, values, qualityCode));
         }
         return snapshots;
     }
