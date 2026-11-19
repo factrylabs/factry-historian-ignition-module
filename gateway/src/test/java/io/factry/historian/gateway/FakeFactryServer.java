@@ -16,7 +16,12 @@ import io.factry.historian.proto.QueryTimeseriesRequest;
 import io.factry.historian.proto.QueryTimeseriesResponse;
 import io.factry.historian.proto.Series;
 import io.factry.historian.proto.SeriesPoint;
+import io.grpc.Metadata;
 import io.grpc.Server;
+import io.grpc.ServerCall;
+import io.grpc.ServerCallHandler;
+import io.grpc.ServerInterceptor;
+import io.grpc.ServerInterceptors;
 import io.grpc.Status;
 import io.grpc.netty.shaded.io.grpc.netty.NettyServerBuilder;
 import io.grpc.stub.StreamObserver;
@@ -56,6 +61,8 @@ final class FakeFactryServer extends HistorianGrpc.HistorianImplBase implements 
     volatile Status queryFailure = null;
     /** Answers every page from the start, like a Factry that does not support offset. */
     volatile boolean ignoreOffset = false;
+    /** The authorization header of every call, in order. */
+    final List<String> authorizations = new CopyOnWriteArrayList<>();
 
     private final Server server;
 
@@ -63,7 +70,19 @@ final class FakeFactryServer extends HistorianGrpc.HistorianImplBase implements 
         // Loopback only: forPort(0) binds the wildcard address, and macOS can hand out a port that
         // another process already holds on 127.0.0.1, so the client would talk to that process.
         server = NettyServerBuilder.forAddress(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0))
-                .addService(this).build().start();
+                .addService(ServerInterceptors.intercept(this, recordAuthorization())).build().start();
+    }
+
+    private ServerInterceptor recordAuthorization() {
+        Metadata.Key<String> key = Metadata.Key.of("authorization", Metadata.ASCII_STRING_MARSHALLER);
+        return new ServerInterceptor() {
+            @Override
+            public <Q, A> ServerCall.Listener<Q> interceptCall(ServerCall<Q, A> call, Metadata headers,
+                                                               ServerCallHandler<Q, A> next) {
+                authorizations.add(String.valueOf(headers.get(key)));
+                return next.startCall(call, headers);
+            }
+        };
     }
 
     int port() {

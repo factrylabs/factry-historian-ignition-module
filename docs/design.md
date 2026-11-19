@@ -198,7 +198,7 @@ The `toSettings()` / `fromSettings()` methods convert between the UI record and 
 
 Internal settings object implementing `HistorianSettings`. Holds all configuration plus derived fields:
 
-- `applyTokenDefaults(token)` — parses the JWT to extract `grpcHost`, `grpcPort`, `collectorUUID`
+- `applyTokenDefaults(token)`: cleans the token with `JwtTokenParser.normalize()`, parses the JWT to extract `grpcHost`, `grpcPort`, `collectorUUID`, and returns the cleaned token, which the provider gives to the gRPC client
 - `validate()` — checks that collector ID, host, port (1-65535), batch size (>0), batch interval (>0) are valid
 
 This is what the engines and gRPC client receive. The separation from `FactryHistorianConfig` allows internal fields (like parsed JWT claims) that aren't shown in the UI.
@@ -217,6 +217,8 @@ Parses the Factry collector JWT token **without signature verification** (the mo
 - `grpc-port` — gRPC port
 
 Used by `FactryHistorianSettings.applyTokenDefaults()`.
+
+`normalize(token)` removes all whitespace (a pasted token often ends with a newline or space, or is wrapped over two lines, and Factry refuses it then) and checks that what remains is three base64url parts separated by dots. Its error message never contains the token.
 
 ### `TagPathUtil.java`
 

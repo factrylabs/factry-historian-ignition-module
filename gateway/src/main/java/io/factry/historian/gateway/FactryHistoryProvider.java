@@ -53,7 +53,7 @@ public class FactryHistoryProvider extends AbstractHistorian<FactryHistorianSett
         super(context, historianName);
         this.context = context;
         this.settings = settings;
-        settings.applyTokenDefaults(settings.getToken());
+        String token = settings.applyTokenDefaults(settings.getToken());
         settings.validate();
         this.metrics = new HistorianMetrics();
 
@@ -61,7 +61,7 @@ public class FactryHistoryProvider extends AbstractHistorian<FactryHistorianSett
                 settings.getGrpcHost(),
                 settings.getGrpcPort(),
                 settings.getCollectorUUID(),
-                settings.getToken(),
+                token,
                 settings.isUseTls(),
                 settings.isSkipTlsVerification(),
                 settings.getCustomCaCert()
@@ -240,7 +240,7 @@ public class FactryHistoryProvider extends AbstractHistorian<FactryHistorianSett
         logger.info("Historian settings change: {}", newSettings);
 
         try {
-            newSettings.applyTokenDefaults(newSettings.getToken());
+            String token = newSettings.applyTokenDefaults(newSettings.getToken());
             newSettings.validate();
 
             // Reconfigure the gRPC client (shuts down old channel, creates new one)
@@ -248,7 +248,7 @@ public class FactryHistoryProvider extends AbstractHistorian<FactryHistorianSett
                     newSettings.getGrpcHost(),
                     newSettings.getGrpcPort(),
                     newSettings.getCollectorUUID(),
-                    newSettings.getToken(),
+                    token,
                     newSettings.isUseTls(),
                     newSettings.isSkipTlsVerification(),
                     newSettings.getCustomCaCert()
