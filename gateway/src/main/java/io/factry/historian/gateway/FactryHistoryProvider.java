@@ -249,6 +249,8 @@ public class FactryHistoryProvider extends AbstractHistorian<FactryHistorianSett
                     newSettings.isSkipTlsVerification(),
                     newSettings.getCustomCaCert()
             );
+            // Judge and log refusals of writes afresh; before the refresh, which can throw.
+            storageEngine.clearRefusals();
 
             // Refresh measurement cache from the new endpoint
             measurementCache.refresh(grpcClient);

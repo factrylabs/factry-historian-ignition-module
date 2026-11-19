@@ -49,6 +49,8 @@ dependencies {
     testImplementation("org.junit.jupiter:junit-jupiter:5.10.2")
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
     testImplementation("com.inductiveautomation.ignitionsdk:ignition-common:${rootProject.extra["sdk_version"]}")
+    // GatewayContext, to build a storage engine in tests
+    testImplementation("com.inductiveautomation.ignition:gateway-api:${rootProject.extra["sdk_version"]}")
     testImplementation("com.inductiveautomation.historian:historian-gateway-api:1.3.3") {
         isTransitive = false
     }

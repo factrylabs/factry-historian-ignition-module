@@ -36,6 +36,18 @@ public final class ModuleProperties {
         return getLong("grpc.write.deadline.seconds", 3);
     }
 
+    public static long getReadDeadlineSeconds() {
+        return getLong("grpc.read.deadline.seconds", 30);
+    }
+
+    public static long getCallDeadlineSeconds() {
+        return getLong("grpc.call.deadline.seconds", 10);
+    }
+
+    public static long getShutdownGraceSeconds() {
+        return getLong("grpc.shutdown.grace.seconds", 3);
+    }
+
     public static long getStatusCacheMs() {
         return getLong("status.cache.ms", 30_000);
     }

@@ -66,9 +66,10 @@ points go straight to the pending buffer with zero delay.
 
 ### gRPC Deadline
 
-The `createPoints()` call has a 3-second deadline. This ensures that when the server goes
-down, the failure is detected quickly rather than hanging indefinitely on a TCP timeout.
-The deadline can be adjusted via the `WRITE_DEADLINE_SECONDS` constant in `FactryGrpcClient`.
+The `createPoints()` call has a 3-second deadline by default. This ensures that when the
+server goes down, the failure is detected quickly rather than hanging indefinitely on a TCP
+timeout. The deadline is set by `grpc.write.deadline.seconds` in `factry-historian.properties`
+(see `ModuleProperties` in [design.md](design.md)).
 
 ## Ignition S&F Engine Configuration
 
@@ -128,8 +129,9 @@ being lost before reaching S&F — check the gateway logs for errors in the stor
 ## Troubleshooting
 
 ### Data lost during server outage (2-10 second gap)
-The gRPC `createPoints()` call has a 3-second deadline. The first call after the server
-goes down will block for up to 3 seconds before failing and marking the connection as down.
+The gRPC `createPoints()` call has a 3-second deadline by default
+(`grpc.write.deadline.seconds`). The first call after the server goes down will block for
+up to that long before failing and marking the connection as down.
 Points arriving during this initial window may be delayed but should not be lost if S&F is
 properly configured.
 
