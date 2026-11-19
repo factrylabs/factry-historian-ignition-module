@@ -114,7 +114,7 @@ public class FactryStorageEngine extends AbstractStorageEngine {
         // then silently drops the points (failure has no error, so no DataStorageException is thrown).
         //
         // Buffering during downtime is handled by toggling the S&F sink's accepting state
-        // in FactryHistoryProvider.getStatus(). When the sink is not accepting, S&F keeps
+        // in FactryHistoryProvider.refreshConnectionStatus(). When the sink is not accepting, S&F keeps
         // points in pending without attempting to forward them.
         //
         // Verified by decompiling AbstractStorageEngine and TagHistoryDataSinkBridge

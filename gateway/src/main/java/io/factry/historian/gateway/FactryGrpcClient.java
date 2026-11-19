@@ -548,15 +548,20 @@ public class FactryGrpcClient {
     }
 
     /**
-     * Test connectivity by making a lightweight gRPC call.
+     * Test connectivity and the collector token with GetCollector.
+     * <p>
+     * Not GetMeasurements: that returns every measurement of the collector, which on a slow
+     * link or a large site does not fit in the deadline, so the check would fail forever and
+     * store and forward would never resume. GetCollector returns one small record and still
+     * fails when Factry rejects the token.
      *
-     * @return true if the server responds
+     * @return true if the server answers for this collector
      */
     public boolean testConnection() {
         channelLock.readLock().lock();
         try {
             blockingStub.withDeadlineAfter(5, TimeUnit.SECONDS)
-                    .getMeasurements(MeasurementRequest.newBuilder().build());
+                    .getCollector(Empty.getDefaultInstance());
             connected = true;
             return true;
         } catch (Exception e) {
