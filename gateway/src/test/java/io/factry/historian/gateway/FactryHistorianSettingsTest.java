@@ -124,4 +124,11 @@ class FactryHistorianSettingsTest {
         IllegalArgumentException e = assertThrows(IllegalArgumentException.class, s::validate);
         assertTrue(e.getMessage().toLowerCase().contains("custom ca certificate"), e.getMessage());
     }
+
+    @Test
+    void toString_leavesTheTokenOut() {
+        FactryHistorianSettings s = validSettings();
+        s.setToken("header.payload.signature");
+        assertFalse(s.toString().contains("signature"));
+    }
 }

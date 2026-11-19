@@ -62,7 +62,9 @@ dependencies {
         isTransitive = false
     }
     testImplementation("com.google.protobuf:protobuf-java:$protobufVersion")
-    testRuntimeOnly("org.slf4j:slf4j-simple:2.0.12")
+    // Ignition logs through logback (1.3.14 to 1.3.16 in lib/core/common); tests use the same so
+    // they can capture log output and change logger levels like an admin does.
+    testImplementation("ch.qos.logback:logback-classic:1.3.14")
 }
 
 // ---------------------------------------------------------------------------

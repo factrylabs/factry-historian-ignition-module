@@ -13,8 +13,6 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.MethodSource;
 
-import java.io.ByteArrayOutputStream;
-import java.io.PrintStream;
 import java.util.Date;
 import java.util.List;
 import java.util.Map;
@@ -71,17 +69,12 @@ class PointWriterValueTypesTest {
                 .orElseThrow(() -> new AssertionError("nothing written for " + measurementName));
     }
 
-    /** Runs the action and returns what the writer logged to stderr (slf4j-simple) meanwhile. */
+    /** Runs the action and returns what the writer logged meanwhile. */
     private static String logOf(Runnable action) {
-        PrintStream original = System.err;
-        ByteArrayOutputStream captured = new ByteArrayOutputStream();
-        System.setErr(new PrintStream(captured, true));
-        try {
+        try (LogCapture log = new LogCapture(ch.qos.logback.classic.Logger.ROOT_LOGGER_NAME, null)) {
             action.run();
-        } finally {
-            System.setErr(original);
+            return log.text();
         }
-        return captured.toString();
     }
 
     private static int count(String haystack, String needle) {

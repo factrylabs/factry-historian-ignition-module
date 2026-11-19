@@ -23,8 +23,13 @@ import io.factry.historian.proto.Points;
 import io.factry.historian.proto.QueryTimeseriesRequest;
 import io.factry.historian.proto.QueryTimeseriesResponse;
 import io.factry.historian.proto.RegisterCollectorSchema;
+import io.grpc.CallOptions;
+import io.grpc.Channel;
+import io.grpc.ClientCall;
+import io.grpc.ClientInterceptor;
 import io.grpc.ManagedChannel;
 import io.grpc.Metadata;
+import io.grpc.MethodDescriptor;
 import io.grpc.Status;
 import io.grpc.StatusRuntimeException;
 import io.grpc.netty.shaded.io.grpc.netty.GrpcSslContexts;
@@ -69,6 +74,7 @@ public class FactryGrpcClient {
     private static final long CALL_DEADLINE_SECONDS = ModuleProperties.getCallDeadlineSeconds();
     private static final long SHUTDOWN_GRACE_SECONDS = ModuleProperties.getShutdownGraceSeconds();
     private static final String CA_CERT_RESOURCE = "factry-historian-ca.crt";
+    private static final String FRAME_LOGGER = "io.grpc.netty.shaded.io.grpc.netty.NettyClientHandler";
 
     /**
      * Largest answer the client accepts. grpc-java defaults to 4 MiB, which a day of 1-second data
@@ -91,9 +97,22 @@ public class FactryGrpcClient {
 
     public FactryGrpcClient(String host, int port, String collectorUUID, String token,
                             boolean useTls, boolean skipTlsVerification, String customCaCert) {
+        keepTokenOutOfFrameLog();
         buildChannel(host, port, collectorUUID, token, useTls, skipTlsVerification, customCaCert);
         logger.info("gRPC client created ({}), target={}:{}, collectorUUID={}",
                 tlsLabel(useTls, skipTlsVerification), host, port, collectorUUID);
+    }
+
+    /**
+     * Netty's HTTP/2 frame logger writes every request header at DEBUG, the collector token
+     * included. Giving it its own INFO level stops a broad io.grpc or root DEBUG from reaching it.
+     * A level an admin set on this exact logger is kept: then the frames are wanted.
+     */
+    static void keepTokenOutOfFrameLog() {
+        if (LoggerFactory.getLogger(FRAME_LOGGER) instanceof ch.qos.logback.classic.Logger frameLogger
+                && frameLogger.getLevel() == null) {
+            frameLogger.setLevel(ch.qos.logback.classic.Level.INFO);
+        }
     }
 
     public CreatePointsReply createPoints(Points points) {
@@ -392,8 +411,21 @@ public class FactryGrpcClient {
         headers.put(AUTHORIZATION_KEY, "Bearer " + token);
 
         this.blockingStub = HistorianGrpc.newBlockingStub(channel)
-                .withInterceptors(MetadataUtils.newAttachHeadersInterceptor(headers));
+                .withInterceptors(MetadataUtils.newAttachHeadersInterceptor(headers), FRAME_LOG_GUARD);
     }
+
+    /**
+     * Checks the frame logger before every call: a logback reload (a scan, or levels reset on the
+     * Logs page) clears its level, and the next call would log the token again.
+     */
+    private static final ClientInterceptor FRAME_LOG_GUARD = new ClientInterceptor() {
+        @Override
+        public <ReqT, RespT> ClientCall<ReqT, RespT> interceptCall(
+                MethodDescriptor<ReqT, RespT> method, CallOptions callOptions, Channel next) {
+            keepTokenOutOfFrameLog();
+            return next.newCall(method, callOptions);
+        }
+    };
 
     /**
      * Build a TrustManagerFactory that trusts the JVM's default (system/public) CAs plus the
