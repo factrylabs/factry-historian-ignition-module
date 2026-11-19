@@ -34,6 +34,8 @@ class FakeFactry extends FactryGrpcClient {
 
     final List<Measurement> measurements = new ArrayList<>();
     final List<String> createdNames = new ArrayList<>();
+    /** Every measurement Factry was asked to create, with its data type and settings. */
+    final List<CreateMeasurement> created = new ArrayList<>();
     final List<Points> sent = new ArrayList<>();
     /** Number of single-name lookup calls (pages) made. */
     int lookups = 0;
@@ -115,6 +117,7 @@ class FakeFactry extends FactryGrpcClient {
         }
         for (CreateMeasurement m : request.getMeasurementsList()) {
             createdNames.add(m.getName());
+            created.add(m);
             if (measurements.stream().noneMatch(e -> e.getName().equals(m.getName()))) {
                 add(m.getName(), "new-" + m.getName(), createdCollector, createdStatus);
             } else if (existingInOtherDatabase) {

@@ -99,9 +99,15 @@ public class FactryStorageEngine extends AbstractStorageEngine {
 
     @Override
     protected StorageResult<SourceChangePoint> applySourceChanges(List<SourceChangePoint> changes) {
-        // Measurement lifecycle is managed by the Factry platform, not by this collector.
-        // No retirement action needed — just acknowledge the changes.
-        logger.debug("applySourceChanges called with " + changes.size() + " changes (no-op for Factry)");
+        // Measurement lifecycle is managed by the Factry platform, not by this collector. Only the
+        // cached metadata of retired or renamed tags is dropped, so the cache does not grow with them.
+        logger.debug("applySourceChanges called with " + changes.size() + " changes");
+        for (SourceChangePoint change : changes) {
+            // A retirement has no new source; a rename has a different one.
+            if (change.oldSource() != null && !change.oldSource().equals(change.newSource())) {
+                measurementCache.forgetMetadata(TagPathUtil.storagePathToStoredPath(change.oldSource().toString()));
+            }
+        }
         return StorageResult.success(changes);
     }
 

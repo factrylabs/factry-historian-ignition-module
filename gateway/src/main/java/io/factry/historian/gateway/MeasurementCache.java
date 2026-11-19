@@ -62,8 +62,12 @@ public class MeasurementCache {
     /** Measurement UUID → collector name, for grouping in the browse tree. */
     private volatile ConcurrentHashMap<String, String> measurementToCollectorName = new ConcurrentHashMap<>();
 
-    /** Metadata properties cached from doStoreMetadata, applied when creating measurements. */
-    private final ConcurrentHashMap<String, Map<String, String>> pendingMetadata = new ConcurrentHashMap<>();
+    /**
+     * Metadata properties cached from doStoreMetadata, applied when creating measurements. Creating a
+     * measurement does not remove them: a failed create or a measurement deleted in Factry creates it
+     * again, and Ignition may not send the metadata again.
+     */
+    private final ConcurrentHashMap<String, Map<String, String>> tagMetadata = new ConcurrentHashMap<>();
 
     private final int pageSize = ModuleProperties.getMeasurementCachePageSize();
 
@@ -217,14 +221,17 @@ public class MeasurementCache {
         }
         logger.debug("Cache miss for '{}', cache size={}, keys={}", tagPath, tagPathToUUID.size(), tagPathToUUID.keySet());
 
-        // Determine data type from value — refuse to create without it
-        String dataType = explicitDataType != null ? explicitDataType : toFactryDataType(value);
+        // Data type from the tag's metadata, else from the value; refuse to create without one
+        String dataType = explicitDataType != null ? explicitDataType : dataTypeFor(tagPath, value);
         if (dataType == null) {
             logger.debug("Skipping measurement creation for '{}': value is null or unknown type", tagPath);
             return "";
         }
 
-        return resolveMissing(Map.of(tagPath, dataType), grpcClient).getOrDefault(tagPath, "");
+        // Not Map.of: value is null when only a data type is given (array measurements).
+        Map<String, Object> pathToValue = new HashMap<>();
+        pathToValue.put(tagPath, value);
+        return resolveMissing(Map.of(tagPath, dataType), pathToValue, grpcClient).getOrDefault(tagPath, "");
     }
 
     /**
@@ -258,16 +265,16 @@ public class MeasurementCache {
                     result.put(path, uuid);
                 }
             } else {
-                String dataType = toFactryDataType(entry.getValue());
+                String dataType = dataTypeFor(path, entry.getValue());
                 if (dataType != null) {
                     pathToDataType.put(path, dataType);
                 }
-                // Unsupported value type → no entry in result (caller skips the point).
+                // No data type → no entry in result; the caller defers the point for S&F retry.
             }
         }
 
         if (!pathToDataType.isEmpty()) {
-            result.putAll(resolveMissing(pathToDataType, grpcClient));
+            result.putAll(resolveMissing(pathToDataType, tagPathToValue, grpcClient));
         }
         return result;
     }
@@ -292,9 +299,12 @@ public class MeasurementCache {
      * rest is abandoned: nothing is created, and only the paths resolved so far are returned.
      * One slow Factry costs a flush one write deadline, not one per new tag.
      *
+     * @param pathToValue a representative value per path, or none: a Date marks a new
+     *                    measurement DateTime when the tag's metadata does not say so
      * @return map from tag path to UUID; absent entries were refused or could not be resolved
      */
-    private Map<String, String> resolveMissing(Map<String, String> pathToDataType, FactryGrpcClient grpcClient) {
+    private Map<String, String> resolveMissing(Map<String, String> pathToDataType, Map<String, Object> pathToValue,
+                                               FactryGrpcClient grpcClient) {
         String collectorUUID = grpcClient.getCollectorUUID();
         Map<String, String> result = new HashMap<>();
         // Paths created although another collector's measurement has the name, and those of
@@ -333,7 +343,6 @@ public class MeasurementCache {
                     if (!uuid.isEmpty()) {
                         result.put(path, uuid);
                     }
-                    pendingMetadata.remove(path);
                     toCreate.remove(path);
                     pendingCreations.remove(path);
                 }
@@ -344,7 +353,7 @@ public class MeasurementCache {
                 CreateMeasurementsRequest.Builder req = CreateMeasurementsRequest.newBuilder();
                 for (String path : toCreate) {
                     req.addMeasurements(buildCreateMeasurement(
-                            path, pathToDataType.get(path), pendingMetadata.remove(path)));
+                            path, pathToDataType.get(path), metadataFor(path, pathToValue.get(path))));
                 }
                 try {
                     grpcClient.createMeasurements(req.build());
@@ -723,11 +732,49 @@ public class MeasurementCache {
         if (properties == null || properties.isEmpty()) {
             return;
         }
-        pendingMetadata.merge(tagPath, new HashMap<>(properties), (existing, incoming) -> {
-            existing.putAll(incoming);
-            return existing;
-        });
+        // Copy on write, so a create reading the map never sees it change underneath.
+        tagMetadata.merge(tagPath, Collections.unmodifiableMap(new HashMap<>(properties)),
+                (existing, incoming) -> {
+                    Map<String, String> merged = new HashMap<>(existing);
+                    merged.putAll(incoming);
+                    return Collections.unmodifiableMap(merged);
+                });
         logger.debug("Cached metadata for '{}': {}", tagPath, properties);
+    }
+
+    /** Drop the cached metadata of a tag that Ignition retired or renamed. */
+    public void forgetMetadata(String tagPath) {
+        tagMetadata.remove(tagPath);
+    }
+
+    /**
+     * The cached metadata for a tag that is about to get a measurement. A Date value without a
+     * known Ignition data type (for example one stored by a script) still marks the tag as DateTime,
+     * so the read side can return Dates.
+     */
+    private Map<String, String> metadataFor(String tagPath, Object value) {
+        Map<String, String> metadata = tagMetadata.get(tagPath);
+        if (value instanceof java.util.Date && (metadata == null || !metadata.containsKey(IGNITION_DATA_TYPE))) {
+            metadata = metadata != null ? new HashMap<>(metadata) : new HashMap<>();
+            metadata.put(IGNITION_DATA_TYPE, "DateTime");
+        }
+        return metadata;
+    }
+
+    /** Ignition tag property that holds the tag's data type (e.g. "DateTime"). */
+    static final String IGNITION_DATA_TYPE = "dataType";
+
+    /**
+     * Measurement setting that keeps the tag's Ignition data type. Factry stores dates as plain
+     * numbers, so this is how the read side knows to return Dates. Settings are used because the
+     * gRPC read calls return them, while they leave the metadata map empty (Factry v8.2.3).
+     */
+    static final String IGNITION_DATA_TYPE_SETTING = "ignitionDataType";
+
+    /** The Ignition data type recorded on a measurement at creation, or null when there is none. */
+    static String ignitionDataType(Measurement m) {
+        Value v = m.getSettings().getFieldsMap().get(IGNITION_DATA_TYPE_SETTING);
+        return v != null && v.getKindCase() == Value.KindCase.STRING_VALUE ? v.getStringValue() : null;
     }
 
     /** Factry derives EngineeringSpecs from a nested "Config" attribute group with these keys. */
@@ -756,6 +803,9 @@ public class MeasurementCache {
      * read calls (GetMeasurements, GetMeasurementsByFilter) leave Measurement.metadata empty, so
      * these extras do not come back to Ignition. The read side still merges the map in case Factry
      * starts returning it; Config-derived engineeringSpecs wins over it.
+     *
+     * The tag's data type is also copied to the measurement settings, which the gRPC read calls do
+     * return (see {@link #IGNITION_DATA_TYPE_SETTING}).
      */
     static CreateMeasurement buildCreateMeasurement(String tagPath, String dataType,
                                                     Map<String, String> metadata) {
@@ -766,6 +816,12 @@ public class MeasurementCache {
 
         if (metadata == null || metadata.isEmpty()) {
             return builder.build();
+        }
+
+        String ignitionType = metadata.get(IGNITION_DATA_TYPE);
+        if (ignitionType != null) {
+            builder.setSettings(Struct.newBuilder()
+                    .putFields(IGNITION_DATA_TYPE_SETTING, Value.newBuilder().setStringValue(ignitionType).build()));
         }
 
         Struct.Builder config = Struct.newBuilder();
@@ -817,10 +873,46 @@ public class MeasurementCache {
         return builder.build();
     }
 
+    /**
+     * Factry data type for a new measurement. The tag's Ignition data type, from the metadata
+     * Ignition sends before the first value, wins over the value: Store and Forward hands Boolean
+     * values over as Long 0/1 (its storage format has no boolean type), so the value alone would
+     * turn a Boolean tag into a number measurement.
+     */
+    String dataTypeFor(String tagPath, Object value) {
+        Map<String, String> metadata = tagMetadata.get(tagPath);
+        String fromTag = fromIgnitionDataType(metadata != null ? metadata.get(IGNITION_DATA_TYPE) : null);
+        return fromTag != null ? fromTag : toFactryDataType(value);
+    }
+
+    /**
+     * Map an Ignition DataType name to a Factry data type, or null when there is no mapping.
+     * Array types map to their element type.
+     */
+    private static String fromIgnitionDataType(String ignitionType) {
+        if (ignitionType == null) {
+            return null;
+        }
+        String type = ignitionType.endsWith("Array")
+                ? ignitionType.substring(0, ignitionType.length() - "Array".length())
+                : ignitionType;
+        if (type.equals("Boolean")) {
+            return "boolean";
+        }
+        if (type.startsWith("Int") || type.startsWith("Float") || type.equals("DateTime")) {
+            return "number";
+        }
+        if (type.equals("String") || type.equals("Text")) {
+            return "string";
+        }
+        return null;
+    }
+
     static String toFactryDataType(Object value) {
         if (value instanceof Boolean) {
             return "boolean";
-        } else if (value instanceof Number) {
+        } else if (value instanceof Number || value instanceof java.util.Date) {
+            // Dates are stored as epoch milliseconds, see PointWriter.toProtoValue.
             return "number";
         } else if (value instanceof String) {
             return "string";

@@ -4,7 +4,9 @@ import com.inductiveautomation.historian.common.model.TimeRange;
 import com.inductiveautomation.historian.common.model.AggregationType;
 import com.inductiveautomation.historian.common.model.LegacyAggregateAdapter;
 import com.inductiveautomation.historian.common.model.TimeWindow;
+import com.inductiveautomation.historian.common.model.HistorianProperties;
 import com.inductiveautomation.historian.common.model.data.AggregatedDataPoint;
+import com.inductiveautomation.historian.common.model.data.AggregatedPoint;
 import com.inductiveautomation.historian.common.model.data.AtomicPoint;
 import com.inductiveautomation.historian.common.model.data.DataPointFactory;
 import com.inductiveautomation.historian.common.model.data.DataPointType;
@@ -28,9 +30,12 @@ import com.inductiveautomation.ignition.common.StringPath;
 import com.inductiveautomation.ignition.common.browsing.BrowseFilter;
 import com.inductiveautomation.ignition.common.config.BasicProperty;
 import com.inductiveautomation.ignition.common.config.BasicPropertySet;
+import com.inductiveautomation.ignition.common.config.Property;
 import com.inductiveautomation.ignition.common.config.PropertySet;
 import com.inductiveautomation.ignition.common.model.values.QualityCode;
 import com.inductiveautomation.ignition.common.sqltags.history.AggregationMode;
+import com.inductiveautomation.ignition.common.sqltags.model.types.DataType;
+import com.inductiveautomation.ignition.common.sqltags.model.types.DataTypeClass;
 import com.inductiveautomation.ignition.common.util.LoggerEx;
 import com.inductiveautomation.ignition.gateway.model.GatewayContext;
 
@@ -393,12 +398,13 @@ public class FactryQueryEngine extends AbstractQueryEngine {
             for (Map.Entry<String, List<RawPt>> entry : pointsByUuid.entrySet()) {
                 RawQueryKey key = uuidToKeyMap.get(entry.getKey());
                 QualifiedPath path = key.source();
+                boolean asDate = isDateTime(keyToNode.get(key));
                 List<RawPt> pts = entry.getValue();
                 pts.sort(Comparator.comparingLong(RawPt::ts));
 
                 for (RawPt p : pts) {
                     AtomicPoint<?> atomicPoint = DataPointFactory.createAtomicPoint(
-                            p.value(), p.quality(), Instant.ofEpochMilli(p.ts()), path);
+                            asDate ? toDate(p.value()) : p.value(), p.quality(), Instant.ofEpochMilli(p.ts()), path);
 
                     if (!processor.onPointAvailable(key, atomicPoint)) {
                         processor.onComplete();
@@ -440,7 +446,8 @@ public class FactryQueryEngine extends AbstractQueryEngine {
             // framework commits the shared result set, it aborted the ENTIRE query. mapKeysToNodes()
             // populates the context from queryForHistoricalNodes() and calls onInitialize() for us.
             Map<AggregatedQueryKey, ? extends HistoricalNode> keyToNode =
-                    mapKeysToNodes(options, processor, AggregatedQueryKey::source);
+                    mapKeysToNodes(options, new CountAsNumber(processor, options.getQueryKeys()),
+                            AggregatedQueryKey::source);
 
             // mapKeysToNodes only initializes the processor when it resolves at least one node.
             // If NOTHING resolved, the processor is not initialized, so calling
@@ -470,13 +477,24 @@ public class FactryQueryEngine extends AbstractQueryEngine {
 
                 try {
                     String aggName = key.aggregationType().name();
+                    boolean dateTime = isDateTime(keyToNode.get(key));
+
+                    if (dateTime && !DATE_AGGREGATES.contains(aggName)) {
+                        // A sum or spread of dates is not a date; Count is the only number that fits.
+                        logger.debug("Aggregate " + aggName + " is not supported for DateTime tag: " + tagPath);
+                        processor.onKeyFailure(key, QualityCode.Bad_Unsupported);
+                        continue;
+                    }
+                    // Count stays a number; every other aggregate of a date is itself a date.
+                    boolean asDate = dateTime && !"Count".equals(aggName);
 
                     if ("MinMax".equals(aggName)) {
                         // MinMax: query min and max separately, emit pairs
-                        pointCount += queryMinMax(uuid, source, key, period, options, processor);
+                        pointCount += queryMinMax(uuid, source, key, period, options, processor, asDate);
                     } else {
                         String factryFunction = toFactryAggregateFunction(aggName);
-                        pointCount += querySingleAggregate(uuid, source, key, factryFunction, period, options, processor);
+                        pointCount += querySingleAggregate(uuid, source, key, factryFunction, period, options,
+                                processor, asDate);
                     }
                 } catch (Exception e) {
                     logger.error("Error querying aggregated data for: " + tagPath, e);
@@ -598,7 +616,7 @@ public class FactryQueryEngine extends AbstractQueryEngine {
     private int querySingleAggregate(
             String uuid, QualifiedPath source, AggregatedQueryKey key,
             String factryFunction, String period,
-            AggregatedQueryOptions options, AggregatedPointProcessor processor) {
+            AggregatedQueryOptions options, AggregatedPointProcessor processor, boolean asDate) {
 
         Aggregation aggregation = Aggregation.newBuilder()
                 .setName(factryFunction)
@@ -629,6 +647,9 @@ public class FactryQueryEngine extends AbstractQueryEngine {
             for (SeriesPoint pt : series.getDataPointsList()) {
                 Instant timestamp = Instant.ofEpochMilli(pt.getTimestamp());
                 Object value = protoValueToJava(pt.getValue());
+                if (asDate) {
+                    value = toDate(value);
+                }
 
                 AggregatedDataPoint<Object, AggregationType> point =
                         AggregatedDataPoint.<Object, AggregationType>builder(source, key.aggregationType())
@@ -647,7 +668,7 @@ public class FactryQueryEngine extends AbstractQueryEngine {
     private int queryMinMax(
             String uuid, QualifiedPath source, AggregatedQueryKey key,
             String period, AggregatedQueryOptions options,
-            AggregatedPointProcessor processor) {
+            AggregatedPointProcessor processor, boolean asDate) {
 
         // Query min and max separately, grouped by status and keeping only the Good series so
         // bad/uncertain samples don't skew the min/max (see querySingleAggregate).
@@ -677,7 +698,8 @@ public class FactryQueryEngine extends AbstractQueryEngine {
                 continue;
             }
             for (SeriesPoint pt : series.getDataPointsList()) {
-                minValues.put(pt.getTimestamp(), protoValueToJava(pt.getValue()));
+                Object minVal = protoValueToJava(pt.getValue());
+                minValues.put(pt.getTimestamp(), asDate ? toDate(minVal) : minVal);
             }
         }
 
@@ -692,6 +714,9 @@ public class FactryQueryEngine extends AbstractQueryEngine {
                 Instant timestamp = Instant.ofEpochMilli(ts);
                 Object minVal = minValues.get(ts);
                 Object maxVal = protoValueToJava(pt.getValue());
+                if (asDate) {
+                    maxVal = toDate(maxVal);
+                }
 
                 // Emit min point
                 if (minVal != null) {
@@ -808,7 +833,8 @@ public class FactryQueryEngine extends AbstractQueryEngine {
             Instant createdTime = m.hasCreatedAt()
                     ? Instant.ofEpochSecond(m.getCreatedAt().getSeconds(), m.getCreatedAt().getNanos())
                     : Instant.EPOCH;
-            return Optional.of(new FactryRecord(m.getUuid(), path, m.getDatatype(), createdTime));
+            return Optional.of(new FactryRecord(m.getUuid(), path, m.getDatatype(),
+                    MeasurementCache.ignitionDataType(m), createdTime));
         }
 
         // Try asset
@@ -880,6 +906,89 @@ public class FactryQueryEngine extends AbstractQueryEngine {
     /** A status that maps to Good quality (Good level, or an untagged series). */
     private static boolean isGoodStatus(String status) {
         return statusToQuality(status) == QualityCode.Good;
+    }
+
+    /**
+     * Aggregates that still mean something for a DateTime tag. Factry stores dates as epoch
+     * milliseconds, so the min, max, last value and mean of those numbers are dates too, and Count
+     * is a count. Sum, Range, Variance and StdDev of dates are not dates, so they return Bad.
+     */
+    private static final Set<String> DATE_AGGREGATES = Set.of(
+            "Average", "SimpleAverage", "MinMax", "Minimum", "Maximum", "LastValue", "Count");
+
+    /** True for a measurement that holds an Ignition DateTime tag (stored as epoch milliseconds). */
+    private static boolean isDateTime(HistoricalNode node) {
+        return node != null && node.dataType().orElse(null) == DataType.DateTime;
+    }
+
+    /** Factry returns a date as its epoch milliseconds; Ignition expects a Date. */
+    static Object toDate(Object value) {
+        return value instanceof Number ? new java.util.Date(Math.round(((Number) value).doubleValue())) : value;
+    }
+
+    /**
+     * Gives a Count of a tag that is not numeric (String, DateTime, ...) a number column. The
+     * framework types a Count column after the tag (CountAggregate returns the tag's own type
+     * class), then coerces each value to that type, so a count of 600 would come out as the text
+     * "600" or the Date 1970-01-01 00:00:00.600. Everything else passes through to the real processor.
+     */
+    private static final class CountAsNumber implements AggregatedPointProcessor {
+        private final AggregatedPointProcessor delegate;
+        private final List<AggregatedQueryKey> keys;
+
+        CountAsNumber(AggregatedPointProcessor delegate, List<AggregatedQueryKey> keys) {
+            this.delegate = delegate;
+            this.keys = keys;
+        }
+
+        @Override
+        public boolean onInitialize(ProcessingContext<AggregatedQueryKey, DataPointType> context) {
+            if (!(context instanceof DefaultProcessingContext<AggregatedQueryKey, DataPointType> given)) {
+                return delegate.onInitialize(context);
+            }
+            DefaultProcessingContext.Builder<AggregatedQueryKey, DataPointType> builder = DefaultProcessingContext.builder();
+            given.properties().forEach((key, props) -> {
+                for (var pv : props) {
+                    builder.addPropertyValue(key, (Property<Object>) pv.getProperty(), pv.getValue());
+                }
+            });
+            for (AggregatedQueryKey key : keys) {
+                // Boolean tags have the Integer class, so their Count is already a number.
+                boolean notNumeric = context.getContextValue(key, HistorianProperties.DATA_TYPE)
+                        .filter(t -> t.getTypeClass() != DataTypeClass.Integer
+                                && t.getTypeClass() != DataTypeClass.Float)
+                        .isPresent();
+                if (notNumeric && "Count".equals(key.aggregationType().name())) {
+                    builder.addPropertyValue(key, HistorianProperties.DATA_TYPE, DataType.Float8);
+                }
+            }
+            return delegate.onInitialize(builder.build());
+        }
+
+        @Override
+        public boolean onPointAvailable(AggregatedQueryKey key, AggregatedPoint<?, ?> point) {
+            return delegate.onPointAvailable(key, point);
+        }
+
+        @Override
+        public void onKeyFailure(AggregatedQueryKey key, QualityCode quality) {
+            delegate.onKeyFailure(key, quality);
+        }
+
+        @Override
+        public void onError(QualityCode quality) {
+            delegate.onError(quality);
+        }
+
+        @Override
+        public void onError(Exception e) {
+            delegate.onError(e);
+        }
+
+        @Override
+        public void onComplete() {
+            delegate.onComplete();
+        }
     }
 
     static Object protoValueToJava(com.google.protobuf.Value value) {

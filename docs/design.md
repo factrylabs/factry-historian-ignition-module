@@ -153,7 +153,7 @@ In-memory cache of Factry measurements and assets. Both the storage engine and q
 - `tagPathToUUID` — maps stored tag path (e.g., `Ignition-abc:[default]Temperature`) to Factry UUID
 - `uuidToMeasurement` — maps UUID to full `Measurement` proto object
 - `refresh(grpcClient)` — fetches all measurements from Factry, replaces the maps. Only keeps measurements with `status=Active`
-- `getOrCreateUUID(tagPath, grpcClient, value)` — cache lookup with auto-creation: on miss, creates the measurement in Factry, polls until visible, returns UUID. Includes concurrent creation prevention (`pendingCreations` set) and data type detection from the value
+- `getOrCreateUUID(tagPath, grpcClient, value)` — cache lookup with auto-creation: on miss, creates the measurement in Factry, polls until visible, returns UUID. Includes concurrent creation prevention (`pendingCreations` set). The data type comes from the tag's Ignition `dataType` metadata when known (Store and Forward hands Boolean values over as Long 0/1), else from the value. Dates are stored as epoch milliseconds in a `number` measurement, and the tag's Ignition data type is written to the measurement settings (`ignitionDataType`, a Date value without metadata counts as `DateTime`) so queries can return Dates. NaN and Infinity are written as a Bad point without a value, and Longs above 2^53 as the nearest double, with a warning once per tag
 - `evictByUUID(uuid)` — removes a measurement so it gets re-created on next write (used when Factry rejects points for deleted measurements)
 - Before creating a measurement, the write path looks its exact name up in Factry and reuses an Active one. Measurements that are not Active (Discovered, ...) are kept in `inactiveByName`, for the write path only. Values for a tag whose measurement exists only in another status are discarded (`WriteRefusal.NOT_ACTIVE`): counted as handled, so store and forward does not retry them, with one warning per flush naming the newly refused tags and a count in `HistorianMetrics.getDiscardedPointCount()`. The measurement is not created again
 - `writeRefusal(measurement, collectorUUID)` — the one check of whether the module may write to a measurement. Factry answers OK to points written to another collector's measurement and drops them, so the write paths only use measurements of the module's own collector (or without a collector UUID). Browse and query keep every collector's measurements; when several have the same name (one per time-series database), the cache keeps the module's own under that name, so query by name prefers it too. When the measurement with a tag's name is another collector's (`WriteRefusal.OTHER_COLLECTOR`), the module asks Factry once per tag to create its own, since the other may be in another database, and polls until one of its own appears. If none Active appears, the tag's values are discarded like a `NOT_ACTIVE` tag's. A measurement of its own with that name in another status (the Discovered duplicate such a try leaves) counts as tried, so a restart does not try again
@@ -243,6 +243,8 @@ Implements `HistoricalNode` — the Ignition SDK's representation of a browsable
 - `"boolean"` → `DataType.Boolean`
 - `"number"` → `DataType.Float8`
 - `"string"` → `DataType.String`
+- a measurement whose `ignitionDataType` setting is `DateTime` → `DataType.DateTime`. Factry keeps the dates as epoch milliseconds; the query engine returns them as `java.util.Date`. Aggregates of such a tag: LastValue, Minimum, Maximum, MinMax, Average and SimpleAverage are Dates, Count is a number, and Sum, Range, Variance and StdDev fail the key with `Bad_Unsupported`. Measurements created before this setting existed read back as numbers. To have such a measurement read back as Dates and keep its history, add the setting in Factry instead of deleting the measurement: `GET /api/measurements/{uuid}`, then `PUT /api/measurements/{uuid}` with the same `Attributes`, `CollectorUUID`, `DatabaseUUID`, `Datatype`, `Description`, `Metadata`, `Name` and `Status`, and `Settings` plus `"ignitionDataType": "DateTime"`. The module reads Dates from its next cache refresh. The bulk `PATCH /api/measurements` refuses it ("Setting ignitionDataType is not common to all selected measurements"). Checked on Factry v8.2.3.
+- Array tags get their Ignition type in the setting too (e.g. `DateTimeArray`), but the read side does not return array values yet. Only `DateTime` is checked, so when array read-back is added, the elements of a `DateTimeArray` measurement must be turned into Dates as well.
 
 ### `ModuleProperties.java`
 
@@ -285,7 +287,9 @@ Steps 2 to 7 live in `PointWriter`, which the engine calls; it uses no Ignition 
 
 **`isEngineUnavailable()`** — returns `true` when the gRPC connection is down. This is how S&F knows to buffer instead of attempting writes.
 
-**`doStoreMetadata()`** / **`doStoreSourceChange()`** — no-ops. Metadata is managed on the Factry platform, not pushed from Ignition.
+**`doStoreMetadata()`**: caches each tag's metadata in `MeasurementCache`; it sends nothing to Factry by itself. When the module creates a measurement for the tag, its data type, description, engineering units and limits (the `Config` attributes) and the `ignitionDataType` setting come from this cache. The cache keeps the metadata after the create, so a failed create or a measurement deleted in Factry is created again with it: Ignition may not send it again.
+
+**`applySourceChanges()`**: drops the cached metadata of retired and renamed tags. Measurements in Factry are left alone.
 
 ### `FactryQueryEngine.java`
 
@@ -316,6 +320,7 @@ Extends `AbstractQueryEngine`. Handles all data retrieval from Factry.
 | StdDev | `stddev` |
 | MinMax | queries `min` and `max` separately, emits pairs |
 
+- Count of a tag that is not numeric (String, DateTime) gets a number column: Ignition types a Count column after the tag, so it would otherwise return the text `"600"` or a Date in 1970
 - Time window → Go duration conversion (e.g., `TimeWindow(2h30m)` → `"2h30m0s"`)
 
 **`doBrowse(browseContext, publisher)`**:
@@ -481,7 +486,7 @@ FactryStorageEngine.doStoreAtomic(points)
 - **History renaming** — not supported by the Factry platform
 - **Extended scripting** (e.g. `system.factry.queryEvents`) — deferred until customer demand exists
 
-**Store metadata is a no-op:** `FactryStorageEngine.doStoreMetadata()` accepts the call and returns success, but does not forward metadata to Factry. Metadata (engineering units, limits, etc.) is managed on the Factry platform directly, not pushed from Ignition.
+**Metadata only seeds new measurements:** `FactryStorageEngine.doStoreMetadata()` caches the tag metadata, and it is applied only when the module creates a measurement (data type, description, engineering units and limits, `ignitionDataType` setting). Later changes to a tag's metadata in Ignition are not pushed to an existing measurement; edit those on the Factry platform.
 
 **Pagination:** The design document lists pagination as a provider requirement. In practice, there is no paginated use case — charts receive the full dataset and Jython scripts get a complete `DataSet` object. The gRPC proto does define `limit`/`offset` fields on `QueryTimeseriesRequest`, so pagination can be added if Factry ever imposes response size limits.
 
