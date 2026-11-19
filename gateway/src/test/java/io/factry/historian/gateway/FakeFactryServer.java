@@ -155,8 +155,8 @@ final class FakeFactryServer extends HistorianGrpc.HistorianImplBase implements 
             for (Pt p : points.getOrDefault(uuid, List.of())) {
                 var tf = request.getTags().getFieldsMap().get("status");
                 if (tf != null && !tf.getStringValue().equals(p.status())) continue;
-                boolean endExcl = request.getDesc();
-                if (p.ts() >= start && (endExcl ? p.ts() < end : p.ts() <= end)) {
+                // Factry's end is exclusive (checked live on 8.2.3).
+                if (p.ts() >= start && p.ts() < end) {
                     String grp = request.getGroupByList().contains("status") ? p.status() : "";
                     byStatus.computeIfAbsent(grp, k -> new ArrayList<>()).add(p);
                 }

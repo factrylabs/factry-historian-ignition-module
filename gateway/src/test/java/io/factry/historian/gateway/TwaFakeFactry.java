@@ -46,6 +46,8 @@ class TwaFakeFactry extends FactryGrpcClient {
     final List<Integer> rawAnswerPoints = new ArrayList<>();
     /** Answers larger than this fail like a gRPC message over the client's limit. */
     int maxAnswerBytes = Integer.MAX_VALUE;
+    /** Requests that include one of these measurements fail, as Factry fails a whole request. */
+    final java.util.Set<String> failingMeasurements = new java.util.HashSet<>();
 
     TwaFakeFactry() {
         super("localhost", 1, "collector", "token", false, false, null);
@@ -110,6 +112,9 @@ class TwaFakeFactry extends FactryGrpcClient {
     @Override
     public QueryTimeseriesResponse queryTimeseries(QueryTimeseriesRequest request) {
         queries.add(request);
+        if (request.getMeasurementUUIDsList().stream().anyMatch(failingMeasurements::contains)) {
+            throw Status.UNKNOWN.withDescription("measurement not found").asRuntimeException();
+        }
         long start = Timestamps.toMillis(request.getStart());
         long end = request.hasEnd() ? Timestamps.toMillis(request.getEnd()) : Long.MAX_VALUE;
         boolean byStatus = request.getGroupByList().contains("status");

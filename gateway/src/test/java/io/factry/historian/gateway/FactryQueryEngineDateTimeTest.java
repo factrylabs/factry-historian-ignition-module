@@ -57,7 +57,7 @@ import static org.junit.jupiter.api.Assertions.*;
 class FactryQueryEngineDateTimeTest {
 
     private static final long T0 = 1_794_480_000_000L;
-    private static final String START = "2026-11-12T10:00:00Z";
+    private static final String START = "2026-11-12T10:40:00Z";
 
     private Server server;
     private FactryGrpcClient client;
@@ -85,8 +85,8 @@ class FactryQueryEngineDateTimeTest {
         }
 
         /**
-         * Raw: three samples one second apart. Aggregated: one bucket, the mean of those samples,
-         * stamped at the query start like Factry's buckets.
+         * Raw: three samples one second apart, those in the requested range. Aggregated: one
+         * bucket, the mean of those samples, stamped at the query start like Factry's buckets.
          */
         @Override
         public void queryTimeseries(QueryTimeseriesRequest request, StreamObserver<QueryTimeseriesResponse> observer) {
@@ -99,9 +99,15 @@ class FactryQueryEngineDateTimeTest {
                         .setTimestamp(com.google.protobuf.util.Timestamps.toMillis(request.getStart()))
                         .setValue(Value.newBuilder().setNumberValue(value)));
             } else {
+                long start = com.google.protobuf.util.Timestamps.toMillis(request.getStart());
+                long end = request.hasEnd() ? com.google.protobuf.util.Timestamps.toMillis(request.getEnd())
+                        : Long.MAX_VALUE;
                 for (int i = 0; i < 3; i++) {
-                    series.addDataPoints(SeriesPoint.newBuilder().setTimestamp(T0 + i * 1_000L)
-                            .setValue(Value.newBuilder().setNumberValue(T0 + i * 1_000L)));
+                    long ts = T0 + i * 1_000L;
+                    if (ts >= start && ts < end) {
+                        series.addDataPoints(SeriesPoint.newBuilder().setTimestamp(ts)
+                                .setValue(Value.newBuilder().setNumberValue(ts)));
+                    }
                 }
             }
             observer.onNext(QueryTimeseriesResponse.newBuilder().addSeries(series).build());

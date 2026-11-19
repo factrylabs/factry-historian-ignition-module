@@ -51,14 +51,15 @@ dependencies {
     testImplementation("com.inductiveautomation.ignitionsdk:ignition-common:${rootProject.extra["sdk_version"]}")
     // GatewayContext, to build storage and query engines in tests
     testImplementation("com.inductiveautomation.ignition:gateway-api:${rootProject.extra["sdk_version"]}")
-    testImplementation("com.inductiveautomation.historian:historian-gateway-api:1.3.3") {
+    testImplementation("com.inductiveautomation.historian:historian-gateway-api:1.3.6") {
         isTransitive = false
     }
-    testImplementation("com.inductiveautomation.historian:historian-common:1.3.3") {
+    testImplementation("com.inductiveautomation.historian:historian-common:1.3.6") {
         isTransitive = false
     }
-    // Ignition's own wide-format writer, so tests read results the way a trend does.
-    testImplementation("com.inductiveautomation.historian:historian-gateway:1.3.3") {
+    // Ignition's own wide-format writer, so tests read results the way a trend does. 1.3.6 as in
+    // Ignition 8.3.6: its legacy query path (queryTagHistory) differs from 1.3.3's.
+    testImplementation("com.inductiveautomation.historian:historian-gateway:1.3.6") {
         isTransitive = false
     }
     testImplementation("com.google.protobuf:protobuf-java:$protobufVersion")

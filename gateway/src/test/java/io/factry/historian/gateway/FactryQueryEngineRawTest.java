@@ -292,7 +292,10 @@ class FactryQueryEngineRawTest {
         for (int i = 0; i < times.size(); i++) {
             assertEquals(START + i * 1000L, times.get(i));
         }
-        assertEquals(1, factry.queries.size(), "pens past the first 100 points should stop paging");
+        // The range itself; the other two read the values before and after it.
+        assertEquals(1, factry.queries.stream()
+                        .filter(q -> com.google.protobuf.util.Timestamps.toMillis(q.getStart()) == START).count(),
+                "pens past the first 100 points should stop paging");
     }
 
     @Test

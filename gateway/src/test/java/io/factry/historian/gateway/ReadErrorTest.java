@@ -138,10 +138,11 @@ class ReadErrorTest {
         Dataset ds = raw("a", "b");
 
         assertOnlySecondPenFailed(ds);
-        // The same rows as pen a alone: the failed pen adds none of its own.
-        assertEquals(6, ds.rows.size(), ds::toString);
+        // The same rows as pen a alone: the failed pen adds none of its own. Factry's end is
+        // exclusive, so the samples at 0 to 4 s.
+        assertEquals(5, ds.rows.size(), ds::toString);
         assertEquals(START, ds.time(0), ds::toString);
-        assertEquals(5.0, ((Number) ds.rows.get(ds.rows.size() - 1)[1]).doubleValue(), ds::toString);
+        assertEquals(4.0, ((Number) ds.rows.get(ds.rows.size() - 1)[1]).doubleValue(), ds::toString);
     }
 
     @Test
@@ -309,7 +310,7 @@ class ReadErrorTest {
         Dataset ds = raw("a", "c");
 
         assertNull(ds.error);
-        assertEquals(6, ds.rows.size(), ds::toString);
+        assertEquals(5, ds.rows.size(), ds::toString);
         for (QualityCode[] q : ds.qualities) {
             assertTrue(q[1].isGood(), ds::toString);
             assertTrue(q[2].is(QualityCode.Bad_NotFound), ds::toString);

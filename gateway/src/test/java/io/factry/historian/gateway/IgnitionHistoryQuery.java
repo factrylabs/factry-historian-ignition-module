@@ -1,10 +1,13 @@
 package io.factry.historian.gateway;
 
+import com.inductiveautomation.historian.common.model.options.RawQueryOptions;
+import com.inductiveautomation.historian.common.model.options.ResultWriterOptions;
 import com.inductiveautomation.historian.gateway.api.Historian;
 import com.inductiveautomation.historian.gateway.api.paths.QualifiedPathAdapter;
 import com.inductiveautomation.historian.gateway.api.query.QueryEngine;
 import com.inductiveautomation.historian.gateway.interop.HistorianQueryInterface;
 import com.inductiveautomation.historian.gateway.query.writing.HistoryWriter;
+import com.inductiveautomation.historian.gateway.util.HistorianUtilities;
 import com.inductiveautomation.ignition.common.FillMode;
 import com.inductiveautomation.ignition.common.QualifiedPath;
 import com.inductiveautomation.ignition.common.StreamingDatasetWriter;
@@ -12,6 +15,8 @@ import com.inductiveautomation.ignition.common.model.values.QualityCode;
 import com.inductiveautomation.ignition.common.sqltags.history.AggregationMode;
 import com.inductiveautomation.ignition.common.sqltags.history.BasicTagHistoryQueryParams;
 import com.inductiveautomation.ignition.common.sqltags.history.ReturnFormat;
+import com.inductiveautomation.ignition.common.sqltags.history.TagHistoryQueryParams;
+import com.inductiveautomation.ignition.common.util.Flags;
 import com.inductiveautomation.ignition.gateway.sqltags.history.query.ColumnQueryDefinition;
 import com.inductiveautomation.ignition.gateway.sqltags.history.query.HistoryQueryExecutor;
 
@@ -90,6 +95,11 @@ final class IgnitionHistoryQuery {
      */
     static Dataset wide(QueryEngine engine, long start, long end, int returnSize, AggregationMode aggregate,
                         FillMode fill, String... tags) throws Exception {
+        return wide(engine, start, end, returnSize, aggregate, fill, 0, tags);
+    }
+
+    private static Dataset wide(QueryEngine engine, long start, long end, int returnSize, AggregationMode aggregate,
+                                FillMode fill, int flags, String... tags) throws Exception {
         List<QualifiedPath> paths = new ArrayList<>();
         List<ColumnQueryDefinition> defs = new ArrayList<>();
         for (String tag : tags) {
@@ -101,6 +111,41 @@ final class IgnitionHistoryQuery {
         }
         BasicTagHistoryQueryParams params = new BasicTagHistoryQueryParams(paths, new Date(start), new Date(end),
                 returnSize, aggregate, ReturnFormat.Wide, List.of(tags), List.of());
+        params.setQueryFlags(new Flags(flags));
+        return run(engine, params, defs);
+    }
+
+    /**
+     * A raw read with Ignition's legacy query flags, as queryTagHistory sets them: 16 for
+     * includeBoundingValues=True, 32 for False, 1 for no seed values.
+     */
+    static Dataset raw(QueryEngine engine, long start, long end, int returnSize, int flags, String... tags)
+            throws Exception {
+        return wide(engine, start, end, returnSize, null, FillMode.NONE, flags, tags);
+    }
+
+    /**
+     * A read the way system.historian.queryRawPoints runs it in 8.3.6: its options are turned into
+     * legacy query parameters (HistorianUtilities.toLegacyQueryParams, as
+     * HistorianManagerImpl.queryDataPoints does) and run through the same legacy path as
+     * queryTagHistory.
+     */
+    static Dataset rawPoints(QueryEngine engine, RawQueryOptions options) throws Exception {
+        TagHistoryQueryParams params = HistorianUtilities.toLegacyQueryParams(options, ResultWriterOptions.builder()
+                .resultFormat(ResultWriterOptions.ResultFormat.WIDE)
+                .objectType(ResultWriterOptions.ObjectType.DATASET).build());
+        List<ColumnQueryDefinition> defs = new ArrayList<>();
+        for (int i = 0; i < params.getPaths().size(); i++) {
+            QualifiedPath path = (QualifiedPath) params.getPaths().get(i);
+            List<String> aliases = params.getAliases();
+            defs.add(new ColumnQueryDefinition(path, aliases != null && i < aliases.size() ? aliases.get(i)
+                    : path.getLastPathComponent()));
+        }
+        return run(engine, params, defs);
+    }
+
+    private static Dataset run(QueryEngine engine, TagHistoryQueryParams params, List<ColumnQueryDefinition> defs)
+            throws Exception {
         Dataset ds = new Dataset();
         HistoryWriter writer = new HistoryWriter("test", ds, params);
         HistoryQueryExecutor executor = new HistorianQueryInterface(historian(engine)).createQuery(defs, writer);
