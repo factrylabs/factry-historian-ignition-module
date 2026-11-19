@@ -97,10 +97,9 @@ class PointWriter {
 
         if (built.pointsBuilder.getPointsCount() == 0) {
             if (built.hasSkippedArrays) {
-                // Array measurements are being created asynchronously — tell S&F to retry
-                logger.debug("No points to send, array measurements pending creation");
-                return StorageResult.exception(
-                        new RuntimeException("Array measurement(s) being created, retry later"), points);
+                // An array's measurement is being created, or its last value not read yet
+                logger.debug("No points to send, array(s) not ready");
+                return StorageResult.exception(new RuntimeException(ARRAYS_NOT_READY), points);
             }
             if (built.hasFailedCreations) {
                 // Measurement creation failed for supported-type points (Factry likely
@@ -133,9 +132,8 @@ class PointWriter {
                 // Non-array points sent successfully, but array points were skipped.
                 // Return exception so S&F retries the whole batch — the non-array points
                 // will be re-sent (idempotent) and the array points will succeed next time.
-                logger.debug("Array measurements pending, requesting S&F retry for array points");
-                return StorageResult.exception(
-                        new RuntimeException("Array measurement(s) being created, retry later"), points);
+                logger.debug("Array(s) not ready, requesting S&F retry for array points");
+                return StorageResult.exception(new RuntimeException(ARRAYS_NOT_READY), points);
             }
             if (built.hasFailedCreations) {
                 // Some points were sent, but others have no measurement yet (Factry did not
@@ -346,8 +344,14 @@ class PointWriter {
                 continue;
             }
 
-            written(basePath);
             List<ArrayPointMerger.ArraySnapshot> snapshots = mergeArray(basePath, measurementUUID, byTimestamp);
+            if (snapshots == null) {
+                // The last stored value could not be read yet. Send the rest of the flush and
+                // let store and forward retry it, so one array doesn't hold back the other tags.
+                hasSkippedArrays = true;
+                continue;
+            }
+            written(basePath);
 
             for (ArrayPointMerger.ArraySnapshot snap : snapshots) {
                 // Build a ListValue from the full merged array, in index order.
@@ -378,18 +382,18 @@ class PointWriter {
     /**
      * Merge the incoming (possibly partial) element changes into the last-known full array so
      * unchanged elements are preserved, and return one row per timestamp (see
-     * {@link ArrayPointMerger#mergeUpdates}).
+     * {@link ArrayPointMerger#mergeUpdates}), or null when Factry's last value could not be
+     * read yet and the array should wait for the store and forward retry.
      */
     private List<ArrayPointMerger.ArraySnapshot> mergeArray(String basePath, String measurementUUID,
             java.util.TreeMap<Long, java.util.TreeMap<Integer, ArrayPointMerger.ArrayElement>> byTimestamp) {
         java.util.TreeMap<Integer, Object> state =
                 lastArrayValues.computeIfAbsent(basePath, k -> new java.util.TreeMap<>());
         synchronized (state) {
-            if (state.isEmpty()) {
-                // Cache miss (first store for this array, or first after a restart) —
-                // seed from Factry's last stored value so a partial update from Ignition
-                // doesn't truncate the array.
-                seedArrayStateFromFactry(basePath, measurementUUID, state);
+            // Cache miss (first store for this array, or first after a restart): seed from
+            // Factry's last stored value so a partial update from Ignition doesn't truncate it.
+            if (state.isEmpty() && !seedArrayStateFromFactry(basePath, measurementUUID, state)) {
+                return null;
             }
             return ArrayPointMerger.mergeUpdates(state, byTimestamp);
         }
@@ -454,14 +458,28 @@ class PointWriter {
         }
     }
 
+    private static final String ARRAYS_NOT_READY =
+            "Array measurement being created or its last value not read yet, retry later";
+
+    /** When the "still waiting" warning was last logged, per array base path. */
+    private final Map<String, Long> arraySeedWarnedAt = new ConcurrentHashMap<>();
+    static final long ARRAY_SEED_WARN_EVERY_MS = 5 * 60_000L;
+    /** For tests. */
+    java.util.function.LongSupplier clock = System::currentTimeMillis;
+
     /**
      * Seed {@code state} with the elements of the most recent array value stored in Factry
      * for the given measurement. Used on a cache miss so that a partial element update from
-     * Ignition is merged onto the full array rather than truncating it. Best-effort: on any
-     * error (or when Factry has no prior value) the state is left unchanged.
+     * Ignition is merged onto the full array rather than truncating it.
+     *
+     * @return false when the read failed: the array then waits for the store and forward retry,
+     *     while the rest of the flush is sent. It never gives up and merges onto the empty
+     *     state: the unchanged elements would be missing for good, and Factry stores a row with
+     *     a null element as an empty array. Store and forward keeps the array's values until a
+     *     read works.
      */
-    private void seedArrayStateFromFactry(String basePath, String measurementUUID,
-                                          java.util.TreeMap<Integer, Object> state) {
+    private boolean seedArrayStateFromFactry(String basePath, String measurementUUID,
+                                             java.util.TreeMap<Integer, Object> state) {
         try {
             QueryTimeseriesRequest req = QueryTimeseriesRequest.newBuilder()
                     .addMeasurementUUIDs(measurementUUID)
@@ -471,6 +489,7 @@ class PointWriter {
                     .setLimit(1)
                     .build();
             QueryTimeseriesResponse reply = grpcClient.queryTimeseries(req);
+            arraySeedWarnedAt.remove(basePath);
             for (Series series : reply.getSeriesList()) {
                 for (SeriesPoint pt : series.getDataPointsList()) {
                     Value v = pt.getValue();
@@ -484,8 +503,16 @@ class PointWriter {
                     }
                 }
             }
+            return true;
         } catch (Exception e) {
-            logger.warn("Could not seed array state for '" + basePath + "' from Factry: " + e.getMessage());
+            long now = clock.getAsLong();
+            Long last = arraySeedWarnedAt.get(basePath);
+            if (last == null || now - last >= ARRAY_SEED_WARN_EVERY_MS) {
+                arraySeedWarnedAt.put(basePath, now);
+                logger.warn("Could not read the last value of array '" + basePath + "' from Factry ("
+                        + e.getMessage() + "); its values wait in store and forward until it can be read");
+            }
+            return false;
         }
     }
 

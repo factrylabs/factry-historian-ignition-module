@@ -167,25 +167,23 @@ public class MeasurementCache {
                     freshAssets.put(a.getUuid(), a);
                     assetUUIDs.add(a.getUuid());
                 }
-                assetNameToUUID = new ConcurrentHashMap<>(freshAssetNames);
-                uuidToAsset = new ConcurrentHashMap<>(freshAssets);
 
-                // Fetch properties for all assets
+                // Fetch properties for all assets. A failure (or time-out) here skips the swap
+                // below, so asset browse keeps the previous assets and properties instead of
+                // showing assets without properties until the next refresh succeeds.
                 Map<String, List<AssetProperty>> freshProps = new HashMap<>();
                 if (!assetUUIDs.isEmpty()) {
-                    try {
-                        GetAssetPropertiesRequest propReq = GetAssetPropertiesRequest.newBuilder()
-                                .addAllAssetUUIDs(assetUUIDs)
-                                .setRecursive(true)
-                                .build();
-                        AssetProperties propsResponse = grpcClient.getAssetProperties(propReq);
-                        for (AssetProperty prop : propsResponse.getAssetPropertiesList()) {
-                            freshProps.computeIfAbsent(prop.getAssetUUID(), k -> new ArrayList<>()).add(prop);
-                        }
-                    } catch (Exception pe) {
-                        logger.error("Failed to refresh asset properties cache", pe);
+                    GetAssetPropertiesRequest propReq = GetAssetPropertiesRequest.newBuilder()
+                            .addAllAssetUUIDs(assetUUIDs)
+                            .setRecursive(true)
+                            .build();
+                    AssetProperties propsResponse = grpcClient.getAssetProperties(propReq);
+                    for (AssetProperty prop : propsResponse.getAssetPropertiesList()) {
+                        freshProps.computeIfAbsent(prop.getAssetUUID(), k -> new ArrayList<>()).add(prop);
                     }
                 }
+                assetNameToUUID = new ConcurrentHashMap<>(freshAssetNames);
+                uuidToAsset = new ConcurrentHashMap<>(freshAssets);
                 assetProperties = new ConcurrentHashMap<>(freshProps);
 
                 logger.debug("Asset cache refreshed, {} assets, {} properties",

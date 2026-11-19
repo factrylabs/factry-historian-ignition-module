@@ -6,6 +6,10 @@ import com.inductiveautomation.historian.common.model.data.StorageResult;
 import com.inductiveautomation.ignition.common.QualifiedPath;
 import com.inductiveautomation.ignition.common.model.values.QualityCode;
 import io.factry.historian.proto.Point;
+import io.factry.historian.proto.QueryTimeseriesResponse;
+import io.factry.historian.proto.Series;
+import io.factry.historian.proto.SeriesPoint;
+import io.grpc.StatusRuntimeException;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
@@ -98,6 +102,55 @@ class PointWriterTest {
         Point last = factry.sent.get(1).getPoints(0);
         assertEquals(List.of(1.0, 5.0), last.getValue().getListValue().getValuesList().stream()
                 .map(com.google.protobuf.Value::getNumberValue).collect(Collectors.toList()));
+    }
+
+    @Test
+    void anArrayWhoseLastValueCannotBeReadIsRetriedAndThenMergedOntoIt() {
+        factry.add("default/Tank/Profile", "profile-uuid");
+        cache.refresh(factry);
+        factry.queryResponse = QueryTimeseriesResponse.newBuilder()
+                .addSeries(Series.newBuilder().addDataPoints(SeriesPoint.newBuilder()
+                        .setTimestamp(500L)
+                        .setValue(com.google.protobuf.Value.newBuilder().setListValue(
+                                com.google.protobuf.ListValue.newBuilder()
+                                        .addValues(number(1)).addValues(number(2)).addValues(number(3))))))
+                .build();
+        factry.queryFailures = 1;
+        List<AtomicPoint<?>> flush = List.of(point("Tank/Profile[1]", 9));
+
+        StorageResult<AtomicPoint<?>> first = writer.write(flush);
+        assertTrue(first.error().isPresent(), "store and forward keeps the flush and retries it");
+        assertTrue(factry.sent.isEmpty());
+
+        writer.write(flush);
+
+        Point last = factry.sent.get(0).getPoints(0);
+        assertEquals(List.of(1.0, 9.0, 3.0), last.getValue().getListValue().getValuesList().stream()
+                .map(com.google.protobuf.Value::getNumberValue).collect(Collectors.toList()),
+                "the retry reads the last value again and keeps the elements that did not change");
+    }
+
+    @Test
+    void anArrayWhoseLastValueStaysUnreadableDoesNotHoldBackTheOtherTags() {
+        factry.add("default/Tank/Level", "level-uuid");
+        factry.add("default/Tank/Profile", "profile-uuid");
+        cache.refresh(factry);
+        factry.queryFailure = io.grpc.Status.DEADLINE_EXCEEDED;
+        factry.queryFailures = Integer.MAX_VALUE;
+        List<AtomicPoint<?>> flush = List.of(point("Tank/Level", 2.0), point("Tank/Profile[1]", 9));
+
+        for (int attempt = 1; attempt <= 5; attempt++) {
+            StorageResult<AtomicPoint<?>> result = writer.write(flush);
+            assertTrue(result.error().isPresent(), "attempt " + attempt + " is retried");
+            assertEquals(attempt, factry.sent.size(), "the scalar goes out on every attempt");
+            assertEquals("level-uuid", factry.sent.get(attempt - 1).getPoints(0).getMeasurementUUID());
+            assertEquals(1, factry.sent.get(attempt - 1).getPointsCount(),
+                    "the array waits rather than being stored without its unchanged elements");
+        }
+    }
+
+    static com.google.protobuf.Value number(double v) {
+        return com.google.protobuf.Value.newBuilder().setNumberValue(v).build();
     }
 
     @Nested

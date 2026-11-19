@@ -2,6 +2,10 @@ package io.factry.historian.gateway;
 
 import com.google.protobuf.Struct;
 import com.google.protobuf.Value;
+import io.factry.historian.proto.Asset;
+import io.factry.historian.proto.AssetProperties;
+import io.factry.historian.proto.AssetProperty;
+import io.factry.historian.proto.Assets;
 import io.factry.historian.proto.CreateMeasurement;
 import io.factry.historian.proto.Measurement;
 import io.factry.historian.proto.MetadataProperty;
@@ -654,6 +658,33 @@ class MeasurementCacheTest {
             assertEquals(MeasurementCache.WriteRefusal.PAUSED, MeasurementCache.writeRefusal(paused, "abc-123"));
             assertEquals(MeasurementCache.WriteRefusal.OTHER_COLLECTOR,
                     MeasurementCache.writeRefusal(paused, "def-456"));
+        }
+    }
+
+    @Nested
+    class AssetRefresh {
+
+        @Test
+        void aFailedPropertyFetchKeepsThePreviousAssetsAndProperties() {
+            FakeFactry factry = fakeFactry();
+            factry.assets = Assets.newBuilder()
+                    .addAssets(Asset.newBuilder().setUuid("a1").setName("Pump")).build();
+            factry.assetProperties = AssetProperties.newBuilder()
+                    .addAssetProperties(AssetProperty.newBuilder().setUuid("p1").setAssetUUID("a1")
+                            .setName("Speed"))
+                    .build();
+            MeasurementCache cache = new MeasurementCache(NO_WAIT);
+            cache.refresh(factry);
+            assertEquals(1, cache.getPropertiesForAsset("a1").size());
+
+            factry.assets = Assets.newBuilder()
+                    .addAssets(Asset.newBuilder().setUuid("a1").setName("Pump"))
+                    .addAssets(Asset.newBuilder().setUuid("a2").setName("Valve")).build();
+            factry.assetPropertiesFailure = Status.DEADLINE_EXCEEDED;
+            cache.refresh(factry);
+
+            assertEquals(1, cache.getPropertiesForAsset("a1").size(), "properties kept after a failed fetch");
+            assertNull(cache.getAssetUUID("Valve"), "assets and properties are swapped in together");
         }
     }
 }

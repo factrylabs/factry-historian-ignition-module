@@ -138,9 +138,10 @@ The single point of contact with Factry. Wraps a gRPC `ManagedChannel` and expos
 **Key design points:**
 - **TLS modes**: plain text, TLS with bundled CA cert, TLS with insecure trust (skip verification), fallback to system trust store
 - **Connection tracking**: `connected` flag set to `false` on `createPoints()` failure, checked by `StorageEngine.isEngineUnavailable()` so S&F can buffer without hitting the network
-- **Write deadline**: 3-second timeout on writes (configurable via `ModuleProperties`)
+- **Deadlines**: every call has one, so a Factry that never answers cannot hang the module: 3 s for writes and store lookups, 30 s for history queries, each cache refresh page and the asset fetches, 10 s for the other small calls (configurable via `ModuleProperties`). The connection test has a fixed 5 s
+- **Dead connections**: no keepalive pings, because Factry closes a connection that pings without a call running (`too_many_pings`). When `testConnection()` times out, the channel drops its connection with `enterIdle()` so the next call opens a new one
 - **Auth headers**: every call includes `collectoruuid` + `authorization: Bearer <token>` metadata
-- **Read/write lock**: prevents race conditions during `reconfigure()` — old channel is shut down and replaced atomically
+- **Read/write lock**: prevents race conditions during `reconfigure()` — old channel is shut down and replaced atomically. `reconfigure()` and `shutdown()` wait at most 3 s for running calls, then cancel them
 - **Reconfiguration**: `handleSettingsChange()` calls `reconfigure()` to swap the channel without restarting the module
 
 ### `MeasurementCache.java`
@@ -252,6 +253,9 @@ Loads tuning values from `factry-historian.properties` (bundled in the .modl). T
 | Property | Default | Controls |
 |----------|---------|----------|
 | `grpc.write.deadline.seconds` | 3 | Timeout on `createPoints()` calls |
+| `grpc.read.deadline.seconds` | 30 | Timeout on history queries, on each page of the measurement cache refresh, and on the asset and asset property fetches |
+| `grpc.call.deadline.seconds` | 10 | Timeout on the small calls: collectors, health, collector state |
+| `grpc.shutdown.grace.seconds` | 3 | How long a settings save or shutdown waits for running calls before it cancels them |
 | `status.cache.ms` | 30000 | How long to cache historian status (avoids gRPC poll on every UI refresh) |
 | `measurement.cache.refresh.seconds` | 30 | How often to reload measurements from Factry |
 
