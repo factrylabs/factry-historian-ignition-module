@@ -48,6 +48,12 @@ final class FakeFactryServer extends HistorianGrpc.HistorianImplBase implements 
     final List<QueryTimeseriesRequest> queries = new CopyOnWriteArrayList<>();
     /** Answers larger than this fail like Factry's own send limit. */
     volatile int maxAnswerBytes = Integer.MAX_VALUE;
+    /** QueryTimeseries calls that include one of these measurements fail. */
+    final java.util.Set<String> failingMeasurements = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    /** QueryTimeseries calls past the first page (offset above 0) that include one of these fail. */
+    final java.util.Set<String> failingPastFirstPage = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    /** When set, every QueryTimeseries call fails with this status, like a Factry that is down or hangs. */
+    volatile Status queryFailure = null;
     /** Answers every page from the start, like a Factry that does not support offset. */
     volatile boolean ignoreOffset = false;
 
@@ -112,19 +118,34 @@ final class FakeFactryServer extends HistorianGrpc.HistorianImplBase implements 
     public void queryTimeseries(QueryTimeseriesRequest request,
                                 StreamObserver<QueryTimeseriesResponse> observer) {
         queries.add(request);
+        if (queryFailure != null) {
+            observer.onError(queryFailure.asRuntimeException());
+            return;
+        }
+        if (request.getMeasurementUUIDsList().stream().anyMatch(failingMeasurements::contains)
+                || request.getOffset() > 0
+                && request.getMeasurementUUIDsList().stream().anyMatch(failingPastFirstPage::contains)) {
+            observer.onError(Status.INTERNAL.withDescription("query failed").asRuntimeException());
+            return;
+        }
         long start = request.hasStart() ? com.google.protobuf.util.Timestamps.toMillis(request.getStart()) : Long.MIN_VALUE;
         long end = request.hasEnd() ? com.google.protobuf.util.Timestamps.toMillis(request.getEnd()) : Long.MAX_VALUE;
         List<Series> series = new ArrayList<>();
         for (String uuid : request.getMeasurementUUIDsList()) {
             Map<String, List<Pt>> byStatus = new TreeMap<>();
             for (Pt p : points.getOrDefault(uuid, List.of())) {
-                if (p.ts() >= start && p.ts() <= end) {
-                    byStatus.computeIfAbsent(p.status(), k -> new ArrayList<>()).add(p);
+                var tf = request.getTags().getFieldsMap().get("status");
+                if (tf != null && !tf.getStringValue().equals(p.status())) continue;
+                boolean endExcl = request.getDesc();
+                if (p.ts() >= start && (endExcl ? p.ts() < end : p.ts() <= end)) {
+                    String grp = request.getGroupByList().contains("status") ? p.status() : "";
+                    byStatus.computeIfAbsent(grp, k -> new ArrayList<>()).add(p);
                 }
             }
             for (Map.Entry<String, List<Pt>> e : byStatus.entrySet()) {
                 List<Pt> pts = e.getValue();
                 pts.sort(Comparator.comparingLong(Pt::ts));
+                if (request.getDesc()) { pts = new ArrayList<>(pts); Collections.reverse(pts); }
                 if (request.hasAggregation()) {
                     pts = aggregate(pts, request.getAggregation().getName(),
                             periodMillis(request.getAggregation().getPeriod()), e.getKey());
@@ -174,6 +195,9 @@ final class FakeFactryServer extends HistorianGrpc.HistorianImplBase implements 
             double v = switch (function) {
                 case "min" -> stats.getMin();
                 case "max" -> stats.getMax();
+                case "count" -> stats.getCount();
+                case "sum" -> stats.getSum();
+                case "last" -> b.getValue().get(b.getValue().size() - 1);
                 default -> stats.getAverage();
             };
             out.add(new Pt(b.getKey(), Value.newBuilder().setNumberValue(v).build(), status));

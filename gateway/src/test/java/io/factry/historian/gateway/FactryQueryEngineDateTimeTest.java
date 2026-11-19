@@ -237,6 +237,18 @@ class FactryQueryEngineDateTimeTest {
         Recorder r = aggregated("Stamp", AggregationMode.Sum);
 
         assertEquals(List.of(), r.values);
-        assertEquals(List.of(QualityCode.Bad_Unsupported), r.failures);
+        // The quality comes with the context, so Ignition builds a column that reads null with
+        // Bad_Unsupported on every row; an onKeyFailure would show as Bad_NotFound.
+        assertEquals(Optional.of(QualityCode.Bad_Unsupported), columnQuality(r));
+        assertEquals(List.of(), r.failures);
+    }
+
+    /** The quality Ignition gives the result column of the query's only key, if any. */
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    private static Optional<QualityCode> columnQuality(Recorder recorder) {
+        Map<?, ?> props = ((DefaultProcessingContext) recorder.context).properties();
+        assertEquals(1, props.size());
+        return ((ProcessingContext) recorder.context).getContextValue(
+                (QueryKey) props.keySet().iterator().next(), HistorianProperties.QUALITY_CODE);
     }
 }

@@ -81,6 +81,15 @@ final class IgnitionHistoryQuery {
      */
     static Dataset wide(QueryEngine engine, long start, long end, int returnSize, AggregationMode aggregate,
                         String... tags) throws Exception {
+        return wide(engine, start, end, returnSize, aggregate, FillMode.NONE, tags);
+    }
+
+    /**
+     * @param fill with an aggregate, the fill mode of every column. FillMode.DERIVED makes Ignition
+     *             give each column its own executor and query.
+     */
+    static Dataset wide(QueryEngine engine, long start, long end, int returnSize, AggregationMode aggregate,
+                        FillMode fill, String... tags) throws Exception {
         List<QualifiedPath> paths = new ArrayList<>();
         List<ColumnQueryDefinition> defs = new ArrayList<>();
         for (String tag : tags) {
@@ -88,7 +97,7 @@ final class IgnitionHistoryQuery {
             paths.add(path);
             defs.add(aggregate == null
                     ? new ColumnQueryDefinition(path, tag)
-                    : new ColumnQueryDefinition(path, aggregate, FillMode.NONE, tag));
+                    : new ColumnQueryDefinition(path, aggregate, fill, tag));
         }
         BasicTagHistoryQueryParams params = new BasicTagHistoryQueryParams(paths, new Date(start), new Date(end),
                 returnSize, aggregate, ReturnFormat.Wide, List.of(tags), List.of());

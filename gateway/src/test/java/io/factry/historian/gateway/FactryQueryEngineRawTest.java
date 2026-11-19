@@ -113,7 +113,11 @@ class FactryQueryEngineRawTest {
             b.returnSize(returnSize);
         }
         Recorder rec = new Recorder();
-        engine.query(b.build(), rec);
+        try {
+            engine.query(b.build(), rec);
+        } catch (IllegalStateException e) {
+            // A failed read also throws, so Ignition shows the error; rec.error has what onError got.
+        }
         return rec;
     }
 
@@ -289,6 +293,34 @@ class FactryQueryEngineRawTest {
             assertEquals(START + i * 1000L, times.get(i));
         }
         assertEquals(1, factry.queries.size(), "pens past the first 100 points should stop paging");
+    }
+
+    @Test
+    void penRefusedAfterTheReturnSizeCutDoesNotLosePointsOfOtherPens() {
+        // Pen a sets where the first returnSize points end, so b stops paging; then Factry refuses
+        // a on its second page. Without a's points the first 100 reach into b's.
+        String a = factry.addMeasurement("default/a", "number");
+        String b = factry.addMeasurement("default/b", "number");
+        String c = factry.addMeasurement("default/c", "number");
+        for (int s = 1; s <= 200; s++) {
+            factry.addPoint(a, START + s * 1000L, s);
+        }
+        for (int s = 0; s < 100; s++) {
+            factry.addPoint(b, START + (1000 + s) * 1000L, s);
+        }
+        for (int s = 100; s < 160; s++) {
+            factry.addPoint(c, START + s * 1000L, s);
+        }
+        factry.failingPastFirstPage.add(a);
+        startEngine();
+        engine.maxRawPoints = 150;
+
+        Recorder rec = query(100, key("a"), key("b"), key("c"));
+
+        assertNull(rec.error, () -> "read failed: " + rec.error);
+        assertEquals(0, rec.count(key("a")));
+        assertEquals(60, rec.count(key("c")));
+        assertEquals(40, rec.count(key("b")));
     }
 
     @Test
