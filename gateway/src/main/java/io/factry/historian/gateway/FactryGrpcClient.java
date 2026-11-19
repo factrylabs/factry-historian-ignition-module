@@ -69,6 +69,7 @@ public class FactryGrpcClient {
     private static final long WRITE_DEADLINE_SECONDS = ModuleProperties.getWriteDeadlineSeconds();
     private static final long WRITE_DEADLINE_MILLIS_PER_POINT = ModuleProperties.getWriteDeadlineMillisPerPoint();
     private static final long WRITE_DEADLINE_MAX_SECONDS = ModuleProperties.getWriteDeadlineMaxSeconds();
+    private static final long WRITE_MIN_BYTES_PER_SECOND = ModuleProperties.getWriteMinBytesPerSecond();
     private static final boolean WRITE_GZIP = ModuleProperties.isWriteGzip();
     private static final long READ_DEADLINE_SECONDS = ModuleProperties.getReadDeadlineSeconds();
     private static final long CALL_DEADLINE_SECONDS = ModuleProperties.getCallDeadlineSeconds();
@@ -149,7 +150,8 @@ public class FactryGrpcClient {
 
     private CreatePointsReply sendPoints(Points points, boolean gzip) {
         HistorianGrpc.HistorianBlockingStub stub = blockingStub
-                .withDeadlineAfter(writeDeadlineMillis(points.getPointsCount()), TimeUnit.MILLISECONDS);
+                .withDeadlineAfter(writeDeadlineMillis(points.getPointsCount(), points.getSerializedSize()),
+                        TimeUnit.MILLISECONDS);
         if (gzip) {
             stub = stub.withCompression("gzip");
         }
@@ -172,11 +174,17 @@ public class FactryGrpcClient {
     /**
      * A fixed deadline that fits one point is too short for a full store and forward batch on a
      * slow link: the same batch would time out on every retry and the backlog would never
-     * shrink. So the deadline grows with the batch (points, or measurements to create), up to a
-     * ceiling.
+     * shrink. So the deadline grows with the batch (points, or measurements to create) and with
+     * its size in bytes, at an assumed minimum link speed (a few big strings are few points but
+     * many bytes), up to a ceiling.
      */
     private static long writeDeadlineMillis(int itemCount) {
-        long millis = WRITE_DEADLINE_SECONDS * 1000 + itemCount * WRITE_DEADLINE_MILLIS_PER_POINT;
+        return writeDeadlineMillis(itemCount, 0);
+    }
+
+    private static long writeDeadlineMillis(int itemCount, long bytes) {
+        long millis = WRITE_DEADLINE_SECONDS * 1000 + itemCount * WRITE_DEADLINE_MILLIS_PER_POINT
+                + bytes * 1000 / WRITE_MIN_BYTES_PER_SECOND;
         return Math.min(millis, WRITE_DEADLINE_MAX_SECONDS * 1000);
     }
 

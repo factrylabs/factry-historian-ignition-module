@@ -65,6 +65,18 @@ class PointWriterTest {
     }
 
     @Test
+    void aMessageSizeOfZeroStillSendsAFlushInOneCall() {
+        factry.add("default/Tank/Temp", "temp-uuid");
+        cache.refresh(factry);
+        writer.maxMessageBytes = 0;
+
+        writer.write(List.of(point("Tank/Temp", 1.0, 1_000L), point("Tank/Temp", 2.0, 2_000L),
+                point("Tank/Temp", 3.0, 3_000L)));
+
+        assertEquals(1, factry.sent.size(), "not one call per point");
+    }
+
+    @Test
     void aFlushWithAPointWhoseMeasurementCouldNotBeCreatedIsRetriedWhole() {
         factry.add("default/Tank/Level", "level-uuid");
         cache.refresh(factry);

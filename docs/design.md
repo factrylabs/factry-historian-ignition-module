@@ -258,8 +258,10 @@ Loads tuning values from `factry-historian.properties` (bundled in the .modl). T
 | Property | Default | Controls |
 |----------|---------|----------|
 | `grpc.write.deadline.seconds` | 3 | Timeout on store lookups; base timeout on `createPoints()` and `createMeasurements()` |
-| `grpc.write.deadline.ms.per.point` | 1 | Added to the `createPoints()` timeout per point, and to the `createMeasurements()` timeout per measurement |
+| `grpc.write.deadline.ms.per.point` | 1 | Added to the `createPoints()` timeout per point (plus time for its size, see `grpc.write.min.bytes.per.second`), and to the `createMeasurements()` timeout per measurement |
 | `grpc.write.deadline.max.seconds` | 30 | Ceiling on the `createPoints()` and `createMeasurements()` timeouts |
+| `grpc.write.max.message.bytes` | 4194304 | Largest `createPoints()` message (at least 64 KiB); a bigger flush goes in several calls |
+| `grpc.write.min.bytes.per.second` | 262144 | Link speed the `createPoints()` timeout allows for: the message's size divided by this is added to it, within the ceiling |
 | `grpc.write.gzip` | true | Send `createPoints()` gzip-compressed. If Factry has no gzip decompressor, the client resends the batch uncompressed and stops using gzip until the historian settings are saved |
 | `grpc.read.deadline.seconds` | 30 | Timeout on history queries, on each page of the measurement cache refresh, and on the asset and asset property fetches |
 | `grpc.call.deadline.seconds` | 10 | Timeout on the small calls: collectors, health, collector state |
@@ -284,7 +286,7 @@ Extends `AbstractStorageEngine`. Receives data points from Ignition's tag system
 3. Looks up (or auto-creates) the measurement UUID via `MeasurementCache`
 4. Converts value to protobuf `Value` (Boolean, Number, String)
 5. Maps Ignition `QualityCode` to status string ("Good", "Uncertain", "Bad")
-6. Sends `CreatePoints` gRPC call
+6. Sends `CreatePoints` gRPC call, in parts of at most `grpc.write.max.message.bytes`. Factry refuses a message over 64 MiB (`RESOURCE_EXHAUSTED`, checked after decompression) every time, so a part it still finds too large is sent in halves; so is a part a proxy refuses with HTTP 413 (grpc-java: `UNKNOWN` "HTTP status code 413"). Half the refused size is then the most per call until the settings are saved, so the next flush is not refused again. A single point too large on its own can never be stored; it is sent as a Bad point without a value, with a WARN naming the tag and time. Factry v8.2.3 also answers OK to string values over about 1 MiB but does not store them.
 7. On failure: distinguishes connection errors (UNAVAILABLE, DEADLINE_EXCEEDED) from server rejections. On rejection, evicts the measurement UUID and retries once (handles deleted measurements)
 
 Steps 2 to 7 live in `PointWriter`, which the engine calls; it uses no Ignition gateway classes, so unit tests can run it against a fake Factry client.

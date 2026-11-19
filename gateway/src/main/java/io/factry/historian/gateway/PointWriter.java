@@ -1,5 +1,6 @@
 package io.factry.historian.gateway;
 
+import com.google.protobuf.CodedOutputStream;
 import com.google.protobuf.Value;
 import com.google.protobuf.util.Timestamps;
 import com.inductiveautomation.historian.common.model.data.AtomicPoint;
@@ -40,6 +41,16 @@ class PointWriter {
     private final MeasurementCache measurementCache;
     private final HistorianMetrics metrics;
     private final RefusalLog refusalLog = new RefusalLog();
+    /** For tests. */
+    long maxMessageBytes = ModuleProperties.getWriteMaxMessageBytes();
+    /** Below this, grpc.write.max.message.bytes would mean a call per point, not a safer write. */
+    static final long MIN_MESSAGE_BYTES = 64 * 1024;
+    /**
+     * Half the size of the last write Factry (or a proxy in front of it) refused as too large,
+     * so the next flush starts with parts that fit instead of being refused again on the way
+     * down. Forgotten with new settings.
+     */
+    private volatile long fittingMessageBytes = Long.MAX_VALUE;
 
     PointWriter(FactryGrpcClient grpcClient, MeasurementCache measurementCache, HistorianMetrics metrics) {
         this.grpcClient = grpcClient;
@@ -60,6 +71,7 @@ class PointWriter {
      * settings (the collector may have changed): they are judged and logged afresh.
      */
     void clearRefusals() {
+        fittingMessageBytes = Long.MAX_VALUE;
         refusalLog.clear();
         measurementCache.clearWriteRefusals();
     }
@@ -123,7 +135,10 @@ class PointWriter {
         try {
             logger.debug("Sending " + built.pointsBuilder.getPointsCount() + " points via createPoints");
             long beforeMs = System.currentTimeMillis();
-            grpcClient.createPoints(built.pointsBuilder.build());
+            long partBytes = Math.min(Math.max(MIN_MESSAGE_BYTES, maxMessageBytes), fittingMessageBytes);
+            for (List<Point> part : parts(built.pointsBuilder.getPointsList(), partBytes)) {
+                sendPart(part);
+            }
             long elapsedMs = System.currentTimeMillis() - beforeMs;
             metrics.recordStore(built.pointsBuilder.getPointsCount(), elapsedMs);
             logger.debug("createPoints succeeded for " + built.pointsBuilder.getPointsCount() + " points");
@@ -169,6 +184,87 @@ class PointWriter {
 
             throw e;
         }
+    }
+
+    /**
+     * Cut {@code points} into consecutive parts whose CreatePoints message stays under
+     * {@code maxBytes}; a point bigger than that on its own is a part by itself. Factry refuses a
+     * message over its GRPC_MAX_MESSAGE_SIZE (64 MiB by default) for good, and one that big
+     * also may not fit in the write deadline on a slow link, which would look like an outage.
+     */
+    static List<List<Point>> parts(List<Point> points, long maxBytes) {
+        List<List<Point>> parts = new ArrayList<>();
+        int start = 0;
+        long size = 0;
+        for (int i = 0; i < points.size(); i++) {
+            long pointSize = CodedOutputStream.computeMessageSize(Points.POINTS_FIELD_NUMBER, points.get(i));
+            if (i > start && size + pointSize > maxBytes) {
+                parts.add(points.subList(start, i));
+                start = i;
+                size = 0;
+            }
+            size += pointSize;
+        }
+        if (start < points.size()) {
+            parts.add(points.subList(start, points.size()));
+        }
+        return parts;
+    }
+
+    /**
+     * Send one part. Should Factry still find it too large (its limit can be set lower than ours),
+     * send it in halves. A single point that is too large can never be stored: it is sent as a
+     * Bad point without a value, like a NaN, so its time shows in the history and the rest of the
+     * flush is not held back.
+     */
+    private void sendPart(List<Point> part) {
+        Points message = Points.newBuilder().addAllPoints(part).build();
+        try {
+            grpcClient.createPoints(message);
+        } catch (StatusRuntimeException e) {
+            if (!isTooLarge(e)) {
+                throw e;
+            }
+            long fitting = message.getSerializedSize() / 2;
+            if (fitting < fittingMessageBytes) {
+                fittingMessageBytes = fitting;
+                logger.info("Factry refused a write of {} bytes as too large ({}); sending at most {} bytes"
+                        + " per call until the settings are saved", message.getSerializedSize(),
+                        e.getStatus().getDescription(), fitting);
+            }
+            if (part.size() > 1) {
+                sendPart(part.subList(0, part.size() / 2));
+                sendPart(part.subList(part.size() / 2, part.size()));
+                return;
+            }
+            Point point = part.get(0);
+            Measurement measurement = measurementCache.getMeasurementByUUID(point.getMeasurementUUID());
+            logger.warn("A value of tag '{}' at {} is {} bytes, more than Factry accepts in one write ({});"
+                            + " storing a Bad point without a value instead",
+                    measurement != null ? measurement.getName() : point.getMeasurementUUID(),
+                    Timestamps.toString(point.getTimestamp()), point.getSerializedSize(),
+                    e.getStatus().getDescription());
+            grpcClient.createPoints(Points.newBuilder()
+                    .addPoints(point.toBuilder().clearValue().setStatus("Bad")).build());
+        }
+    }
+
+    /**
+     * Whether a write was refused for its size: RESOURCE_EXHAUSTED "grpc: received message (after
+     * decompression) larger than max" from grpc-go (Factry), "exceeds maximum size" from
+     * grpc-java, or a proxy's HTTP 413, which grpc-java reports as UNKNOWN "HTTP status code 413"
+     * (nginx refuses bodies over 1 MiB by default). Not any RESOURCE_EXHAUSTED: a proxy may use it
+     * for a quota, and that is worth a retry.
+     */
+    static boolean isTooLarge(StatusRuntimeException e) {
+        String description = e.getStatus().getDescription();
+        if (description == null) {
+            return false;
+        }
+        Status.Code code = e.getStatus().getCode();
+        return code == Status.Code.RESOURCE_EXHAUSTED
+                && (description.contains("larger than max") || description.contains("exceeds maximum"))
+                || code == Status.Code.UNKNOWN && description.startsWith("HTTP status code 413");
     }
 
     private static class BuildResult {

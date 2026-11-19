@@ -44,6 +44,22 @@ public final class ModuleProperties {
         return getLong("grpc.write.deadline.max.seconds", 30);
     }
 
+    /**
+     * Largest CreatePoints message the module sends; bigger flushes go in several calls. Well
+     * under Factry's 64 MiB limit. Values under 64 KiB are taken as 64 KiB.
+     */
+    public static long getWriteMaxMessageBytes() {
+        return getLong("grpc.write.max.message.bytes", 4L * 1024 * 1024);
+    }
+
+    /**
+     * The link speed a write deadline allows for, in bytes per second of the uncompressed
+     * message: a 4 MiB message gets 16 s on top of the base deadline. At least 1.
+     */
+    public static long getWriteMinBytesPerSecond() {
+        return Math.max(1, getLong("grpc.write.min.bytes.per.second", 256 * 1024));
+    }
+
     public static boolean isWriteGzip() {
         return Boolean.parseBoolean(props.getProperty("grpc.write.gzip", "true").trim());
     }
