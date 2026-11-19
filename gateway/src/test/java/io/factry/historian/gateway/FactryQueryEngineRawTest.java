@@ -266,6 +266,32 @@ class FactryQueryEngineRawTest {
     }
 
     @Test
+    void returnSizeBelowTheCapReadsManyPens() {
+        // Only returnSize points over all pens are wanted, so the cap must not count every pen's
+        // first returnSize points.
+        for (int pen = 0; pen < 5; pen++) {
+            String uuid = factry.addMeasurement("default/p" + pen, "number");
+            for (int s = 0; s < 600; s++) {
+                factry.addPoint(uuid, START + (s * 5L + pen) * 1000L, s);
+            }
+        }
+        startEngine();
+        engine.maxRawPoints = 300;
+
+        Recorder rec = query(100, key("p0"), key("p1"), key("p2"), key("p3"), key("p4"));
+
+        assertNull(rec.error, () -> "read failed: " + rec.error);
+        List<Long> times = new ArrayList<>();
+        rec.points.values().forEach(pts -> pts.forEach(p -> times.add(p.timestamp().toEpochMilli())));
+        times.sort(null);
+        assertEquals(100, times.size());
+        for (int i = 0; i < times.size(); i++) {
+            assertEquals(START + i * 1000L, times.get(i));
+        }
+        assertEquals(1, factry.queries.size(), "pens past the first 100 points should stop paging");
+    }
+
+    @Test
     void returnSizeKeepsTheFirstPointsInTime() {
         for (String tag : List.of("a", "b")) {
             String uuid = factry.addMeasurement("default/" + tag, "number");
@@ -279,10 +305,11 @@ class FactryQueryEngineRawTest {
 
         Recorder rec = query(100, key("a"), key("b"));
 
+        // 100 points across both pens, the earliest ones: 50 seconds of each.
         for (String tag : List.of("a", "b")) {
             List<AtomicPoint<?>> pts = rec.points.get(key(tag));
-            assertEquals(100, pts.size(), tag);
-            assertEquals(START + 99_000L, pts.get(99).timestamp().toEpochMilli(), tag);
+            assertEquals(50, pts.size(), tag);
+            assertEquals(START + 49_000L, pts.get(49).timestamp().toEpochMilli(), tag);
         }
         for (QueryTimeseriesRequest q : factry.queries) {
             assertTrue(q.getOffset() + q.getLimit() <= 100, () -> "fetched past returnSize: " + q);

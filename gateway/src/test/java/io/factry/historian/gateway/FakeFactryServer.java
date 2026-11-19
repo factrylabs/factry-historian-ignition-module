@@ -125,6 +125,10 @@ final class FakeFactryServer extends HistorianGrpc.HistorianImplBase implements 
             for (Map.Entry<String, List<Pt>> e : byStatus.entrySet()) {
                 List<Pt> pts = e.getValue();
                 pts.sort(Comparator.comparingLong(Pt::ts));
+                if (request.hasAggregation()) {
+                    pts = aggregate(pts, request.getAggregation().getName(),
+                            periodMillis(request.getAggregation().getPeriod()), e.getKey());
+                }
                 int from = (int) Math.min(pts.size(),
                         request.hasOffset() && !ignoreOffset ? request.getOffset() : 0);
                 int to = request.hasLimit() ? (int) Math.min(pts.size(), from + request.getLimit()) : pts.size();
@@ -152,6 +156,45 @@ final class FakeFactryServer extends HistorianGrpc.HistorianImplBase implements 
         }
         observer.onNext(answer);
         observer.onCompleted();
+    }
+
+    /**
+     * Buckets aligned to the epoch, like InfluxQL's GROUP BY time(), stamped with the bucket start,
+     * empty buckets left out (fill none). Only the functions the tests use.
+     */
+    private static List<Pt> aggregate(List<Pt> pts, String function, long period, String status) {
+        Map<Long, List<Double>> buckets = new TreeMap<>();
+        for (Pt p : pts) {
+            long bucket = Math.floorDiv(p.ts(), period) * period;
+            buckets.computeIfAbsent(bucket, k -> new ArrayList<>()).add(p.value().getNumberValue());
+        }
+        List<Pt> out = new ArrayList<>();
+        for (Map.Entry<Long, List<Double>> b : buckets.entrySet()) {
+            var stats = b.getValue().stream().mapToDouble(Double::doubleValue).summaryStatistics();
+            double v = switch (function) {
+                case "min" -> stats.getMin();
+                case "max" -> stats.getMax();
+                default -> stats.getAverage();
+            };
+            out.add(new Pt(b.getKey(), Value.newBuilder().setNumberValue(v).build(), status));
+        }
+        return out;
+    }
+
+    /** Go duration strings as the module sends them: "1h30m", "10s", "250ms". */
+    static long periodMillis(String period) {
+        var m = java.util.regex.Pattern.compile("(\\d+)(ms|h|m|s)").matcher(period);
+        long total = 0;
+        while (m.find()) {
+            long n = Long.parseLong(m.group(1));
+            total += switch (m.group(2)) {
+                case "h" -> n * 3_600_000L;
+                case "m" -> n * 60_000L;
+                case "s" -> n * 1_000L;
+                default -> n;
+            };
+        }
+        return total;
     }
 
     @Override

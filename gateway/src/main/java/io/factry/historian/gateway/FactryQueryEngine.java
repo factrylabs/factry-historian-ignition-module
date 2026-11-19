@@ -396,9 +396,8 @@ public class FactryQueryEngine extends AbstractQueryEngine {
             Integer returnSize = options.getReturnSize().filter(n -> n > 0).orElse(null);
 
             // A measurement now spans multiple status-series. Collect all of a measurement's points
-            // (each carrying its series' quality), then merge-sort by timestamp before emitting —
-            // Ignition expects time-ordered points per key.
-            record RawPt(long ts, Object value, QualityCode quality) {}
+            // (each carrying its series' quality), then merge-sort by timestamp before emitting.
+            record RawPt(RawQueryKey key, long ts, Object value, QualityCode quality) {}
             Map<String, List<RawPt>> pointsByUuid = new LinkedHashMap<>();
 
             // Read in pages: one answer for a long range does not fit in a gRPC message. Factry
@@ -408,6 +407,8 @@ public class FactryQueryEngine extends AbstractQueryEngine {
             int pageSize = RAW_QUERY_PAGE_SIZE;
             List<String> pending = measurementUUIDs;
             long offset = 0;
+            // Points held: all that were read, or with returnSize only those that can still be
+            // among the first returnSize. The cap is checked against this.
             long collected = 0;
             // Last timestamp read per series (measurement and status), to see that a page moved on.
             Map<String, Long> lastTsBySeries = new HashMap<>();
@@ -462,6 +463,8 @@ public class FactryQueryEngine extends AbstractQueryEngine {
                 }
 
                 Set<String> more = new LinkedHashSet<>();
+                // Per pen with a full series: the earliest point it would read next.
+                Map<String, Long> nextFrom = new HashMap<>();
                 for (Series series : reply.getSeriesList()) {
                     String uuid = series.hasMeasurementUUID() ? series.getMeasurementUUID() : "";
                     if (!uuidToKeyMap.containsKey(uuid)) {
@@ -469,17 +472,37 @@ public class FactryQueryEngine extends AbstractQueryEngine {
                     }
                     if (series.getDataPointsCount() >= limit) {
                         more.add(uuid);
+                        nextFrom.merge(uuid,
+                                series.getDataPoints(series.getDataPointsCount() - 1).getTimestamp(), Math::min);
                     }
                     QualityCode quality = statusToQuality(seriesStatus(series));
+                    RawQueryKey key = uuidToKeyMap.get(uuid);
+                    boolean asDate = isDateTime(keyToNode.get(key));
                     List<RawPt> pts = pointsByUuid.computeIfAbsent(uuid, k -> new ArrayList<>());
                     for (SeriesPoint pt : series.getDataPointsList()) {
-                        pts.add(new RawPt(pt.getTimestamp(), protoValueToJava(pt.getValue()), quality));
+                        Object value = protoValueToJava(pt.getValue());
+                        pts.add(new RawPt(key, pt.getTimestamp(), asDate ? toDate(value) : value, quality));
                     }
                     collected += series.getDataPointsCount();
                     if (series.getDataPointsCount() > 0) {
                         lastTsBySeries.put(uuid + "|" + seriesStatus(series),
                                 series.getDataPoints(series.getDataPointsCount() - 1).getTimestamp());
                     }
+                }
+                // With returnSize, only the first returnSize points over all pens are returned, so
+                // drop the rest now and stop paging pens whose next points all come after them.
+                // Otherwise every pen would hold up to returnSize points and many pens would hit
+                // the cap although few points are wanted.
+                if (returnSize != null && collected > returnSize) {
+                    long[] times = pointsByUuid.values().stream().flatMap(List::stream)
+                            .mapToLong(RawPt::ts).sorted().toArray();
+                    long last = times[returnSize - 1];
+                    collected = 0;
+                    for (List<RawPt> pts : pointsByUuid.values()) {
+                        pts.removeIf(p -> p.ts() > last);
+                        collected += pts.size();
+                    }
+                    more.removeIf(uuid -> nextFrom.get(uuid) > last);
                 }
                 // Returning only part of the range would be worse than failing: Ignition repeats a
                 // pen's last value, with Good quality, into every row after its data stops, so a
@@ -494,29 +517,33 @@ public class FactryQueryEngine extends AbstractQueryEngine {
                 offset += limit;
             }
 
+            // Ignition's raw reader builds wide rows from one stream: each point closes the rows up
+            // to its timestamp, so every pen must be handed over in one time order. Pen by pen,
+            // the second pen's points go back in time and the dataset gets rows out of order, with
+            // the first pen's last value carried into them.
+            List<RawPt> merged = new ArrayList<>((int) collected);
+            // Each point carries its key, so merging adds no wrapper object per point, and each pen's
+            // list is dropped once copied. A large read is held about once in the module.
+            for (var it = pointsByUuid.values().iterator(); it.hasNext(); ) {
+                merged.addAll(it.next());
+                it.remove();
+            }
+            merged.sort(Comparator.comparingLong(RawPt::ts));
+            // Like Ignition's own historians, returnSize counts points across all pens.
+            if (returnSize != null && merged.size() > returnSize) {
+                merged = merged.subList(0, returnSize);
+            }
+
             int totalPoints = 0;
-            for (Map.Entry<String, List<RawPt>> entry : pointsByUuid.entrySet()) {
-                RawQueryKey key = uuidToKeyMap.get(entry.getKey());
-                QualifiedPath path = key.source();
-                boolean asDate = isDateTime(keyToNode.get(key));
-                List<RawPt> pts = entry.getValue();
-                pts.sort(Comparator.comparingLong(RawPt::ts));
-                // Each status series was capped on its own, so a short Bad series can reach far
-                // past where the Good one stopped. Keep only the first returnSize points in time.
-                if (returnSize != null && pts.size() > returnSize) {
-                    pts = pts.subList(0, returnSize);
-                }
+            for (RawPt p : merged) {
+                AtomicPoint<?> atomicPoint = DataPointFactory.createAtomicPoint(
+                        p.value(), p.quality(), Instant.ofEpochMilli(p.ts()), p.key().source());
 
-                for (RawPt p : pts) {
-                    AtomicPoint<?> atomicPoint = DataPointFactory.createAtomicPoint(
-                            asDate ? toDate(p.value()) : p.value(), p.quality(), Instant.ofEpochMilli(p.ts()), path);
-
-                    if (!processor.onPointAvailable(key, atomicPoint)) {
-                        processor.onComplete();
-                        return Optional.of(totalPoints);
-                    }
-                    totalPoints++;
+                if (!processor.onPointAvailable(p.key(), atomicPoint)) {
+                    processor.onComplete();
+                    return Optional.of(totalPoints);
                 }
+                totalPoints++;
             }
 
             processor.onComplete();
