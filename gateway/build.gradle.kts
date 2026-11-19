@@ -57,6 +57,10 @@ dependencies {
     testImplementation("com.inductiveautomation.historian:historian-common:1.3.3") {
         isTransitive = false
     }
+    // Ignition's own wide-format writer, so tests read results the way a trend does.
+    testImplementation("com.inductiveautomation.historian:historian-gateway:1.3.3") {
+        isTransitive = false
+    }
     testImplementation("com.google.protobuf:protobuf-java:$protobufVersion")
     testRuntimeOnly("org.slf4j:slf4j-simple:2.0.12")
 }

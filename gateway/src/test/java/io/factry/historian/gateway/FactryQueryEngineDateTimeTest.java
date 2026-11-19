@@ -84,7 +84,10 @@ class FactryQueryEngineDateTimeTest {
             observer.onCompleted();
         }
 
-        /** Raw: three samples one second apart. Aggregated: one bucket, the mean of those samples. */
+        /**
+         * Raw: three samples one second apart. Aggregated: one bucket, the mean of those samples,
+         * stamped at the query start like Factry's buckets.
+         */
         @Override
         public void queryTimeseries(QueryTimeseriesRequest request, StreamObserver<QueryTimeseriesResponse> observer) {
             Series.Builder series = Series.newBuilder()
@@ -92,7 +95,8 @@ class FactryQueryEngineDateTimeTest {
                     .setTags(Struct.newBuilder().putFields("status", Value.newBuilder().setStringValue("Good").build()));
             if (request.hasAggregation()) {
                 double value = request.getAggregation().getName().equals("count") ? 3 : T0 + 1_000;
-                series.addDataPoints(SeriesPoint.newBuilder().setTimestamp(T0)
+                series.addDataPoints(SeriesPoint.newBuilder()
+                        .setTimestamp(com.google.protobuf.util.Timestamps.toMillis(request.getStart()))
                         .setValue(Value.newBuilder().setNumberValue(value)));
             } else {
                 for (int i = 0; i < 3; i++) {

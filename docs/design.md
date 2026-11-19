@@ -309,7 +309,8 @@ Extends `AbstractQueryEngine`. Handles all data retrieval from Factry.
 
 | Ignition | Factry |
 |----------|--------|
-| Average, SimpleAverage | `mean` |
+| Average | `twa` with fill `previous`, over Good time only (see below) |
+| SimpleAverage | `mean` |
 | Minimum | `min` |
 | Maximum | `max` |
 | Sum | `sum` |
@@ -321,7 +322,18 @@ Extends `AbstractQueryEngine`. Handles all data retrieval from Factry.
 | MinMax | queries `min` and `max` separately, emits pairs |
 
 - Count of a tag that is not numeric (String, DateTime) gets a number column: Ignition types a Count column after the tag, so it would otherwise return the text `"600"` or a Date in 1970
-- Time window → Go duration conversion (e.g., `TimeWindow(2h30m)` → `"2h30m0s"`)
+- Time window → Go duration conversion (e.g., `TimeWindow(2h30m)` → `"2h30m"`, 600 ms → `"600ms"`). The bucket length in milliseconds and the period string come from the same number.
+
+**Average (time-weighted, `GoodTimeAverage`)**:
+- Factry's `twa` is only right with fill `previous`: it then holds each value until the next sample, also from before the range. Its buckets start at the query start.
+- `twa` refuses group by, so Bad and Uncertain time is masked in the module. A `last` aggregate grouped by status and the last sample before the range tell per bucket: Good throughout → Factry's `twa`; not Good throughout → a Bad point without a value (null); status changes inside → the bucket's raw samples are averaged over Good time.
+- Raw reads have a budget per pen: 50,000 samples per request, 200,000 and 10 requests per pen, spent from the range end backwards so the most recent buckets are exact. Neighbouring buckets share a request. A `count` aggregate (only when some bucket needs raw samples) sizes the requests. When the status at a bucket start is unknown (the bucket before held several statuses and was not read), the last sample before it is read: always at the start of a raw request, and up to 10 times per pen for buckets outside one.
+- A bucket beyond the budget gets `twa` over the samples with status exactly `Good`, returned as Good (the Power Chart drops values that are not Good). It leaves Bad values out but holds the last Good value through Bad time and misses Good sub-statuses.
+- Requests per pen: 3 for a healthy tag (`twa`, `last`, sample before); at most 35 (plus `count`, up to 10 raw, 20 one-sample reads, 1 fallback). Raw samples: at most 200,000.
+- The range stops at now: the current bucket is weighted up to now, and buckets after now are Bad.
+- Every bucket gets a point. Ignition fills a bucket without a point with a neighbouring value marked Good (checked through its own query path, and live on 8.3.6), so an outage, the time before the first sample and the time after now would read as a held Good value. They are Bad points instead, which the Power Chart draws as gaps and `queryTagHistory` returns with Bad quality (a null reads as 0.0 in a Float column). Not NaN: the Power Chart streams history as strict JSON, which fails at a NaN.
+- Booleans: Factry's `twa` refuses them, so they are averaged from raw samples as the fraction of Good time true (true = 1). A `mean` per status replaces `twa`: a Good mean of exactly 0 or 1 means the bucket holds one value, so it needs no raw read when that is the value held. Beyond the budget: that `mean`, no extra request, returned as Uncertain because a sample mean can be far off for a Boolean stored on change (0.5 instead of 0.017 for a bit on 1 minute of the hour). The Power Chart draws Uncertain values as gaps; with neighbouring buckets sharing a request and on-change storage this should be rare. At most 34 requests. Factry 8.2.3 accepts `last`, `count`, `mean`, `min` and `max` on a Boolean. Strings keep `mean`.
+- Difference with Ignition's internal historian: the module leaves all Bad and Uncertain time out (the owner's choice) and holds the previous value until the next sample (steps). Ignition's own time-weighted average uses trapezoids between values and bridges Bad time inside a block, leaving out only Bad time at the block's start and end. So the numbers differ on ramps and across short Bad stretches.
 
 **`doBrowse(browseContext, publisher)`**:
 - Root level: publishes two category folders — "Measurements" and "Assets"
