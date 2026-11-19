@@ -48,7 +48,9 @@ import java.security.cert.CertificateFactory;
 import java.security.cert.X509Certificate;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
@@ -60,6 +62,12 @@ public class FactryGrpcClient {
             Metadata.Key.of("authorization", Metadata.ASCII_STRING_MARSHALLER);
 
     private static final long WRITE_DEADLINE_SECONDS = ModuleProperties.getWriteDeadlineSeconds();
+    private static final long WRITE_DEADLINE_MILLIS_PER_POINT = ModuleProperties.getWriteDeadlineMillisPerPoint();
+    private static final long WRITE_DEADLINE_MAX_SECONDS = ModuleProperties.getWriteDeadlineMaxSeconds();
+    private static final boolean WRITE_GZIP = ModuleProperties.isWriteGzip();
+    private static final long READ_DEADLINE_SECONDS = ModuleProperties.getReadDeadlineSeconds();
+    private static final long CALL_DEADLINE_SECONDS = ModuleProperties.getCallDeadlineSeconds();
+    private static final long SHUTDOWN_GRACE_SECONDS = ModuleProperties.getShutdownGraceSeconds();
     private static final String CA_CERT_RESOURCE = "factry-historian-ca.crt";
 
     /**
@@ -71,6 +79,8 @@ public class FactryGrpcClient {
     private volatile ManagedChannel channel;
     private volatile HistorianGrpc.HistorianBlockingStub blockingStub;
     private volatile boolean connected = true;
+    private final AtomicBoolean writeGzip = new AtomicBoolean(WRITE_GZIP);
+    private volatile String collectorUUID;
 
     public FactryGrpcClient(String host, int port, String collectorUUID, String token,
                             boolean useTls, boolean skipTlsVerification, String customCaCert) {
@@ -83,9 +93,21 @@ public class FactryGrpcClient {
         logger.debug("Sending CreatePoints with {} points", points.getPointsCount());
         channelLock.readLock().lock();
         try {
-            CreatePointsReply reply = blockingStub
-                    .withDeadlineAfter(WRITE_DEADLINE_SECONDS, TimeUnit.SECONDS)
-                    .createPoints(points);
+            CreatePointsReply reply;
+            boolean gzip = writeGzip.get();
+            try {
+                reply = sendPoints(points, gzip);
+            } catch (StatusRuntimeException e) {
+                if (!gzip || !isGzipRejected(e)) {
+                    throw e;
+                }
+                // Without this the batch would fail the same way on every attempt.
+                if (writeGzip.compareAndSet(true, false)) {
+                    logger.warn("Factry does not accept gzip-compressed writes ({}), sending them uncompressed from now on",
+                            e.getStatus().getDescription());
+                }
+                reply = sendPoints(points, false);
+            }
             connected = true;
             return reply;
         } catch (StatusRuntimeException e) {
@@ -99,11 +121,46 @@ public class FactryGrpcClient {
         }
     }
 
+    private CreatePointsReply sendPoints(Points points, boolean gzip) {
+        HistorianGrpc.HistorianBlockingStub stub = blockingStub
+                .withDeadlineAfter(writeDeadlineMillis(points.getPointsCount()), TimeUnit.MILLISECONDS);
+        if (gzip) {
+            stub = stub.withCompression("gzip");
+        }
+        return stub.createPoints(points);
+    }
+
+    /**
+     * A server without a gzip decompressor answers UNIMPLEMENTED: grpc-go with "grpc:
+     * Decompressor is not installed for grpc-encoding \"gzip\"", grpc-java with "Can't find
+     * decompressor for gzip". An RPC the server does not know is also UNIMPLEMENTED ("unknown
+     * method", "Method not found"), so the message tells the two apart.
+     */
+    static boolean isGzipRejected(StatusRuntimeException e) {
+        String description = e.getStatus().getDescription();
+        return e.getStatus().getCode() == Status.Code.UNIMPLEMENTED
+                && description != null
+                && description.toLowerCase(Locale.ROOT).contains("decompressor");
+    }
+
+    /**
+     * A fixed deadline that fits one point is too short for a full store and forward batch on a
+     * slow link: the same batch would time out on every retry and the backlog would never
+     * shrink. So the deadline grows with the batch (points, or measurements to create), up to a
+     * ceiling.
+     */
+    private static long writeDeadlineMillis(int itemCount) {
+        long millis = WRITE_DEADLINE_SECONDS * 1000 + itemCount * WRITE_DEADLINE_MILLIS_PER_POINT;
+        return Math.min(millis, WRITE_DEADLINE_MAX_SECONDS * 1000);
+    }
+
     public Measurements getMeasurements(MeasurementRequest request) {
         logger.debug("Sending GetMeasurements");
         channelLock.readLock().lock();
         try {
-            return blockingStub.getMeasurements(request);
+            return blockingStub
+                    .withDeadlineAfter(CALL_DEADLINE_SECONDS, TimeUnit.SECONDS)
+                    .getMeasurements(request);
         } finally {
             channelLock.readLock().unlock();
         }
@@ -117,7 +174,35 @@ public class FactryGrpcClient {
         logger.debug("Sending GetMeasurementsByFilter");
         channelLock.readLock().lock();
         try {
-            return blockingStub.getMeasurementsByFilter(request);
+            return blockingStub
+                    .withDeadlineAfter(READ_DEADLINE_SECONDS, TimeUnit.SECONDS)
+                    .getMeasurementsByFilter(request);
+        } finally {
+            channelLock.readLock().unlock();
+        }
+    }
+
+    /**
+     * Same call as {@link #getMeasurementsByFilter}, bounded by the write deadline. For the small
+     * single-name lookups on the store-and-forward path, so a Factry that accepts the connection
+     * but never answers cannot block the write. Not for the full cache refresh, which pages
+     * through every measurement and can take longer.
+     */
+    public Measurements getMeasurementsByFilterWithDeadline(GetMeasurementsByFilterRequest request) {
+        logger.debug("Sending GetMeasurementsByFilter with deadline");
+        channelLock.readLock().lock();
+        try {
+            Measurements reply = blockingStub
+                    .withDeadlineAfter(WRITE_DEADLINE_SECONDS, TimeUnit.SECONDS)
+                    .getMeasurementsByFilter(request);
+            connected = true;
+            return reply;
+        } catch (StatusRuntimeException e) {
+            Status.Code code = e.getStatus().getCode();
+            if (code == Status.Code.UNAVAILABLE || code == Status.Code.DEADLINE_EXCEEDED) {
+                connected = false;
+            }
+            throw e;
         } finally {
             channelLock.readLock().unlock();
         }
@@ -127,7 +212,9 @@ public class FactryGrpcClient {
         logger.debug("Sending QueryTimeseries for {} measurements", request.getMeasurementUUIDsCount());
         channelLock.readLock().lock();
         try {
-            return blockingStub.queryTimeseries(request);
+            return blockingStub
+                    .withDeadlineAfter(READ_DEADLINE_SECONDS, TimeUnit.SECONDS)
+                    .queryTimeseries(request);
         } finally {
             channelLock.readLock().unlock();
         }
@@ -137,7 +224,9 @@ public class FactryGrpcClient {
         logger.debug("Sending GetAssets");
         channelLock.readLock().lock();
         try {
-            return blockingStub.getAssets(GetAssetsRequest.newBuilder().build());
+            return blockingStub
+                    .withDeadlineAfter(READ_DEADLINE_SECONDS, TimeUnit.SECONDS)
+                    .getAssets(GetAssetsRequest.newBuilder().build());
         } finally {
             channelLock.readLock().unlock();
         }
@@ -147,7 +236,9 @@ public class FactryGrpcClient {
         logger.debug("Sending GetAssetProperties for {} assets", request.getAssetUUIDsCount());
         channelLock.readLock().lock();
         try {
-            return blockingStub.getAssetProperties(request);
+            return blockingStub
+                    .withDeadlineAfter(READ_DEADLINE_SECONDS, TimeUnit.SECONDS)
+                    .getAssetProperties(request);
         } finally {
             channelLock.readLock().unlock();
         }
@@ -157,7 +248,9 @@ public class FactryGrpcClient {
         logger.debug("Sending GetCollectors");
         channelLock.readLock().lock();
         try {
-            return blockingStub.getCollectors(GetCollectorsRequest.newBuilder().build());
+            return blockingStub
+                    .withDeadlineAfter(CALL_DEADLINE_SECONDS, TimeUnit.SECONDS)
+                    .getCollectors(GetCollectorsRequest.newBuilder().build());
         } finally {
             channelLock.readLock().unlock();
         }
@@ -167,7 +260,9 @@ public class FactryGrpcClient {
         logger.debug("Sending RegisterCollector");
         channelLock.readLock().lock();
         try {
-            return blockingStub.registerCollector(schema);
+            return blockingStub
+                    .withDeadlineAfter(CALL_DEADLINE_SECONDS, TimeUnit.SECONDS)
+                    .registerCollector(schema);
         } finally {
             channelLock.readLock().unlock();
         }
@@ -177,7 +272,9 @@ public class FactryGrpcClient {
         logger.debug("Sending UpdateHealth");
         channelLock.readLock().lock();
         try {
-            return blockingStub.updateHealth(updates);
+            return blockingStub
+                    .withDeadlineAfter(CALL_DEADLINE_SECONDS, TimeUnit.SECONDS)
+                    .updateHealth(updates);
         } finally {
             channelLock.readLock().unlock();
         }
@@ -187,7 +284,9 @@ public class FactryGrpcClient {
         logger.debug("Sending UpdateCollectorState");
         channelLock.readLock().lock();
         try {
-            blockingStub.updateCollectorState(state);
+            blockingStub
+                    .withDeadlineAfter(CALL_DEADLINE_SECONDS, TimeUnit.SECONDS)
+                    .updateCollectorState(state);
         } finally {
             channelLock.readLock().unlock();
         }
@@ -197,8 +296,11 @@ public class FactryGrpcClient {
         logger.debug("Sending CreateMeasurements with {} measurements", request.getMeasurementsCount());
         channelLock.readLock().lock();
         try {
+            // A create that times out may still be carried out by Factry, and creating the same
+            // names again adds Discovered duplicates. So it gets as long as a write of as many
+            // points, which lets thousands of new tags in one flush through on a slow link.
             CreateMeasurementsReply reply = blockingStub
-                    .withDeadlineAfter(WRITE_DEADLINE_SECONDS, TimeUnit.SECONDS)
+                    .withDeadlineAfter(writeDeadlineMillis(request.getMeasurementsCount()), TimeUnit.MILLISECONDS)
                     .createMeasurements(request);
             connected = true;
             return reply;
@@ -220,10 +322,13 @@ public class FactryGrpcClient {
     public void reconfigure(String host, int port, String collectorUUID, String token,
                             boolean useTls, boolean skipTlsVerification, String customCaCert) {
         logger.info("Reconfiguring gRPC client: {}:{}", host, port);
-        channelLock.writeLock().lock();
+        lockChannel();
         try {
             shutdownChannel();
             buildChannel(host, port, collectorUUID, token, useTls, skipTlsVerification, customCaCert);
+            // New settings may point at another Factry, or the same one after an upgrade, so
+            // gzip is tried again instead of staying off for the life of the client.
+            writeGzip.set(WRITE_GZIP);
             logger.info("gRPC client reconfigured ({}), target={}:{}, collectorUUID={}",
                     tlsLabel(useTls, skipTlsVerification), host, port, collectorUUID);
         } finally {
@@ -231,6 +336,10 @@ public class FactryGrpcClient {
         }
     }
 
+    // No gRPC keepalive pings. Factry's server keeps the grpc-go defaults: a ping while no call is
+    // running counts as abuse, and after three it closes the connection with "too_many_pings"
+    // (seen on v8.2.3 with pings every 30 s and every 5 minutes). Deadlines on every call and
+    // enterIdle() in testConnection() deal with connections the network dropped.
     private void buildChannel(String host, int port, String collectorUUID, String token,
                               boolean useTls, boolean skipTlsVerification, String customCaCert) {
         if (useTls) {
@@ -268,6 +377,7 @@ public class FactryGrpcClient {
                     .build();
         }
 
+        this.collectorUUID = collectorUUID;
         Metadata headers = new Metadata();
         headers.put(COLLECTOR_UUID_KEY, collectorUUID);
         headers.put(AUTHORIZATION_KEY, "Bearer " + token);
@@ -369,12 +479,31 @@ public class FactryGrpcClient {
     }
 
     public void shutdown() {
-        channelLock.writeLock().lock();
+        lockChannel();
         try {
             shutdownChannel();
         } finally {
             channelLock.writeLock().unlock();
         }
+    }
+
+    /**
+     * Takes the write lock. Running calls hold the read lock, so this waits for them, but only for
+     * the grace period: then it cancels them, so a Factry that never answers cannot hold up a
+     * settings save or gateway shutdown until the calls time out. A cancelled call fails with
+     * UNAVAILABLE, which store and forward retries.
+     */
+    private void lockChannel() {
+        try {
+            if (channelLock.writeLock().tryLock(SHUTDOWN_GRACE_SECONDS, TimeUnit.SECONDS)) {
+                return;
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        logger.warn("gRPC calls still running after {} s, cancelling them", SHUTDOWN_GRACE_SECONDS);
+        channel.shutdownNow();
+        channelLock.writeLock().lock();
     }
 
     /** Shuts down the channel. Caller must hold the write lock. */
@@ -394,6 +523,20 @@ public class FactryGrpcClient {
 
     public boolean isShutdown() {
         return channel.isShutdown();
+    }
+
+    /** The collector this client writes as: Factry only stores points for this collector's measurements. */
+    public String getCollectorUUID() {
+        return collectorUUID;
+    }
+
+    /** Whether {@code e} says Factry could not be reached in time: UNAVAILABLE or DEADLINE_EXCEEDED. */
+    static boolean isConnectionError(Throwable e) {
+        if (!(e instanceof StatusRuntimeException)) {
+            return false;
+        }
+        Status.Code code = ((StatusRuntimeException) e).getStatus().getCode();
+        return code == Status.Code.UNAVAILABLE || code == Status.Code.DEADLINE_EXCEEDED;
     }
 
     public boolean isConnected() {
@@ -419,6 +562,13 @@ public class FactryGrpcClient {
         } catch (Exception e) {
             connected = false;
             logger.debug("Connection test failed: {}", e.getMessage());
+            if (e instanceof StatusRuntimeException sre
+                    && sre.getStatus().getCode() == Status.Code.DEADLINE_EXCEEDED) {
+                // A connection the network dropped without closing it (firewall or NAT timeout)
+                // still looks ready, and every call on it times out until TCP gives up, about
+                // 16 minutes on Linux. Drop it, so the next call opens a new connection.
+                channel.enterIdle();
+            }
             return false;
         } finally {
             channelLock.readLock().unlock();
