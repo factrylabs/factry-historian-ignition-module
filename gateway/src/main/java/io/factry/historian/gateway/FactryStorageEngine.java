@@ -58,10 +58,13 @@ public class FactryStorageEngine extends AbstractStorageEngine {
             Status.Code code = e.getStatus().getCode();
             if (code == Status.Code.UNAVAILABLE || code == Status.Code.DEADLINE_EXCEEDED) {
                 logger.warn("Connection error storing points, S&F will retry: " + e.getMessage());
-                return StorageResult.exception(e, points);
+            } else {
+                logger.error("Factry refused " + points.size() + " points (" + code + "), S&F keeps them"
+                        + " and retries: " + e.getMessage());
             }
-            logger.error("Server rejected points (" + code + "): " + e.getMessage());
-            return StorageResult.failure(points);
+            // Always attach the error. TagHistoryDataSinkBridge only keeps a batch in S&F when the
+            // result carries one; a failure without an error counts as handled and the points are lost.
+            return StorageResult.exception(e, points);
         } catch (Exception e) {
             metrics.recordStoreError();
             logger.error("Unexpected error storing points via gRPC", e);
