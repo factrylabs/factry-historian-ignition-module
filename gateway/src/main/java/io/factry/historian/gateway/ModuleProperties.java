@@ -72,6 +72,10 @@ public final class ModuleProperties {
         return (int) getLong("measurement.cache.page.size", 5000);
     }
 
+    public static long getRawQueryMaxPoints() {
+        return getLong("query.raw.max.points", 500_000);
+    }
+
     private static long getLong(String key, long defaultValue) {
         String val = props.getProperty(key);
         if (val != null) {

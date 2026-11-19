@@ -263,6 +263,7 @@ Loads tuning values from `factry-historian.properties` (bundled in the .modl). T
 | `grpc.shutdown.grace.seconds` | 3 | How long a settings save or shutdown waits for running calls before it cancels them |
 | `status.cache.ms` | 30000 | How often the connection check runs; it pauses S&F while Factry is unreachable and resumes it when it is back |
 | `measurement.cache.refresh.seconds` | 30 | How often to reload measurements from Factry |
+| `query.raw.max.points` | 500000 | Most raw points one query reads over all its pens; a range that holds more fails the read with an error. About 200 bytes of heap per point while the query runs, so about 100 MB per query |
 
 ---
 
@@ -300,8 +301,9 @@ Extends `AbstractQueryEngine`. Handles all data retrieval from Factry.
 **`doQueryRaw(options, processor)`**:
 1. Maps each `RawQueryKey` to stored tag path → measurement UUID (via `lookupUUID`)
 2. `lookupUUID` checks cache, then refreshes from Factry on miss
-3. Builds `QueryTimeseriesRequest` with measurement UUIDs and time range
-4. Iterates response `Series` → `SeriesPoint`, converts protobuf values to Java, creates `AtomicPoint` objects, feeds them to the `RawPointProcessor`
+3. Builds `QueryTimeseriesRequest` with measurement UUIDs and time range, grouped by status
+4. Reads in pages of `limit`/`offset` (Factry applies both per series), halving the page when an answer is too large, and keeps only the first `returnSize` points per pen when Ignition sets one. Fails the read when the range holds more than `query.raw.max.points` points over all pens, or when a page starts before the previous one ended, as a Factry that ignores `offset` would answer. Part of a range is never returned: Ignition repeats a pen's last value with Good quality into every row after its data stops, so a pen cut short looks like a flat line. Ignition's own `HistoryWriter` fails the same way at its row limit
+5. Iterates response `Series` → `SeriesPoint`, converts protobuf values to Java, creates `AtomicPoint` objects, feeds them to the `RawPointProcessor`
 
 **`doQueryAggregated(options, processor)`**:
 - Same pattern but adds aggregation function and interval to the request
@@ -500,7 +502,7 @@ FactryStorageEngine.doStoreAtomic(points)
 
 **Metadata only seeds new measurements:** `FactryStorageEngine.doStoreMetadata()` caches the tag metadata, and it is applied only when the module creates a measurement (data type, description, engineering units and limits, `ignitionDataType` setting). Later changes to a tag's metadata in Ignition are not pushed to an existing measurement; edit those on the Factry platform.
 
-**Pagination:** The design document lists pagination as a provider requirement. In practice, there is no paginated use case — charts receive the full dataset and Jython scripts get a complete `DataSet` object. The gRPC proto does define `limit`/`offset` fields on `QueryTimeseriesRequest`, so pagination can be added if Factry ever imposes response size limits.
+**Pagination:** Raw reads page through `QueryTimeseries` with `limit`/`offset`. One answer for a day of 1-second data on a few pens is over grpc-java's default 4 MiB message limit, so the client also accepts answers up to 64 MiB, which is Factry's own send limit (`GRPC_MAX_MESSAGE_SIZE`). Charts and scripts still receive the full dataset, up to `query.raw.max.points` points per query; a query over it fails with an error that names the setting.
 
 **Browse filters and optional query parameters:** The design document's appendix lists optional parameters for `browse`, `queryRawPoints`, and `queryAggregatedPoints` (e.g. `returnSize`, `includeBounds`, `fillModes`, `nameFilters`). These are part of the Ignition scripting API — the framework parses them and passes relevant options to the query engine. Our implementation handles the core parameters (time range, aggregation type, time window). The optional parameters are either handled by the Ignition framework itself or are not relevant for the Factry backend.
 

@@ -71,6 +71,13 @@ public class FactryGrpcClient {
     private static final String CA_CERT_RESOURCE = "factry-historian-ca.crt";
 
     /**
+     * Largest answer the client accepts. grpc-java defaults to 4 MiB, which a day of 1-second data
+     * for a few pens already passes. Factry Historian sends up to its GRPC_MAX_MESSAGE_SIZE, 64 MiB
+     * by default, so accept the same.
+     */
+    static final int MAX_INBOUND_MESSAGE_BYTES = 64 * 1024 * 1024;
+
+    /**
      * Guards channel/stub access during reconfiguration.
      * gRPC calls take the read lock (concurrent), reconfigure takes the write lock (exclusive).
      */
@@ -367,6 +374,7 @@ public class FactryGrpcClient {
                 }
                 this.channel = NettyChannelBuilder.forAddress(host, port)
                         .sslContext(sslBuilder.build())
+                        .maxInboundMessageSize(MAX_INBOUND_MESSAGE_BYTES)
                         .build();
             } catch (SSLException e) {
                 throw new RuntimeException("Failed to create TLS-enabled gRPC channel", e);
@@ -374,6 +382,7 @@ public class FactryGrpcClient {
         } else {
             this.channel = NettyChannelBuilder.forAddress(host, port)
                     .usePlaintext()
+                    .maxInboundMessageSize(MAX_INBOUND_MESSAGE_BYTES)
                     .build();
         }
 

@@ -50,8 +50,8 @@ class FactryGrpcClientConnectionTest {
 
     @BeforeEach
     void startServer() throws Exception {
-        server = NettyServerBuilder.forPort(0).addService(new SlowMeasurementsHistorian()).build().start();
-        client = new FactryGrpcClient("localhost", server.getPort(), "collector-uuid", "token",
+        server = NettyServerBuilder.forAddress(new java.net.InetSocketAddress(java.net.InetAddress.getLoopbackAddress(), 0)).addService(new SlowMeasurementsHistorian()).build().start();
+        client = new FactryGrpcClient(java.net.InetAddress.getLoopbackAddress().getHostAddress(), server.getPort(), "collector-uuid", "token",
                 false, false, null);
     }
 

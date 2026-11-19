@@ -137,8 +137,8 @@ class FactryQueryEngineDateTimeTest {
 
     @BeforeEach
     void start() throws Exception {
-        server = NettyServerBuilder.forPort(0).addService(new FakeFactry()).build().start();
-        client = new FactryGrpcClient("localhost", server.getPort(), "collector-uuid", "token", false, false, null);
+        server = NettyServerBuilder.forAddress(new java.net.InetSocketAddress(java.net.InetAddress.getLoopbackAddress(), 0)).addService(new FakeFactry()).build().start();
+        client = new FactryGrpcClient(java.net.InetAddress.getLoopbackAddress().getHostAddress(), server.getPort(), "collector-uuid", "token", false, false, null);
         MetricRegistry registry = new MetricRegistry();
         GatewayContext context = (GatewayContext) Proxy.newProxyInstance(
                 GatewayContext.class.getClassLoader(), new Class<?>[]{GatewayContext.class},

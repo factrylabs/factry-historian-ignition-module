@@ -149,8 +149,8 @@ class GrpcTimeLimitsTest {
 
     @BeforeEach
     void startServer() throws Exception {
-        server = NettyServerBuilder.forPort(0).addService(factry).build().start();
-        client = new FactryGrpcClient("localhost", server.getPort(), "collector-uuid", "token",
+        server = NettyServerBuilder.forAddress(new java.net.InetSocketAddress(java.net.InetAddress.getLoopbackAddress(), 0)).addService(factry).build().start();
+        client = new FactryGrpcClient(java.net.InetAddress.getLoopbackAddress().getHostAddress(), server.getPort(), "collector-uuid", "token",
                 false, false, null);
     }
 
@@ -303,7 +303,7 @@ class GrpcTimeLimitsTest {
     @Test
     void failedConnectionTestDropsADeadConnection() throws Exception {
         try (SilentDropProxy proxy = new SilentDropProxy(server.getPort())) {
-            FactryGrpcClient viaProxy = new FactryGrpcClient("localhost", proxy.port(), "collector-uuid",
+            FactryGrpcClient viaProxy = new FactryGrpcClient(java.net.InetAddress.getLoopbackAddress().getHostAddress(), proxy.port(), "collector-uuid",
                     "token", false, false, null);
             try {
                 assertTrue(viaProxy.testConnection());
@@ -325,7 +325,7 @@ class GrpcTimeLimitsTest {
      * like a connection a firewall or NAT forgot. New connections still go through.
      */
     private static class SilentDropProxy implements AutoCloseable {
-        private final ServerSocket listener = new ServerSocket(0);
+        private final ServerSocket listener = new ServerSocket(0, 50, java.net.InetAddress.getLoopbackAddress());
         private final List<AtomicBoolean> links = new CopyOnWriteArrayList<>();
         private final List<Socket> sockets = new CopyOnWriteArrayList<>();
 
@@ -334,7 +334,7 @@ class GrpcTimeLimitsTest {
                 try {
                     while (true) {
                         Socket in = listener.accept();
-                        Socket out = new Socket("localhost", targetPort);
+                        Socket out = new Socket(java.net.InetAddress.getLoopbackAddress().getHostAddress(), targetPort);
                         sockets.add(in);
                         sockets.add(out);
                         AtomicBoolean dropped = new AtomicBoolean();

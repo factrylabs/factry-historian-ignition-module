@@ -116,10 +116,10 @@ class SlowLinkTest {
 
     @BeforeEach
     void startServer() throws Exception {
-        server = NettyServerBuilder.forPort(0)
+        server = NettyServerBuilder.forAddress(new java.net.InetSocketAddress(java.net.InetAddress.getLoopbackAddress(), 0))
                 .addService(ServerInterceptors.intercept(new SlowFactry(), new EncodingRecorder()))
                 .build().start();
-        client = new FactryGrpcClient("localhost", server.getPort(), "collector-uuid", "token",
+        client = new FactryGrpcClient(java.net.InetAddress.getLoopbackAddress().getHostAddress(), server.getPort(), "collector-uuid", "token",
                 false, false, null);
     }
 
@@ -174,11 +174,11 @@ class SlowLinkTest {
     void writesFallBackToUncompressedWhenFactryRejectsGzip() throws Exception {
         // A Factry without the gzip decompressor answers UNIMPLEMENTED. An empty registry gives
         // this server the same gap.
-        Server noGzipServer = NettyServerBuilder.forPort(0)
+        Server noGzipServer = NettyServerBuilder.forAddress(new java.net.InetSocketAddress(java.net.InetAddress.getLoopbackAddress(), 0))
                 .decompressorRegistry(DecompressorRegistry.emptyInstance())
                 .addService(ServerInterceptors.intercept(new SlowFactry(), new EncodingRecorder()))
                 .build().start();
-        FactryGrpcClient noGzipClient = new FactryGrpcClient("localhost", noGzipServer.getPort(),
+        FactryGrpcClient noGzipClient = new FactryGrpcClient(java.net.InetAddress.getLoopbackAddress().getHostAddress(), noGzipServer.getPort(),
                 "collector-uuid", "token", false, false, null);
         try {
             FactryStorageEngine engine = engine(noGzipClient);
@@ -214,17 +214,17 @@ class SlowLinkTest {
 
     @Test
     void newSettingsTurnGzipBackOn() throws Exception {
-        Server noGzipServer = NettyServerBuilder.forPort(0)
+        Server noGzipServer = NettyServerBuilder.forAddress(new java.net.InetSocketAddress(java.net.InetAddress.getLoopbackAddress(), 0))
                 .decompressorRegistry(DecompressorRegistry.emptyInstance())
                 .addService(ServerInterceptors.intercept(new SlowFactry(), new EncodingRecorder()))
                 .build().start();
         Points points = Points.newBuilder().addPoints(Point.newBuilder().setMeasurementUUID("uuid")).build();
         try {
-            client.reconfigure("localhost", noGzipServer.getPort(), "collector-uuid", "token", false, false, null);
+            client.reconfigure(java.net.InetAddress.getLoopbackAddress().getHostAddress(), noGzipServer.getPort(), "collector-uuid", "token", false, false, null);
             client.createPoints(points);
             assertNull(writeEncoding.get(), "gzip turned off by the fallback");
 
-            client.reconfigure("localhost", server.getPort(), "collector-uuid", "token", false, false, null);
+            client.reconfigure(java.net.InetAddress.getLoopbackAddress().getHostAddress(), server.getPort(), "collector-uuid", "token", false, false, null);
             client.createPoints(points);
 
             assertEquals("gzip", writeEncoding.get(), "a settings save sends gzip again");
