@@ -308,7 +308,8 @@ class FactryQueryEngineBucketTest {
         factry.add(u, T0 + 3_000, 4, "Good");
         factry.add(u, T0 + 11_000, 6, "Good");
 
-        for (AggregationMode mode : List.of(AggregationMode.SimpleAverage, AggregationMode.Range)) {
+        for (AggregationMode mode : List.of(AggregationMode.SimpleAverage, AggregationMode.Range,
+                AggregationMode.Variance, AggregationMode.StdDev)) {
             FactryQueryEngineAverageTest.Recorder rec = aggregated(mode, T0 + 3_600_000);
 
             // The mean of the means (3.5) and the largest spread (1) look right but are not.
@@ -372,18 +373,24 @@ class FactryQueryEngineBucketTest {
     }
 
     @Test
-    void aBucketWithOneSample_hasNoStandardDeviation_andTheOtherBucketsStillDo() throws Exception {
-        // Factry answers such a bucket without a value; it must not fail the whole pen.
+    void varianceAndStdDev_divideByTheNumberOfSamples_asIgnitionDoes() throws Exception {
+        // Ignition's VarianceAggregate is the population variance; Factry's stddev is the sample
+        // one, and Factry has no variance at all (every Variance pen read Bad_Failure before).
         String u = factry.addMeasurement("default/out", "number");
-        factry.add(u, T0 + 1_000, 5, "Good");
-        factry.add(u, T0 + 11_000, 1, "Good");
-        factry.add(u, T0 + 12_000, 2, "Good");
-        factry.add(u, T0 + 13_000, 3, "Good");
+        factry.add(u, T0 + 1_000, 1, "Good");
+        factry.add(u, T0 + 2_000, 2, "Good");
+        factry.add(u, T0 + 3_000, 3, "Good");
+        factry.add(u, T0 + 11_000, 5, "Good");
 
-        AverageHistoryQuery.Dataset ds = read(AggregationMode.StdDev);
+        for (AggregationMode mode : List.of(AggregationMode.Variance, AggregationMode.StdDev)) {
+            AverageHistoryQuery.Dataset ds = read(mode);
+            double expected = mode == AggregationMode.Variance ? 2.0 / 3 : Math.sqrt(2.0 / 3);
 
-        assertTrue(ds.qualities.get(0)[1].isBad(), ds::toString);
-        assertEquals(1.0, ((Number) ds.rows.get(1)[1]).doubleValue(), 1e-9, ds::toString);
-        assertTrue(ds.qualities.get(1)[1].isGood(), ds::toString);
+            assertEquals(expected, ((Number) ds.rows.get(0)[1]).doubleValue(), 1e-9, () -> mode + "\n" + ds);
+            assertTrue(ds.qualities.get(0)[1].isGood(), ds::toString);
+            // One sample: Factry has no value, Ignition gives 0.
+            assertEquals(0.0, ((Number) ds.rows.get(1)[1]).doubleValue(), 1e-9, () -> mode + "\n" + ds);
+            assertTrue(ds.qualities.get(1)[1].isGood(), ds::toString);
+        }
     }
 }

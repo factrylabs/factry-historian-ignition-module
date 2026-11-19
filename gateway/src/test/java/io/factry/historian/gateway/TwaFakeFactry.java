@@ -267,6 +267,10 @@ class TwaFakeFactry extends FactryGrpcClient {
                 double ss = in.stream().mapToDouble(p -> Math.pow(num(p.value()) - mean, 2)).sum();
                 return Value.newBuilder().setNumberValue(Math.sqrt(ss / (in.size() - 1))).build();
             }
+            case "variance":
+                // Not a Factry aggregate (checked live on 8.2.3, gRPC and REST).
+                throw Status.UNKNOWN.withDescription("error converting timeseries query: invalid aggregation:"
+                        + " invalid aggregation name: invalid aggregation type: variance").asRuntimeException();
             case "sum":
                 return Value.newBuilder().setNumberValue(
                         in.stream().mapToDouble(p -> num(p.value())).sum()).build();
