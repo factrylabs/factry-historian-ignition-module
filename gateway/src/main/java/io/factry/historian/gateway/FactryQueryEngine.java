@@ -855,6 +855,8 @@ public class FactryQueryEngine extends AbstractQueryEngine {
                     if (TIME_WEIGHTED_AVERAGE.equals(factryFunction) && options.getTimeRange().isPresent()) {
                         pointCount += queryTimeWeightedAverage(uuid, source, key, period,
                                 periodMs, dataType == DataType.Boolean, asDate, options, pts);
+                    } else if ("count".equals(factryFunction) && options.getTimeRange().isPresent()) {
+                        pointCount += queryCount(uuid, source, key, period, periodMs, options, pts);
                     } else if ("count".equals(factryFunction) || TIME_WEIGHTED_AVERAGE.equals(factryFunction)) {
                         pointCount += querySingleAggregate(uuid, source, key, factryFunction, period, options,
                                 pts, asDate);
@@ -1369,6 +1371,35 @@ public class FactryQueryEngine extends AbstractQueryEngine {
                         .build());
                 count++;
             }
+        }
+        return count;
+    }
+
+    /**
+     * Count of Good samples, with a point for every bucket: Ignition would copy a neighbour's
+     * count into a bucket without one. A bucket without Good samples counts 0, as Ignition's own
+     * Count does; buckets from now on are Bad, as for the other aggregates.
+     */
+    private int queryCount(
+            String uuid, QualifiedPath source, AggregatedQueryKey key, String period, long periodMs,
+            AggregatedQueryOptions options, List<AggregatedPoint<?, ?>> out) {
+        long startMs = options.getTimeRange().get().startTime().toEpochMilli();
+        long rangeEndMs = options.getTimeRange().get().endTime().toEpochMilli();
+        long nowMs = now.getAsLong();
+        long endMs = Math.min(rangeEndMs, nowMs);
+        Map<Long, Object> counts = endMs > startMs
+                ? goodAggregate("count", grpcClient.queryTimeseries(withRange(
+                        perStatusRequest(uuid, "count", period), startMs, endMs).build()))
+                : Map.of();
+        int count = 0;
+        for (long b = startMs; b < rangeEndMs; b += periodMs) {
+            Object value = b < nowMs ? counts.getOrDefault(b, 0.0) : null;
+            out.add(AggregatedDataPoint.<Object, AggregationType>builder(source, key.aggregationType())
+                    .value(value)
+                    .quality(value == null ? QualityCode.Bad : QualityCode.Good)
+                    .timestamp(Instant.ofEpochMilli(b))
+                    .build());
+            count++;
         }
         return count;
     }

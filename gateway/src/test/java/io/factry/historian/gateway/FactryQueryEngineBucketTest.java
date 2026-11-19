@@ -230,6 +230,42 @@ class FactryQueryEngineBucketTest {
     }
 
     @Test
+    void count_isZeroForABucketWithoutGoodSamples() throws Exception {
+        String u = factry.addMeasurement("default/out", "number");
+        for (int s = 0; s < 13; s++) {
+            factry.add(u, T0 + s * 1000L, s, "Good");
+        }
+        factry.add(u, T0 + 25_000, 99, "Bad");
+        for (int s = 40; s < 60; s++) {
+            factry.add(u, T0 + s * 1000L, s, "Good");
+        }
+
+        // Before the fix Ignition copied a neighbour's count into the empty buckets: 10, 3, 10, 10, 10, 10.
+        assertColumn(read(AggregationMode.Count), 10.0, 3.0, 0.0, 0.0, 10.0, 10.0);
+        assertColumn(read(AggregationMode.Count, FillMode.DERIVED, T0 + 3_600_000), 10.0, 3.0, 0.0, 0.0, 10.0, 10.0);
+    }
+
+    @Test
+    void count_withoutAnySamples_isZero_andBadFromNowOn() throws Exception {
+        factry.addMeasurement("default/out", "number");
+
+        assertColumn(read(AggregationMode.Count, FillMode.NONE, T0 + 30_000), 0.0, 0.0, 0.0, BAD, BAD, BAD);
+    }
+
+    @Test
+    void count_addsUpSeveralGoodStatusesInOneBucket() {
+        String u = factry.addMeasurement("default/out", "number");
+        factry.add(u, T0 + 1_000, 3, "Good");
+        factry.add(u, T0 + 2_000, 5, "GoodLocalOverride");
+        factry.add(u, T0 + 3_000, 4, "Good");
+        factry.add(u, T0 + 4_000, 4, "Bad");
+
+        FactryQueryEngineAverageTest.Recorder rec = aggregated(AggregationMode.Count, T0 + 3_600_000);
+
+        assertEquals(Arrays.asList(3.0, 0.0, 0.0, 0.0, 0.0, 0.0), values(rec));
+    }
+
+    @Test
     void severalGoodStatusesInOneBucket_giveOnePoint() {
         String u = factry.addMeasurement("default/out", "number");
         factry.add(u, T0 + 1_000, 3, "Good");
