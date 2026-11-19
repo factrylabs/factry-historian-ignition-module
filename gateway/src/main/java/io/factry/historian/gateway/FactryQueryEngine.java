@@ -740,25 +740,35 @@ public class FactryQueryEngine extends AbstractQueryEngine {
     }
 
     /**
-     * Convert a TimeWindow to a Go-style duration string (e.g. "2h30m", "45s").
+     * Convert a TimeWindow to a Go-style duration string (e.g. "2h30m", "45s", "600ms").
      * Factry uses Go's time.ParseDuration() which does not accept ISO 8601.
      */
     static String timeWindowToPeriod(TimeWindow tw) {
-        long totalSeconds = tw.toSeconds();
-        if (totalSeconds <= 0) {
-            return "1m";
+        // Work in milliseconds: Ignition asks for sub-second windows (e.g. 600 ms) when a
+        // trend is zoomed in, and rounding them to whole seconds widens every bucket.
+        // TimeWindow.toMillis() throws for any unit but MILLIS, and toDuration() throws for
+        // date units (days and longer), so pick the conversion by unit.
+        long totalMillis = tw.unit().isTimeBased()
+                ? tw.toDuration().toMillis()
+                : tw.toSeconds() * 1000;
+        // TimeWindow refuses sizes below 1, so this can't happen today. Fail rather than send a
+        // made-up period: a silent 1 minute was the original bug, and "0s" crashes Factry.
+        if (totalMillis <= 0) {
+            throw new IllegalArgumentException("Time window shorter than 1 ms: " + tw);
         }
 
         StringBuilder sb = new StringBuilder();
-        long hours = totalSeconds / 3600;
-        long minutes = (totalSeconds % 3600) / 60;
-        long seconds = totalSeconds % 60;
+        long hours = totalMillis / 3_600_000;
+        long minutes = (totalMillis % 3_600_000) / 60_000;
+        long seconds = (totalMillis % 60_000) / 1000;
+        long millis = totalMillis % 1000;
 
         if (hours > 0) sb.append(hours).append("h");
         if (minutes > 0) sb.append(minutes).append("m");
         if (seconds > 0) sb.append(seconds).append("s");
+        if (millis > 0) sb.append(millis).append("ms");
 
-        return sb.length() > 0 ? sb.toString() : "1m";
+        return sb.toString();
     }
 
     @Override
