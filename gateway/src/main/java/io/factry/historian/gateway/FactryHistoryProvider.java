@@ -8,9 +8,11 @@ import com.inductiveautomation.historian.gateway.interop.TagHistoryStorageEngine
 import com.inductiveautomation.ignition.common.resourcecollection.ChangeOperation;
 import com.inductiveautomation.ignition.common.resourcecollection.Resource;
 import com.inductiveautomation.ignition.common.resourcecollection.ResourceBuilder;
+import com.inductiveautomation.ignition.gateway.config.ConfigurationManager;
 import com.inductiveautomation.ignition.gateway.model.GatewayContext;
 import com.inductiveautomation.ignition.gateway.model.ProfileStatus;
 import com.inductiveautomation.ignition.gateway.storeforward.StorageKey;
+import com.inductiveautomation.ignition.gateway.storeforward.StoreAndForwardManager;
 import com.inductiveautomation.ignition.gateway.storeforward.engine.EngineInformation;
 import com.inductiveautomation.ignition.gateway.storeforward.quarantine.QuarantineInterface;
 import com.inductiveautomation.ignition.gateway.storeforward.quarantine.QuarantinedDataInfo;
@@ -24,6 +26,7 @@ import java.util.Optional;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.stream.Collectors;
 
 public class FactryHistoryProvider extends AbstractHistorian<FactryHistorianSettings> {
@@ -45,16 +48,15 @@ public class FactryHistoryProvider extends AbstractHistorian<FactryHistorianSett
     private ScheduledExecutorService scheduledExecutor;
     private volatile String sfEngineName;
 
-    /** Cached status to avoid hitting gRPC on every gateway UI poll. */
+    /** Last connection check result; refreshed on the scheduler, not by status polls. */
     private volatile ProfileStatus cachedStatus = ProfileStatus.UNKNOWN;
-    private volatile long statusCheckedAt = 0;
-    private static final long STATUS_CACHE_MS = ModuleProperties.getStatusCacheMs();
+    private static final long STATUS_CHECK_MS = ModuleProperties.getStatusCacheMs();
 
     public FactryHistoryProvider(GatewayContext context, String historianName, FactryHistorianSettings settings) {
         super(context, historianName);
         this.context = context;
         this.settings = settings;
-        settings.applyTokenDefaults(settings.getToken());
+        String token = settings.applyTokenDefaults(settings.getToken());
         settings.validate();
         this.metrics = new HistorianMetrics();
 
@@ -62,7 +64,7 @@ public class FactryHistoryProvider extends AbstractHistorian<FactryHistorianSett
                 settings.getGrpcHost(),
                 settings.getGrpcPort(),
                 settings.getCollectorUUID(),
-                settings.getToken(),
+                token,
                 settings.isUseTls(),
                 settings.isSkipTlsVerification(),
                 settings.getCustomCaCert()
@@ -177,6 +179,11 @@ public class FactryHistoryProvider extends AbstractHistorian<FactryHistorianSett
         scheduledExecutor.scheduleWithFixedDelay(
                 this::sendHealthUpdate, 0, 30, TimeUnit.SECONDS);
 
+        // Check the connection and pause or resume the S&F sink on a schedule. getStatus() is
+        // only called when someone opens the gateway UI, so it cannot be what resumes forwarding.
+        scheduledExecutor.scheduleWithFixedDelay(
+                this::checkConnection, STATUS_CHECK_MS, STATUS_CHECK_MS, TimeUnit.MILLISECONDS);
+
         // Prime the status cache now that the connection has just been exercised
         // (registerCollector + cache refresh above), so the gateway UI shows the
         // real status on its first poll instead of waiting for the cache to expire.
@@ -236,7 +243,7 @@ public class FactryHistoryProvider extends AbstractHistorian<FactryHistorianSett
         logger.info("Historian settings change: {}", newSettings);
 
         try {
-            newSettings.applyTokenDefaults(newSettings.getToken());
+            String token = newSettings.applyTokenDefaults(newSettings.getToken());
             newSettings.validate();
 
             // Reconfigure the gRPC client (shuts down old channel, creates new one)
@@ -244,11 +251,13 @@ public class FactryHistoryProvider extends AbstractHistorian<FactryHistorianSett
                     newSettings.getGrpcHost(),
                     newSettings.getGrpcPort(),
                     newSettings.getCollectorUUID(),
-                    newSettings.getToken(),
+                    token,
                     newSettings.isUseTls(),
                     newSettings.isSkipTlsVerification(),
                     newSettings.getCustomCaCert()
             );
+            // Judge and log refusals of writes afresh; before the refresh, which can throw.
+            storageEngine.clearRefusals();
 
             // Refresh measurement cache from the new endpoint
             measurementCache.refresh(grpcClient);
@@ -258,8 +267,8 @@ public class FactryHistoryProvider extends AbstractHistorian<FactryHistorianSett
             storageEngine.updateSettings(newSettings);
             this.settings = newSettings;
 
-            // Re-test against the new endpoint and refresh the cached status so the
-            // gateway UI reflects the change on its next poll, not up to STATUS_CACHE_MS later.
+            // Re-test against the new endpoint so the gateway UI reflects the change on its
+            // next poll, not up to STATUS_CHECK_MS later.
             refreshConnectionStatus();
 
             logger.info("Settings change applied successfully");
@@ -268,36 +277,32 @@ public class FactryHistoryProvider extends AbstractHistorian<FactryHistorianSett
             logger.error("Failed to apply settings change", e);
             // Reflect the failure immediately rather than serving a stale cached status.
             cachedStatus = ProfileStatus.ERRORED;
-            statusCheckedAt = System.currentTimeMillis();
             return false;
         }
     }
 
     @Override
     public ProfileStatus getStatus() {
-        if (!started) {
-            return ProfileStatus.UNKNOWN;
-        }
+        return started ? cachedStatus : ProfileStatus.UNKNOWN;
+    }
 
-        long now = System.currentTimeMillis();
-        if (now - statusCheckedAt < STATUS_CACHE_MS) {
-            return cachedStatus;
+    private void checkConnection() {
+        try {
+            refreshConnectionStatus();
+        } catch (Exception e) {
+            // An exception would cancel the scheduled task, and forwarding would never resume.
+            logger.warn("Connection check failed: " + e.getMessage());
         }
-
-        return refreshConnectionStatus();
     }
 
     /**
-     * Actively test the Factry connection, update the cached status and its
-     * timestamp, and toggle the S&F sink to match the connection state.
+     * Actively test the Factry connection, update the cached status, and toggle the S&F
+     * sink to match the connection state.
      * <p>
-     * Called lazily from {@link #getStatus()} when the cache expires, and
-     * eagerly right after startup and settings changes so the gateway UI
-     * reflects the new state on its very next poll instead of waiting out the
-     * {@link #STATUS_CACHE_MS} window (or showing a stale value for up to that long).
+     * Runs every {@link #STATUS_CHECK_MS} on the scheduler, and right after startup and
+     * settings changes so the gateway UI reflects the new state on its next poll.
      */
     private ProfileStatus refreshConnectionStatus() {
-        statusCheckedAt = System.currentTimeMillis();
         boolean connected = grpcClient.testConnection();
         cachedStatus = connected ? ProfileStatus.RUNNING : ProfileStatus.ERRORED;
 
@@ -336,22 +341,27 @@ public class FactryHistoryProvider extends AbstractHistorian<FactryHistorianSett
      * Ignition's default engine settings).
      */
     private void ensureStoreAndForwardEngine(String engineName) {
-        Optional<EngineInformation> existing =
-                context.getStoreAndForwardManager().getEngineInformation(engineName, true);
+        ensureStoreAndForwardEngine(context.getConfigurationManager(), context.getStoreAndForwardManager(),
+                engineName, ENGINE_CREATE_TIMEOUT_MS);
+    }
+
+    private static final long ENGINE_CREATE_TIMEOUT_MS = 10_000;
+
+    enum EngineCreation { EXISTS, CREATED, CREATED_PENDING, FAILED }
+
+    static EngineCreation ensureStoreAndForwardEngine(ConfigurationManager configurationManager,
+                                                      StoreAndForwardManager storeAndForwardManager,
+                                                      String engineName, long timeoutMs) {
+        Optional<EngineInformation> existing = storeAndForwardManager.getEngineInformation(engineName, true);
         if (existing.isPresent()) {
             logger.debug("S&F engine '{}' already exists", engineName);
-            return;
+            return EngineCreation.EXISTS;
         }
 
         // Also check if a resource already exists (covers engines not yet started)
-        List<Resource> sfResources = context.getConfigurationManager()
-                .getResources(StoreAndForwardEngineSettings.getType());
-        for (Resource r : sfResources) {
-            if (r.getResourceName().equalsIgnoreCase(engineName)) {
-                logger.debug("S&F engine resource '{}' already exists (as '{}')",
-                        engineName, r.getResourceName());
-                return;
-            }
+        if (engineResourceExists(configurationManager, engineName)) {
+            logger.debug("S&F engine resource '{}' already exists", engineName);
+            return EngineCreation.EXISTS;
         }
 
         logger.info("S&F engine '{}' does not exist — creating it automatically", engineName);
@@ -366,24 +376,38 @@ public class FactryHistoryProvider extends AbstractHistorian<FactryHistorianSett
             Resource resource = builder.build();
 
             ChangeOperation createOp = ChangeOperation.newCreateOp(resource);
-            context.getConfigurationManager().push(List.of(createOp)).get(10, TimeUnit.SECONDS);
+            configurationManager.push(List.of(createOp)).get(timeoutMs, TimeUnit.MILLISECONDS);
 
             logger.info("S&F engine '{}' created successfully", engineName);
+            return EngineCreation.CREATED;
+        } catch (TimeoutException e) {
+            // push() writes the resource before it returns; its future only waits for the change
+            // listeners. When this profile is itself being started from a config change, those
+            // listeners queue behind us, so the wait times out although the engine is there.
+            if (engineResourceExists(configurationManager, engineName)) {
+                logger.info("S&F engine '{}' created; Ignition is still applying it", engineName);
+                return EngineCreation.CREATED_PENDING;
+            }
+            logger.error("Failed to create S&F engine '{}' — store-and-forward may not work", engineName, e);
+            return EngineCreation.FAILED;
         } catch (Exception e) {
             logger.error("Failed to create S&F engine '{}' — store-and-forward may not work", engineName, e);
+            return EngineCreation.FAILED;
         }
+    }
+
+    private static boolean engineResourceExists(ConfigurationManager configurationManager, String engineName) {
+        return configurationManager.getResources(StoreAndForwardEngineSettings.getType()).stream()
+                .anyMatch(r -> r.getResourceName().equalsIgnoreCase(engineName));
     }
 
     private void retryQuarantinedData(String engineName) {
         try {
-            // Test connection and re-enable forwarding if the server is back
+            // checkConnection() re-enables forwarding once Factry is back; until then a retry
+            // would only fail again.
             if (!grpcClient.isConnected()) {
-                if (grpcClient.testConnection()) {
-                    logger.info("Factry server is reachable again, re-enabling S&F forwarding");
-                } else {
-                    logger.debug("Factry server still unreachable, S&F will keep buffering");
-                    return;
-                }
+                logger.debug("Factry server unreachable, not retrying quarantined data yet");
+                return;
             }
 
             Optional<QuarantineInterface<?>> qi =
