@@ -1,6 +1,7 @@
 package io.factry.historian.gateway;
 
 import com.google.protobuf.Value;
+import com.inductiveautomation.historian.common.model.TimeWindow;
 import com.inductiveautomation.ignition.common.model.values.QualityCode;
 import com.inductiveautomation.ignition.common.sqltags.model.types.DataType;
 import org.junit.jupiter.api.Nested;
@@ -70,6 +71,46 @@ class StaticHelpersTest {
         @Test
         void unknownDefaultsToMean() {
             assertEquals("mean", FactryQueryEngine.toFactryAggregateFunction("UnknownAgg"));
+        }
+    }
+
+    // =========================================================================
+    // FactryQueryEngine.timeWindowToPeriod
+    // =========================================================================
+
+    @Nested
+    class TimeWindowToPeriod {
+
+        @Test
+        void subSecond_keepsMilliseconds() {
+            assertEquals("600ms", FactryQueryEngine.timeWindowToPeriod(TimeWindow.ofMillis(600)));
+        }
+
+        @Test
+        void fractionalSeconds_keepsMilliseconds() {
+            assertEquals("1s500ms", FactryQueryEngine.timeWindowToPeriod(TimeWindow.ofMillis(1500)));
+        }
+
+        @Test
+        void ninetySeconds() {
+            assertEquals("1m30s", FactryQueryEngine.timeWindowToPeriod(TimeWindow.ofSeconds(90)));
+        }
+
+        @Test
+        void oneHour() {
+            assertEquals("1h", FactryQueryEngine.timeWindowToPeriod(TimeWindow.ofHours(1)));
+        }
+
+        @Test
+        void oneDay() {
+            assertEquals("24h", FactryQueryEngine.timeWindowToPeriod(TimeWindow.ofDays(1)));
+        }
+
+        @Test
+        void zero_cannotReachTheEngine() {
+            // A zero period makes Factry's InfluxDB query panic (divide by zero). Ignition's
+            // TimeWindow rejects a zero size, so the engine never has to convert one.
+            assertThrows(IllegalArgumentException.class, () -> TimeWindow.ofMillis(0));
         }
     }
 
