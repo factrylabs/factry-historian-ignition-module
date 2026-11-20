@@ -9,6 +9,7 @@ import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;
 import java.util.Optional;
+import java.util.regex.Pattern;
 
 /**
  * Parses the payload of a Factry Historian JWT collector token without
@@ -18,7 +19,29 @@ import java.util.Optional;
 public final class JwtTokenParser {
     private static final Logger logger = LoggerFactory.getLogger(JwtTokenParser.class);
 
+    // Zero-width space and byte-order mark are not whitespace, but often come along when a
+    // token is copied from a web page or an email.
+    private static final Pattern WHITESPACE = Pattern.compile("[\\s\\u200B\\uFEFF]+", Pattern.UNICODE_CHARACTER_CLASS);
+    private static final Pattern JWT = Pattern.compile("[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+");
+
     private JwtTokenParser() {
+    }
+
+    /**
+     * The token as Factry accepts it: without whitespace. A pasted token often ends with a newline
+     * or space, or is wrapped over two lines, and Factry refuses the header then. A JWT never
+     * contains whitespace, so removing all of it is safe.
+     *
+     * @throws IllegalArgumentException if what remains is not a JWT; the message leaves the token out
+     */
+    public static String normalize(String token) {
+        String cleaned = token == null ? "" : WHITESPACE.matcher(token).replaceAll("");
+        if (!JWT.matcher(cleaned).matches()) {
+            throw new IllegalArgumentException("Invalid token: not a valid JWT. A collector token is three parts"
+                    + " of letters, digits, '-' and '_', separated by dots. Paste the collector token generated"
+                    + " by Factry Historian.");
+        }
+        return cleaned;
     }
 
     /**
@@ -76,6 +99,31 @@ public final class JwtTokenParser {
                 return null;
             }
         });
+    }
+
+    /**
+     * The {@code use-self-signed-certificate} claim: Factry serves its built-in certificate (its
+     * USE_SELF_SIGNED_CERTIFICATE setting). Factry v8.2.3 writes a JSON boolean; a string "true" is
+     * accepted too. Absent means false.
+     */
+    public static boolean usesFactryCertificate(JsonObject payload) {
+        return getStringField(payload, "use-self-signed-certificate").map(Boolean::parseBoolean).orElse(false);
+    }
+
+    /** Extract the REST port from the {@code rest-port} claim. */
+    public static Optional<Integer> getRestPort(JsonObject payload) {
+        return getStringField(payload, "rest-port").map(port -> {
+            try {
+                return Integer.parseInt(port);
+            } catch (NumberFormatException e) {
+                return null;
+            }
+        });
+    }
+
+    /** Extract the organisation UUID from the {@code organization-uuid} claim. */
+    public static Optional<String> getOrganizationUUID(JsonObject payload) {
+        return getStringField(payload, "organization-uuid");
     }
 
     private static Optional<String> getStringField(JsonObject obj, String field) {

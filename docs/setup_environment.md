@@ -168,13 +168,12 @@ Key settings in `config.json`:
 
 | Field | Value | Notes |
 |-------|-------|-------|
-| `grpcHost` | `historian` | Docker service name |
-| `grpcPort` | `8001` | gRPC port |
+| `hostOverride` | `historian` | Docker service name (Host Override) |
+| `portOverride` | `8001` | gRPC port (Port Override) |
 | `token` | (from Factry) | The collector token |
-| `useTls` | `true` | |
 | `skipTlsVerification` | `true` | For dev environment |
 
-> **Note:** The module reads `grpcHost` and `grpcPort` from the JWT token's `aud` claim by default. If the token contains `http://historian`, it will use `historian:8001`. The config file values serve as fallback.
+> **Note:** The module reads host and port from the JWT token's `aud` and `grpc-port` claims. `hostOverride` and `portOverride` (Host Override and Port Override in the form) win when set. The connection always uses TLS. The script writes the token in plain text (`token`); the module reads it with a warning until the profile is saved with the token as a secret.
 
 After updating the config, restart Ignition:
 ```bash

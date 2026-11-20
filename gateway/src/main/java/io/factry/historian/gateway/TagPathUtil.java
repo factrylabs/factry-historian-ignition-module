@@ -135,6 +135,38 @@ final class TagPathUtil {
     }
 
     /**
+     * The read key of another Site's measurement: {@code [<database name>]<name>}. Measurement
+     * names are unique per time-series database, so this names one measurement. Ignition names
+     * the module makes ({@code <provider>/<tag path>}) never start with '[', so they cannot be
+     * taken for one. A database name with ']' is not supported.
+     */
+    static String qualify(String database, String name) {
+        return "[" + database + "]" + name;
+    }
+
+    /** The database name of a read key made by {@link #qualify}, or null. */
+    static String database(String key) {
+        if (key == null || !key.startsWith("[")) {
+            return null;
+        }
+        int close = key.indexOf(']');
+        return close > 1 ? key.substring(1, close) : null;
+    }
+
+    /** A read key without its database, if it has one. */
+    static String withoutDatabase(String key) {
+        String database = database(key);
+        return database != null ? key.substring(database.length() + 2) : key;
+    }
+
+    /** {@link #toBrowseName} of a read key, leaving its database as it is. */
+    static String toBrowseId(String key, String delimiter) {
+        String database = database(key);
+        String browseName = toBrowseName(withoutDatabase(key), delimiter);
+        return database != null ? qualify(database, browseName) : browseName;
+    }
+
+    /**
      * True if a query QualifiedPath refers to the Assets tree rather than the
      * Measurements tree. Asset property tags carry their measurement's real name
      * (which natively contains '/'), so the delimiter reverse-transform must never
