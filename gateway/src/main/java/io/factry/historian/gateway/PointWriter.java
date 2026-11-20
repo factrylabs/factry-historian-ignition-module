@@ -52,18 +52,34 @@ class PointWriter {
      */
     private volatile long fittingMessageBytes = Long.MAX_VALUE;
 
+    private final WriteHealth writeHealth;
+
     PointWriter(FactryGrpcClient grpcClient, MeasurementCache measurementCache, HistorianMetrics metrics) {
+        this(grpcClient, measurementCache, metrics, new WriteHealth());
+    }
+
+    PointWriter(FactryGrpcClient grpcClient, MeasurementCache measurementCache, HistorianMetrics metrics,
+                WriteHealth writeHealth) {
         this.grpcClient = grpcClient;
         this.measurementCache = measurementCache;
         this.metrics = metrics;
+        this.writeHealth = writeHealth;
     }
 
     /**
      * Write a flush of points. Connection errors (UNAVAILABLE, DEADLINE_EXCEEDED) and server
-     * rejections that remain after the retry are thrown, for the engine to report.
+     * rejections that remain after the retry are recorded in {@link WriteHealth}, which logs
+     * them, and thrown for the engine to report to store and forward.
      */
     StorageResult<AtomicPoint<?>> write(List<AtomicPoint<?>> points) {
-        return sendPoints(points, true);
+        try {
+            return sendPoints(points, true);
+        } catch (StatusRuntimeException e) {
+            // Timeouts too: an InfluxDB that hangs lets every write time out while the
+            // connection check passes.
+            writeHealth.writeFailed(e.getStatus(), points.size());
+            throw e;
+        }
     }
 
     /**
@@ -221,6 +237,7 @@ class PointWriter {
         Points message = Points.newBuilder().addAllPoints(part).build();
         try {
             grpcClient.createPoints(message);
+            writeHealth.writeAccepted();
         } catch (StatusRuntimeException e) {
             if (!isTooLarge(e)) {
                 throw e;
@@ -246,6 +263,7 @@ class PointWriter {
                     e.getStatus().getDescription());
             grpcClient.createPoints(Points.newBuilder()
                     .addPoints(point.toBuilder().clearValue().setStatus("Bad")).build());
+            writeHealth.writeAccepted();
         }
     }
 

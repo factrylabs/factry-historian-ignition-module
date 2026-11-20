@@ -416,7 +416,9 @@ Extends `AbstractHistorian<FactryHistorianSettings>`. The orchestrator that ties
 
 **`getStorageEngine()`** — returns S&F bridge if configured, otherwise the direct storage engine
 
-**`getStatus()`** — returns the result of the last scheduled connection check
+**`getStatus()`** — from `WriteHealth`, fed by the scheduled connection check and by what becomes of every write: Errored when the last check failed; also Errored ("Factry does not store writes") when every write failed over at least 30 s while the check passes, refused (for example `INTERNAL` while Factry's InfluxDB is down) or timed out (InfluxDB hanging), until a write is stored again. A failed check restarts that count, so writes are judged afresh after an outage. Data handling does not change: store and forward keeps the data and the quarantine retry sends it again. The gateway's Historians page shows an Errored profile as a red "Error" badge with the status details as its tooltip. Logging, each line naming the profile (also after a rename): one WARN per answer from Factry until a write is stored (repeats at DEBUG), one WARN when the status turns Errored, a summary of failed flushes and points about every 5 minutes while it lasts, and one INFO with the totals when a write is stored again. A connection check that fails in between does not end this story, so a flapping check does not repeat it. While writes fail, the 30 s quarantine retry logs at DEBUG instead of INFO.
+
+With Factry as a History Splitter's primary, an Errored status also sends the splitter's queries to the secondary: Ignition's splitter uses a historian only while its status is Good.
 
 **`handleSettingsChange()`** — reconfigures gRPC client, refreshes cache, updates engines. No restart needed.
 

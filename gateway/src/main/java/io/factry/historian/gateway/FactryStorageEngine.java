@@ -10,7 +10,6 @@ import com.inductiveautomation.historian.common.model.data.StorageResult;
 import com.inductiveautomation.ignition.common.util.LoggerEx;
 import com.inductiveautomation.ignition.gateway.model.GatewayContext;
 
-import io.grpc.Status;
 import io.grpc.StatusRuntimeException;
 
 import java.util.HashMap;
@@ -31,12 +30,24 @@ public class FactryStorageEngine extends AbstractStorageEngine {
         MeasurementCache measurementCache,
         HistorianMetrics metrics
     ) {
+        this(context, historianName, settings, grpcClient, measurementCache, metrics, new WriteHealth());
+    }
+
+    public FactryStorageEngine(
+        GatewayContext context,
+        String historianName,
+        FactryHistorianSettings settings,
+        FactryGrpcClient grpcClient,
+        MeasurementCache measurementCache,
+        HistorianMetrics metrics,
+        WriteHealth writeHealth
+    ) {
         super(context, historianName, LoggerEx.newBuilder().build(FactryStorageEngine.class),
                 QualifiedPathAdapter.DEFAULT, ImmediateStorageStrategy.create(historianName));
         this.settings = settings;
         this.measurementCache = measurementCache;
         this.metrics = metrics;
-        this.pointWriter = new PointWriter(grpcClient, measurementCache, metrics);
+        this.pointWriter = new PointWriter(grpcClient, measurementCache, metrics, writeHealth);
         logger.debug("Factry Storage Engine initialized with gRPC target: " +
                 settings.getGrpcHost() + ":" + settings.getGrpcPort());
     }
@@ -55,13 +66,7 @@ public class FactryStorageEngine extends AbstractStorageEngine {
             return pointWriter.write(points);
         } catch (StatusRuntimeException e) {
             metrics.recordStoreError();
-            Status.Code code = e.getStatus().getCode();
-            if (code == Status.Code.UNAVAILABLE || code == Status.Code.DEADLINE_EXCEEDED) {
-                logger.warn("Connection error storing points, S&F will retry: " + e.getMessage());
-            } else {
-                logger.error("Factry refused " + points.size() + " points (" + code + "), S&F keeps them"
-                        + " and retries: " + e.getMessage());
-            }
+            // Logged by WriteHealth, once per answer rather than once per flush.
             // Always attach the error. TagHistoryDataSinkBridge only keeps a batch in S&F when the
             // result carries one; a failure without an error counts as handled and the points are lost.
             return StorageResult.exception(e, points);
