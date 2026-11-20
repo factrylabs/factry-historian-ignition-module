@@ -1,0 +1,703 @@
+package io.factry.historian.gateway;
+
+import com.google.protobuf.CodedOutputStream;
+import com.google.protobuf.Value;
+import com.google.protobuf.util.Timestamps;
+import com.inductiveautomation.historian.common.model.data.AtomicPoint;
+import com.inductiveautomation.historian.common.model.data.StorageResult;
+import com.inductiveautomation.ignition.common.model.values.QualityCode;
+import io.factry.historian.proto.Measurement;
+import io.factry.historian.proto.Point;
+import io.factry.historian.proto.Points;
+import io.factry.historian.proto.QueryTimeseriesRequest;
+import io.factry.historian.proto.QueryTimeseriesResponse;
+import io.factry.historian.proto.Series;
+import io.factry.historian.proto.SeriesPoint;
+import io.grpc.Status;
+import io.grpc.StatusRuntimeException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.ArrayList;
+import java.util.EnumMap;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+
+/**
+ * Turns a flush of Ignition points into one CreatePoints call: resolves their measurements
+ * through the {@link MeasurementCache}, merges array elements into whole arrays, sends them and
+ * says what store and forward should do with the flush. Used by {@link FactryStorageEngine};
+ * kept apart from it, without Ignition gateway classes, so it can be unit tested.
+ */
+class PointWriter {
+    private static final Logger logger = LoggerFactory.getLogger(PointWriter.class);
+
+    private final FactryGrpcClient grpcClient;
+    private final MeasurementCache measurementCache;
+    private final HistorianMetrics metrics;
+    private final RefusalLog refusalLog = new RefusalLog();
+    /** For tests. */
+    long maxMessageBytes = ModuleProperties.getWriteMaxMessageBytes();
+    /** Below this, grpc.write.max.message.bytes would mean a call per point, not a safer write. */
+    static final long MIN_MESSAGE_BYTES = 64 * 1024;
+    /**
+     * Half the size of the last write Factry (or a proxy in front of it) refused as too large,
+     * so the next flush starts with parts that fit instead of being refused again on the way
+     * down. Forgotten with new settings.
+     */
+    private volatile long fittingMessageBytes = Long.MAX_VALUE;
+
+    private final WriteHealth writeHealth;
+
+    PointWriter(FactryGrpcClient grpcClient, MeasurementCache measurementCache, HistorianMetrics metrics) {
+        this(grpcClient, measurementCache, metrics, new WriteHealth());
+    }
+
+    PointWriter(FactryGrpcClient grpcClient, MeasurementCache measurementCache, HistorianMetrics metrics,
+                WriteHealth writeHealth) {
+        this.grpcClient = grpcClient;
+        this.measurementCache = measurementCache;
+        this.metrics = metrics;
+        this.writeHealth = writeHealth;
+    }
+
+    /**
+     * Write a flush of points. Connection errors (UNAVAILABLE, DEADLINE_EXCEEDED) and server
+     * rejections that remain after the retry are recorded in {@link WriteHealth}, which logs
+     * them, and thrown for the engine to report to store and forward.
+     */
+    StorageResult<AtomicPoint<?>> write(List<AtomicPoint<?>> points) {
+        try {
+            return sendPoints(points, true);
+        } catch (StatusRuntimeException e) {
+            // Timeouts too: an InfluxDB that hangs lets every write time out while the
+            // connection check passes.
+            writeHealth.writeFailed(e.getStatus(), points.size());
+            throw e;
+        }
+    }
+
+    /**
+     * Forget which refusals were logged and which create attempts were made, for new
+     * settings (the collector may have changed): they are judged and logged afresh.
+     */
+    void clearRefusals() {
+        fittingMessageBytes = Long.MAX_VALUE;
+        refusalLog.clear();
+        measurementCache.clearWriteRefusals();
+    }
+
+    RefusalLog refusalLog() {
+        return refusalLog;
+    }
+
+    /**
+     * The flush is done: everything was sent, except points that were skipped (null value),
+     * discarded because Factry has no measurement the module may write
+     * them to, or dropped because the measurement is Paused (see
+     * {@link MeasurementCache.WriteRefusal}). Those count as handled, so store and forward
+     * neither retries nor quarantines them.
+     */
+    private StorageResult<AtomicPoint<?>> stored(List<AtomicPoint<?>> points, BuildResult built) {
+        metrics.recordDiscarded(built.discardedPoints);
+        metrics.recordPausedDropped(built.pausedPoints);
+        return StorageResult.success(points);
+    }
+
+    /**
+     * Build and send points to Factry. If Factry answers NOT_FOUND or INVALID_ARGUMENT
+     * (e.g. a deleted measurement) and {@code retryOnRejection} is true, evict the
+     * affected measurement UUIDs from the cache and retry once. The retry resolves
+     * them again through {@link MeasurementCache#batchGetOrCreateUUIDs} (array
+     * measurements through {@link MeasurementCache#getOrCreateUUID}), which looks
+     * each measurement up in Factry first and only re-creates it if Factry no
+     * longer has it. If Factry does not answer one of those lookups in time, the
+     * rest is left unresolved, so the retry costs one write deadline, not one per
+     * evicted measurement.
+     */
+    private StorageResult<AtomicPoint<?>> sendPoints(List<AtomicPoint<?>> points, boolean retryOnRejection) {
+        BuildResult built = buildPoints(points);
+
+        if (built.pointsBuilder.getPointsCount() == 0) {
+            if (built.hasSkippedArrays) {
+                // An array's measurement is being created, or its last value not read yet
+                logger.debug("No points to send, array(s) not ready");
+                return StorageResult.exception(new RuntimeException(ARRAYS_NOT_READY), points);
+            }
+            if (built.hasFailedCreations) {
+                // Measurement creation failed for new tags (Factry likely unreachable). Return
+                // an exception so S&F keeps them in pending and retries instead of silently
+                // dropping them.
+                logger.warn("Could not create measurement(s) for new tag(s) — S&F will retry");
+                return StorageResult.exception(
+                        new RuntimeException("Measurement creation failed, retry later"), points);
+            }
+            if (measurementCache.size() == 0 && built.discardedPoints + built.pausedPoints == 0) {
+                // All points skipped because measurement cache is empty (Factry likely down).
+                // Return exception so S&F keeps them in pending for retry.
+                logger.warn("No points to send, measurement cache empty — S&F will retry");
+                return StorageResult.exception(
+                        new RuntimeException("Measurement cache empty, cannot resolve UUIDs"), points);
+            }
+            logger.debug("No points to send (all skipped or discarded)");
+            return stored(points, built);
+        }
+
+        try {
+            logger.debug("Sending " + built.pointsBuilder.getPointsCount() + " points via createPoints");
+            long beforeMs = System.currentTimeMillis();
+            long partBytes = Math.min(Math.max(MIN_MESSAGE_BYTES, maxMessageBytes), fittingMessageBytes);
+            for (List<Point> part : parts(built.pointsBuilder.getPointsList(), partBytes)) {
+                sendPart(part);
+            }
+            long elapsedMs = System.currentTimeMillis() - beforeMs;
+            metrics.recordStore(built.pointsBuilder.getPointsCount(), elapsedMs);
+            logger.debug("createPoints succeeded for " + built.pointsBuilder.getPointsCount() + " points");
+
+            if (built.hasSkippedArrays) {
+                // Non-array points sent successfully, but array points were skipped.
+                // Return exception so S&F retries the whole batch — the non-array points
+                // will be re-sent (idempotent) and the array points will succeed next time.
+                logger.debug("Array(s) not ready, requesting S&F retry for array points");
+                return StorageResult.exception(new RuntimeException(ARRAYS_NOT_READY), points);
+            }
+            if (built.hasFailedCreations) {
+                // Some points were sent, but others have no measurement yet (Factry did not
+                // answer in time, or the creation failed). Return exception so S&F retries the
+                // whole batch — the sent points will be re-sent (idempotent) — instead of
+                // acknowledging the deferred points and losing them.
+                logger.warn("Could not create measurement(s) for new tag(s) — S&F will retry the flush");
+                return StorageResult.exception(
+                        new RuntimeException("Measurement creation failed, retry later"), points);
+            }
+            return stored(points, built);
+
+        } catch (StatusRuntimeException e) {
+            Status.Code code = e.getStatus().getCode();
+
+            // Connection errors — let caller handle (S&F retry)
+            if (code == Status.Code.UNAVAILABLE || code == Status.Code.DEADLINE_EXCEEDED) {
+                throw e;
+            }
+
+            // Only an answer about the measurements themselves justifies dropping them from
+            // the cache: evicting on INTERNAL (e.g. InfluxDB down) would send a lookup per
+            // measurement to a Factry that is already struggling, on every retry.
+            // Factry also answers NOT_FOUND when the collector itself was deleted; evicting would
+            // then only send a lookup per measurement to a Factry that refuses them all.
+            boolean aboutMeasurements = (code == Status.Code.NOT_FOUND || code == Status.Code.INVALID_ARGUMENT)
+                    && !FactryGrpcClient.isCollectorDeleted(e.getStatus());
+            if (retryOnRejection && aboutMeasurements && !built.usedUUIDs.isEmpty()) {
+                logger.warn("Server rejected points (" + code + "), evicting "
+                        + built.usedUUIDs.size() + " measurement UUIDs and retrying: " + e.getMessage());
+                for (String uuid : built.usedUUIDs) {
+                    measurementCache.evictByUUID(uuid);
+                }
+                return sendPoints(points, false);
+            }
+
+            throw e;
+        }
+    }
+
+    /**
+     * Cut {@code points} into consecutive parts whose CreatePoints message stays under
+     * {@code maxBytes}; a point bigger than that on its own is a part by itself. Factry refuses a
+     * message over its GRPC_MAX_MESSAGE_SIZE (64 MiB by default) for good, and one that big
+     * also may not fit in the write deadline on a slow link, which would look like an outage.
+     */
+    static List<List<Point>> parts(List<Point> points, long maxBytes) {
+        List<List<Point>> parts = new ArrayList<>();
+        int start = 0;
+        long size = 0;
+        for (int i = 0; i < points.size(); i++) {
+            long pointSize = CodedOutputStream.computeMessageSize(Points.POINTS_FIELD_NUMBER, points.get(i));
+            if (i > start && size + pointSize > maxBytes) {
+                parts.add(points.subList(start, i));
+                start = i;
+                size = 0;
+            }
+            size += pointSize;
+        }
+        if (start < points.size()) {
+            parts.add(points.subList(start, points.size()));
+        }
+        return parts;
+    }
+
+    /**
+     * Send one part. Should Factry still find it too large (its limit can be set lower than ours),
+     * send it in halves. A single point that is too large can never be stored: it is sent as a
+     * Bad point without a value, like a NaN, so its time shows in the history and the rest of the
+     * flush is not held back.
+     */
+    private void sendPart(List<Point> part) {
+        Points message = Points.newBuilder().addAllPoints(part).build();
+        try {
+            grpcClient.createPoints(message);
+            writeHealth.writeAccepted();
+        } catch (StatusRuntimeException e) {
+            if (!isTooLarge(e)) {
+                throw e;
+            }
+            long fitting = message.getSerializedSize() / 2;
+            if (fitting < fittingMessageBytes) {
+                fittingMessageBytes = fitting;
+                logger.info("Factry refused a write of {} bytes as too large ({}); sending at most {} bytes"
+                        + " per call until the settings are saved", message.getSerializedSize(),
+                        e.getStatus().getDescription(), fitting);
+            }
+            if (part.size() > 1) {
+                sendPart(part.subList(0, part.size() / 2));
+                sendPart(part.subList(part.size() / 2, part.size()));
+                return;
+            }
+            Point point = part.get(0);
+            Measurement measurement = measurementCache.getMeasurementByUUID(point.getMeasurementUUID());
+            logger.warn("A value of tag '{}' at {} is {} bytes, more than Factry accepts in one write ({});"
+                            + " storing a Bad point without a value instead",
+                    measurement != null ? measurement.getName() : point.getMeasurementUUID(),
+                    Timestamps.toString(point.getTimestamp()), point.getSerializedSize(),
+                    e.getStatus().getDescription());
+            grpcClient.createPoints(Points.newBuilder()
+                    .addPoints(point.toBuilder().clearValue().setStatus("Bad")).build());
+            writeHealth.writeAccepted();
+        }
+    }
+
+    /**
+     * Whether a write was refused for its size: RESOURCE_EXHAUSTED "grpc: received message (after
+     * decompression) larger than max" from grpc-go (Factry), "exceeds maximum size" from
+     * grpc-java, or a proxy's HTTP 413, which grpc-java reports as UNKNOWN "HTTP status code 413"
+     * (nginx refuses bodies over 1 MiB by default). Not any RESOURCE_EXHAUSTED: a proxy may use it
+     * for a quota, and that is worth a retry.
+     */
+    static boolean isTooLarge(StatusRuntimeException e) {
+        String description = e.getStatus().getDescription();
+        if (description == null) {
+            return false;
+        }
+        Status.Code code = e.getStatus().getCode();
+        return code == Status.Code.RESOURCE_EXHAUSTED
+                && (description.contains("larger than max") || description.contains("exceeds maximum"))
+                || code == Status.Code.UNKNOWN && description.startsWith("HTTP status code 413");
+    }
+
+    private static class BuildResult {
+        final Points.Builder pointsBuilder;
+        final Set<String> usedUUIDs;
+        final boolean hasSkippedArrays;
+        final boolean hasFailedCreations;
+        /** Points not sent because their measurement refuses them (see {@link #refusal}). */
+        final int discardedPoints;
+        /** Points not sent because their measurement is Paused. */
+        final int pausedPoints;
+
+        BuildResult(Points.Builder pointsBuilder, Set<String> usedUUIDs, boolean hasSkippedArrays,
+                    boolean hasFailedCreations, int discardedPoints, int pausedPoints) {
+            this.pointsBuilder = pointsBuilder;
+            this.usedUUIDs = usedUUIDs;
+            this.hasSkippedArrays = hasSkippedArrays;
+            this.hasFailedCreations = hasFailedCreations;
+            this.discardedPoints = discardedPoints;
+            this.pausedPoints = pausedPoints;
+        }
+    }
+
+    /** Tracks array base paths for which measurement creation is in progress on a background thread. */
+    private final Set<String> asyncArrayCreations = ConcurrentHashMap.newKeySet();
+
+    /**
+     * Last-known complete array value per base path (index → value). Ignition historizes
+     * array elements independently and, thanks to per-element deadbands, only sends the
+     * indices that actually changed — e.g. changing [1,2,3,4] to [1,2,4,5] arrives as just
+     * {2:4, 3:5}. We merge those partial updates into this map so the full array [1,2,4,5]
+     * is stored instead of the truncated [4,5]. On a cache miss (first write, or the first
+     * write after a gateway restart) the map is seeded from Factry's last stored array
+     * value. This is not the most efficient approach, but array tags are relatively rare.
+     */
+    private final Map<String, java.util.TreeMap<Integer, Object>> lastArrayValues = new ConcurrentHashMap<>();
+
+    private BuildResult buildPoints(List<AtomicPoint<?>> points) {
+        Points.Builder pointsBuilder = Points.newBuilder();
+        Set<String> usedUUIDs = new HashSet<>();
+        boolean hasFailedCreations = false;
+        int discardedPoints = 0;
+        int pausedPoints = 0;
+        Map<MeasurementCache.WriteRefusal, List<String>> newlyRefused =
+                new EnumMap<>(MeasurementCache.WriteRefusal.class);
+        // Array element changes are collected here and merged into full snapshots below.
+        Map<String, List<ArrayPointMerger.ArrayElement>> arrayElementsByPath = new HashMap<>();
+
+        // First pass: collect unique tag paths so all missing measurements can be
+        // created in a single gRPC call instead of one per tag.
+        Map<String, Object> tagPathToValue = new LinkedHashMap<>();
+        for (AtomicPoint<?> point : points) {
+            String tagPath = TagPathUtil.storagePathToStoredPath(point.source().toString());
+            Object value = point.value();
+
+            logger.debug("Point: tagPath=" + tagPath
+                    + ", value=" + value
+                    + ", valueType=" + (value != null ? value.getClass().getName() : "null"));
+
+            ArrayPointMerger.ArrayRef ref = ArrayPointMerger.parseArrayPath(tagPath);
+            if (ref != null) {
+                long ts = point.timestamp().toEpochMilli();
+                arrayElementsByPath
+                        .computeIfAbsent(ref.basePath, k -> new ArrayList<>())
+                        .add(new ArrayPointMerger.ArrayElement(ref.index, ts, value, point.quality().getCode()));
+                continue;
+            }
+
+            if (value != null) {
+                // putIfAbsent: only the first value is used for data-type inference.
+                tagPathToValue.putIfAbsent(tagPath, value);
+            }
+        }
+
+        // Batch-resolve UUIDs — at most one CreateMeasurementsRequest for the whole flush.
+        Map<String, String> uuidByPath = measurementCache.batchGetOrCreateUUIDs(tagPathToValue, grpcClient);
+
+        // Second pass: build point protos using the resolved UUIDs.
+        for (AtomicPoint<?> point : points) {
+            String tagPath = TagPathUtil.storagePathToStoredPath(point.source().toString());
+            Object value = point.value();
+
+            if (value == null) {
+                logger.debug("Skipping point for '" + tagPath + "': null value");
+                continue;
+            }
+            if (ArrayPointMerger.parseArrayPath(tagPath) != null) {
+                continue; // handled in the array block below
+            }
+
+            String measurementUUID = uuidByPath.get(tagPath);
+            if (measurementUUID == null || measurementUUID.isEmpty()) {
+                // Every value type an AtomicPoint can hold has a Factry data type (AtomicPoint is
+                // sealed and DataPointFactory only builds Boolean, the Java number types, String
+                // and Date), so a missing UUID means a refusal or a failed creation, never a skip.
+                MeasurementCache.WriteRefusal refusal = refusal(tagPath,
+                        measurementCache.writeTarget(tagPath, grpcClient.getCollectorUUID()), newlyRefused);
+                if (refusal == MeasurementCache.WriteRefusal.PAUSED) {
+                    pausedPoints++;
+                } else if (refusal != null) {
+                    discardedPoints++;
+                } else {
+                    logger.debug("Deferring point for '" + tagPath + "': measurement not created yet");
+                    hasFailedCreations = true;
+                }
+                continue;
+            }
+
+            written(tagPath);
+            Point.Builder pb = Point.newBuilder()
+                    .setMeasurementUUID(measurementUUID)
+                    .setTimestamp(Timestamps.fromMillis(point.timestamp().toEpochMilli()));
+
+            if (isNonFinite(value)) {
+                // Factry stores NaN and Infinity as 0, and keeps the status we send unless it is
+                // Good. Send no value and Bad, so the point reads back as Bad instead of a real 0.
+                pb.setStatus("Bad");
+                warnOnce("non-finite", tagPath, "Tag '" + tagPath + "' has value " + value
+                        + "; Factry cannot store it, storing a Bad point instead");
+            } else {
+                Value protoValue = toProtoValue(value);
+                if (losesPrecision(value, protoValue)) {
+                    warnOnce("precision", tagPath, "Tag '" + tagPath + "' has value " + value
+                            + ", which Factry stores as the nearest double " + protoValue.getNumberValue()
+                            + "; integers above 2^53 lose their low digits");
+                }
+                pb.setStatus(qualityToStatus(point.quality().getCode())).setValue(protoValue);
+            }
+
+            pointsBuilder.addPoints(pb.build());
+            usedUUIDs.add(measurementUUID);
+        }
+
+        // Process grouped array points — combine into single points with ListValue.
+        // Array measurement creation can block for seconds (polling for visibility),
+        // which would stall the S&F forwarding thread. Instead, we only use the cache
+        // for instant lookup and trigger creation asynchronously if missing.
+        boolean hasSkippedArrays = false;
+        for (Map.Entry<String, List<ArrayPointMerger.ArrayElement>> entry : arrayElementsByPath.entrySet()) {
+            String basePath = entry.getKey();
+            java.util.TreeMap<Long, java.util.TreeMap<Integer, ArrayPointMerger.ArrayElement>> byTimestamp =
+                    ArrayPointMerger.groupByTimestamp(entry.getValue());
+            // Any element serves to detect the array's element type for async creation.
+            ArrayPointMerger.ArrayElement firstElement = byTimestamp.firstEntry().getValue().firstEntry().getValue();
+
+            // Non-blocking: only check the cache, don't create. The target is looked up once,
+            // so a cache refresh in between cannot change it under us.
+            String collectorUUID = grpcClient.getCollectorUUID();
+            Measurement target = measurementCache.writeTarget(basePath, collectorUUID);
+            MeasurementCache.WriteRefusal refusal = refusal(basePath, target, newlyRefused);
+            if (refusal == MeasurementCache.WriteRefusal.PAUSED) {
+                // Keep the merged array current, so the first value after the resume is the
+                // whole array as it is then; only the rows are dropped.
+                mergeArray(basePath, target.getUuid(), byTimestamp);
+                pausedPoints += entry.getValue().size();
+                continue;
+            }
+            if (refusal != null) {
+                discardedPoints += entry.getValue().size();
+                continue;
+            }
+            String measurementUUID = MeasurementCache.writeRefusal(target, collectorUUID) == null
+                    ? (target != null ? target.getUuid() : null) : null;
+            if (measurementUUID == null || measurementUUID.isEmpty()) {
+                // Trigger async measurement creation if not already in progress
+                if (asyncArrayCreations.add(basePath)) {
+                    String elementType = measurementCache.dataTypeFor(basePath, firstElement.value);
+                    String arrayDataType = "[]" + (elementType != null ? elementType : "string");
+                    logger.info("Array measurement '" + basePath + "' not in cache, creating asynchronously (" + arrayDataType + ")");
+                    Thread creator = new Thread(() -> {
+                        try {
+                            measurementCache.getOrCreateUUID(basePath, grpcClient, arrayDataType);
+                        } finally {
+                            asyncArrayCreations.remove(basePath);
+                        }
+                    }, "array-measurement-creator-" + basePath);
+                    creator.setDaemon(true);
+                    creator.start();
+                }
+                hasSkippedArrays = true;
+                continue;
+            }
+
+            List<ArrayPointMerger.ArraySnapshot> snapshots = mergeArray(basePath, measurementUUID, byTimestamp);
+            if (snapshots == null) {
+                // The last stored value could not be read yet. Send the rest of the flush and
+                // let store and forward retry it, so one array doesn't hold back the other tags.
+                hasSkippedArrays = true;
+                continue;
+            }
+            written(basePath);
+
+            for (ArrayPointMerger.ArraySnapshot snap : snapshots) {
+                Point.Builder pb = Point.newBuilder()
+                        .setMeasurementUUID(measurementUUID)
+                        .setTimestamp(Timestamps.fromMillis(snap.timestampMillis));
+
+                // Build a ListValue from the full merged array, in index order.
+                com.google.protobuf.ListValue.Builder listBuilder = com.google.protobuf.ListValue.newBuilder();
+                Object nonFinite = snap.values.stream().filter(PointWriter::isNonFinite).findFirst().orElse(null);
+                if (nonFinite != null) {
+                    // Same as a scalar NaN: Factry cannot store it (one NaN element turns the whole
+                    // row into an empty array), so send the row as Bad without a value.
+                    pb.setStatus("Bad");
+                    warnOnce("non-finite", basePath, "Array tag '" + basePath + "' has element value " + nonFinite
+                            + "; Factry cannot store it, storing a Bad point instead");
+                } else {
+                    for (Object val : snap.values) {
+                        appendArrayValue(listBuilder, val);
+                    }
+                    pb.setStatus(qualityToStatus(snap.qualityCode))
+                            .setValue(Value.newBuilder().setListValue(listBuilder));
+                }
+
+                pointsBuilder.addPoints(pb.build());
+                logger.debug("Built array point for '" + basePath + "' at " + snap.timestampMillis
+                        + " with " + listBuilder.getValuesCount() + " elements");
+            }
+            usedUUIDs.add(measurementUUID);
+        }
+
+        newlyRefused.forEach((refusal, tagPaths) -> logger.warn(summary(refusal),
+                tagPaths.size(), RefusalLog.names(tagPaths, 5)));
+        return new BuildResult(pointsBuilder, usedUUIDs, hasSkippedArrays, hasFailedCreations,
+                discardedPoints, pausedPoints);
+    }
+
+    /**
+     * Merge the incoming (possibly partial) element changes into the last-known full array so
+     * unchanged elements are preserved, and return one row per timestamp (see
+     * {@link ArrayPointMerger#mergeUpdates}), or null when Factry's last value could not be
+     * read yet and the array should wait for the store and forward retry.
+     */
+    private List<ArrayPointMerger.ArraySnapshot> mergeArray(String basePath, String measurementUUID,
+            java.util.TreeMap<Long, java.util.TreeMap<Integer, ArrayPointMerger.ArrayElement>> byTimestamp) {
+        java.util.TreeMap<Integer, Object> state =
+                lastArrayValues.computeIfAbsent(basePath, k -> new java.util.TreeMap<>());
+        synchronized (state) {
+            // Cache miss (first store for this array, or first after a restart): seed from
+            // Factry's last stored value so a partial update from Ignition doesn't truncate it.
+            if (state.isEmpty() && !seedArrayStateFromFactry(basePath, measurementUUID, state)) {
+                return null;
+            }
+            return ArrayPointMerger.mergeUpdates(state, byTimestamp);
+        }
+    }
+
+    /**
+     * Why values for {@code tagPath} are not written to {@code target}, its measurement in the
+     * cache, or null when they may be (or the measurement is still to be resolved). A refusal
+     * the log has not reported yet is added to {@code newlyRefused}, for one warning per kind
+     * and flush.
+     */
+    private MeasurementCache.WriteRefusal refusal(String tagPath, Measurement target,
+            Map<MeasurementCache.WriteRefusal, List<String>> newlyRefused) {
+        String collectorUUID = grpcClient.getCollectorUUID();
+        MeasurementCache.WriteRefusal refusal = measurementCache.writeRefusal(tagPath, target, collectorUUID);
+        if (refusal != null && refusalLog.refused(tagPath, refusal)) {
+            newlyRefused.computeIfAbsent(refusal, k -> new ArrayList<>()).add(tagPath);
+            logger.debug("Not writing values for '{}' ({}): measurement {} has status '{}' and belongs to"
+                    + " collector {}; this collector is {}", tagPath, refusal, target.getUuid(),
+                    target.getStatus(), target.getCollectorUUID(), collectorUUID);
+        }
+        return refusal;
+    }
+
+    /** The warning for the tags newly refused in a flush; takes their count and names. */
+    private static String summary(MeasurementCache.WriteRefusal refusal) {
+        switch (refusal) {
+            case PAUSED:
+                return "The Factry measurement of {} tag(s) is Paused: {}. Values are dropped while it is"
+                        + " Paused; from the first cache refresh after it is Active again, new values are"
+                        + " stored. Logged once per tag.";
+            case OTHER_COLLECTOR:
+                return "The Factry measurement of {} tag(s) belongs to another collector: {}. Factry would"
+                        + " answer OK and drop their values, so they are discarded. Rename the tags, or move"
+                        + " the measurements to this collector in Factry. Logged once per tag.";
+            case NOT_ACTIVE:
+            default:
+                return "The Factry measurement of {} tag(s) exists but is not Active (for example"
+                        + " Discovered): {}. Their values are discarded until it is Active, from the first"
+                        + " cache refresh after that; it is not created again, which would only add a"
+                        + " duplicate. Logged once per tag.";
+        }
+    }
+
+    /** Record that {@code tagPath} was written, so a later refusal is logged again. */
+    private void written(String tagPath) {
+        if (refusalLog.written(tagPath) == MeasurementCache.WriteRefusal.PAUSED) {
+            logger.info("The Factry measurement of '{}' is Active again; its new values are stored", tagPath);
+        }
+    }
+
+    /** Tag paths (prefixed with the kind of problem) already warned about, to warn once per tag. */
+    private final Set<String> warnedTags = ConcurrentHashMap.newKeySet();
+
+    private void warnOnce(String kind, String tagPath, String message) {
+        if (warnedTags.add(kind + ":" + tagPath)) {
+            logger.warn(message);
+        }
+    }
+
+    /**
+     * Convert a Java value to the protobuf Value Factry gets. Dates go as epoch milliseconds in a
+     * number measurement: they stay exact (well below 2^53) and Factry can chart them. The
+     * measurement is marked DateTime at creation, so the query engine turns them back into Dates.
+     * An ISO string would need a string measurement, which Ignition's raw queries return no rows for.
+     */
+    private static Value toProtoValue(Object value) {
+        if (value instanceof Boolean) {
+            return Value.newBuilder().setBoolValue((Boolean) value).build();
+        } else if (value instanceof java.util.Date) {
+            return Value.newBuilder().setNumberValue(((java.util.Date) value).getTime()).build();
+        } else if (value instanceof Number) {
+            return Value.newBuilder().setNumberValue(((Number) value).doubleValue()).build();
+        } else if (value != null) {
+            return Value.newBuilder().setStringValue(value.toString()).build();
+        }
+        return Value.newBuilder().setNullValue(com.google.protobuf.NullValue.NULL_VALUE).build();
+    }
+
+    private static boolean isNonFinite(Object value) {
+        return (value instanceof Double || value instanceof Float)
+                && !Double.isFinite(((Number) value).doubleValue());
+    }
+
+    /**
+     * True when a Long does not survive the conversion to double. Factry keeps numbers as float64
+     * and parses numeric strings into the same float64, so there is no lossless way to send it to
+     * a number measurement. Compared as BigDecimal because casting back saturates at Long.MAX_VALUE.
+     */
+    private static boolean losesPrecision(Object value, Value sent) {
+        return value instanceof Long
+                && new java.math.BigDecimal(sent.getNumberValue())
+                        .compareTo(java.math.BigDecimal.valueOf((Long) value)) != 0;
+    }
+
+    /** Append a Java value to a protobuf ListValue as the matching Value kind. */
+    private static void appendArrayValue(com.google.protobuf.ListValue.Builder listBuilder, Object val) {
+        listBuilder.addValues(toProtoValue(val));
+    }
+
+    private static final String ARRAYS_NOT_READY =
+            "Array measurement being created or its last value not read yet, retry later";
+
+    /** When the "still waiting" warning was last logged, per array base path. */
+    private final Map<String, Long> arraySeedWarnedAt = new ConcurrentHashMap<>();
+    static final long ARRAY_SEED_WARN_EVERY_MS = 5 * 60_000L;
+    /** For tests. */
+    java.util.function.LongSupplier clock = System::currentTimeMillis;
+
+    /**
+     * Seed {@code state} with the elements of the most recent array value stored in Factry
+     * for the given measurement. Used on a cache miss so that a partial element update from
+     * Ignition is merged onto the full array rather than truncating it.
+     *
+     * @return false when the read failed: the array then waits for the store and forward retry,
+     *     while the rest of the flush is sent. It never gives up and merges onto the empty
+     *     state: the unchanged elements would be missing for good, and Factry stores a row with
+     *     a null element as an empty array. Store and forward keeps the array's values until a
+     *     read works.
+     */
+    private boolean seedArrayStateFromFactry(String basePath, String measurementUUID,
+                                             java.util.TreeMap<Integer, Object> state) {
+        try {
+            QueryTimeseriesRequest req = QueryTimeseriesRequest.newBuilder()
+                    .addMeasurementUUIDs(measurementUUID)
+                    .setStart(Timestamps.fromMillis(0))
+                    .setEnd(Timestamps.fromMillis(System.currentTimeMillis() + 86_400_000L))
+                    .setDesc(true)
+                    .setLimit(1)
+                    .build();
+            QueryTimeseriesResponse reply = grpcClient.queryTimeseries(req);
+            arraySeedWarnedAt.remove(basePath);
+            for (Series series : reply.getSeriesList()) {
+                for (SeriesPoint pt : series.getDataPointsList()) {
+                    Value v = pt.getValue();
+                    if (v.getKindCase() == Value.KindCase.LIST_VALUE) {
+                        List<Value> list = v.getListValue().getValuesList();
+                        for (int i = 0; i < list.size(); i++) {
+                            state.put(i, FactryQueryEngine.protoValueToJava(list.get(i)));
+                        }
+                        logger.debug("Seeded array state for '" + basePath + "' with "
+                                + list.size() + " elements from Factry");
+                    }
+                }
+            }
+            return true;
+        } catch (Exception e) {
+            long now = clock.getAsLong();
+            Long last = arraySeedWarnedAt.get(basePath);
+            if (last == null || now - last >= ARRAY_SEED_WARN_EVERY_MS) {
+                arraySeedWarnedAt.put(basePath, now);
+                logger.warn("Could not read the last value of array '" + basePath + "' from Factry ("
+                        + e.getMessage() + "); its values wait in store and forward until it can be read");
+            }
+            return false;
+        }
+    }
+
+    static String qualityToStatus(int qualityCode) {
+        // Ignition 8 encodes the quality LEVEL in the top two bits of the 32-bit code, NOT the
+        // legacy 0..255 scale. Decode via the QualityCode API so an Uncertain code (~1.07e9) is
+        // recognised as Uncertain instead of tripping a numeric >=192 "Good" threshold. Bad and
+        // Error both map to Factry's "Bad" status.
+        switch (QualityCode.getLevel(qualityCode)) {
+            case Good:
+                return "Good";
+            case Uncertain:
+                return "Uncertain";
+            default:
+                return "Bad";
+        }
+    }
+}

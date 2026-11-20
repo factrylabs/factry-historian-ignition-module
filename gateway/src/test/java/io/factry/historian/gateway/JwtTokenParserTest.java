@@ -161,6 +161,22 @@ class JwtTokenParserTest {
                 .encodeToString(value.getBytes(StandardCharsets.UTF_8));
     }
 
+    // -- normalize --------------------------------------------------------------
+
+    @Test
+    void normalize_badCharacterOnlyInTheSignature_isRefused() {
+        // Header and payload decode fine, so only the character check can catch this.
+        String token = buildToken("{\"uuid\":\"abc-123\"}") + "\"x";
+        IllegalArgumentException e = assertThrows(IllegalArgumentException.class, () -> JwtTokenParser.normalize(token));
+        assertFalse(e.getMessage().contains("abc"));
+    }
+
+    @Test
+    void normalize_invisibleCharactersFromACopy_areRemoved() {
+        String token = buildToken("{\"uuid\":\"abc-123\"}");
+        assertEquals(token, JwtTokenParser.normalize("\uFEFF" + token + "\u200B\n"));
+    }
+
     private static JsonObject parseJson(String json) {
         return com.inductiveautomation.ignition.common.gson.JsonParser.parseString(json).getAsJsonObject();
     }
