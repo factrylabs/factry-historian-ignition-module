@@ -1041,6 +1041,47 @@ class FactryIntegrationTest {
         pass("queryTagHistory " + mode);
     }
 
+    @Test
+    @Order(104)
+    @DisplayName("Average is time-weighted and holds the value from before the window")
+    void testTimeWeightedAverage() throws Exception {
+        section("Time-weighted Average for tags stored on change");
+
+        long hourStart = 1700150400000L; // 2023-11-16T16:00:00Z
+        long hourEnd = hourStart + 3_600_000L;
+
+        // 100 for the first minute, then 0 for the rest of the hour. The mean of the two
+        // samples is 50; the time-weighted average is (100*1 + 0*59) / 60 = 1.667.
+        String step = TEST_PREFIX + "/TwaStep";
+        String stepUuid = createMeasurement(storedTagPath(step), "number");
+        grpcStub.createPoints(Points.newBuilder()
+                .addPoints(buildPoint(stepUuid, hourStart, Value.newBuilder().setNumberValue(100).build()))
+                .addPoints(buildPoint(stepUuid, hourStart + 60_000L, Value.newBuilder().setNumberValue(0).build()))
+                .build());
+
+        // 10 from before the window, 20 from half way: (10*30 + 20*30) / 60 = 15. The mean of
+        // the samples inside the window is 20.
+        String seed = TEST_PREFIX + "/TwaSeed";
+        String seedUuid = createMeasurement(storedTagPath(seed), "number");
+        grpcStub.createPoints(Points.newBuilder()
+                .addPoints(buildPoint(seedUuid, hourStart - 600_000L, Value.newBuilder().setNumberValue(10).build()))
+                .addPoints(buildPoint(seedUuid, hourStart + 1_800_000L, Value.newBuilder().setNumberValue(20).build()))
+                .build());
+
+        // One sample an hour before the window and none inside: the value held all hour is 42.
+        String flat = TEST_PREFIX + "/TwaFlat";
+        String flatUuid = createMeasurement(storedTagPath(flat), "number");
+        grpcStub.createPoints(Points.newBuilder()
+                .addPoints(buildPoint(flatUuid, hourStart - 3_600_000L, Value.newBuilder().setNumberValue(42).build()))
+                .build());
+        Thread.sleep(2000);
+
+        assertTagHistoryAgg(qualifiedPath(HISTORIAN_NAME, step), hourStart, hourEnd, "Average", 1.667, 0.01);
+        assertTagHistoryAgg(qualifiedPath(HISTORIAN_NAME, step), hourStart, hourEnd, "SimpleAverage", 50.0, 0.01);
+        assertTagHistoryAgg(qualifiedPath(HISTORIAN_NAME, seed), hourStart, hourEnd, "Average", 15.0, 0.01);
+        assertTagHistoryAgg(qualifiedPath(HISTORIAN_NAME, flat), hourStart, hourEnd, "Average", 42.0, 0.01);
+    }
+
     // -------------------------------------------------------------------------
     // Store paths & metadata
     // -------------------------------------------------------------------------

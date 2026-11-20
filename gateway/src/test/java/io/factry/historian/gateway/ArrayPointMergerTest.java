@@ -118,6 +118,17 @@ class ArrayPointMergerTest {
     }
 
     @Test
+    void mergeUpdates_anElementPastAGapKeepsItsIndex() {
+        TreeMap<Integer, Object> state = seededState(1.0, 2.0);
+
+        List<ArrayPointMerger.ArraySnapshot> snaps = ArrayPointMerger.mergeUpdates(state,
+                ArrayPointMerger.groupByTimestamp(List.of(new ArrayPointMerger.ArrayElement(3, 100L, 5.0, GOOD))));
+
+        assertEquals(Arrays.asList(1.0, 2.0, null, 5.0), snaps.get(0).values,
+                "index 3 stays index 3; shifting it to index 2 would store it under the wrong element");
+    }
+
+    @Test
     void mergeUpdates_singleTimestampProducesOneMergedRow() {
         TreeMap<Integer, Object> state = seededState(1.0, 2.0, 3.0, 4.0);
 

@@ -124,4 +124,30 @@ class FactryHistorianSettingsTest {
         IllegalArgumentException e = assertThrows(IllegalArgumentException.class, s::validate);
         assertTrue(e.getMessage().toLowerCase().contains("custom ca certificate"), e.getMessage());
     }
+
+    // --- token ---
+
+    @Test
+    void applyTokenDefaults_tokenThatIsNotAJwt_failsWithoutShowingTheToken() {
+        for (String token : new String[]{"eyJhbGciOi\"quoted\".eyJ1dWlkIjoi.secretPart", "onlyOnePart", "a.b", "a.b.c.d"}) {
+            IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+                    () -> new FactryHistorianSettings().applyTokenDefaults(token));
+            assertTrue(e.getMessage().startsWith("Invalid token: not a valid JWT"));
+            assertFalse(e.getMessage().contains("secretPart") || e.getMessage().contains("onlyOnePart"));
+        }
+    }
+
+    @Test
+    void applyTokenDefaults_blankToken_fails() {
+        for (String token : new String[]{null, "", " \n "}) {
+            assertThrows(IllegalArgumentException.class, () -> new FactryHistorianSettings().applyTokenDefaults(token));
+        }
+    }
+
+    @Test
+    void toString_leavesTheTokenOut() {
+        FactryHistorianSettings s = validSettings();
+        s.setToken("header.payload.signature");
+        assertFalse(s.toString().contains("signature"));
+    }
 }
