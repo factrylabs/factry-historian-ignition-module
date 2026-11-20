@@ -49,7 +49,13 @@ final class ArrayPointMerger {
         if (!m.matches()) {
             return null;
         }
-        return new ArrayRef(m.group(1), Integer.parseInt(m.group(2)));
+        try {
+            return new ArrayRef(m.group(1), Integer.parseInt(m.group(2)));
+        } catch (NumberFormatException e) {
+            // An index too large for an int can't name an element; treated like any other
+            // unknown path, so it doesn't fail the reads of the other pens.
+            return null;
+        }
     }
 
     /** One element change within an array update. */

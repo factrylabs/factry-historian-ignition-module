@@ -33,6 +33,8 @@ import java.util.regex.Pattern;
  * the query end, leaves out buckets before the first sample, refuses group by and booleans, and
  * applies a {@code status} tag filter by exact match), and {@code last}/{@code count}/{@code mean}/
  * {@code min}/{@code max}/{@code sum}/{@code spread}/{@code stddev} per status with fill "none".
+ * An array measurement ({@code []number}, ...) holds one list per row and takes only {@code first},
+ * {@code last} and {@code count}.
  * Buckets start at the query start. The gRPC channel is never used.
  */
 class TwaFakeFactry extends FactryGrpcClient {
@@ -65,6 +67,13 @@ class TwaFakeFactry extends FactryGrpcClient {
                         Value.newBuilder().setStringValue("DateTime").build())));
     }
 
+    /** Adds a measurement whose ignitionDataType setting is {@code ignitionDataType} (e.g. "DateTimeArray"). */
+    String addMeasurement(String name, String datatype, String ignitionDataType) {
+        return addMeasurement(Measurement.newBuilder().setName(name).setDatatype(datatype)
+                .setSettings(Struct.newBuilder().putFields(MeasurementCache.IGNITION_DATA_TYPE_SETTING,
+                        Value.newBuilder().setStringValue(ignitionDataType).build())));
+    }
+
     private String addMeasurement(Measurement.Builder m) {
         String uuid = "uuid-" + (measurements.size() + 1);
         measurements.put(uuid, m.setUuid(uuid).setStatus("Active").setCollectorUUID("collector").build());
@@ -82,6 +91,17 @@ class TwaFakeFactry extends FactryGrpcClient {
 
     void add(String uuid, long ts, boolean value, String status) {
         points.get(uuid).add(new Pt(ts, Value.newBuilder().setBoolValue(value).build(), status));
+    }
+
+    /** An array value, stored the way PointWriter stores an array tag: one list per row. */
+    void add(String uuid, long ts, List<?> values, String status) {
+        com.google.protobuf.ListValue.Builder list = com.google.protobuf.ListValue.newBuilder();
+        for (Object v : values) {
+            list.addValues(v instanceof String str ? Value.newBuilder().setStringValue(str).build()
+                    : v instanceof Boolean b ? Value.newBuilder().setBoolValue(b).build()
+                    : Value.newBuilder().setNumberValue(((Number) v).doubleValue()).build());
+        }
+        points.get(uuid).add(new Pt(ts, Value.newBuilder().setListValue(list).build(), status));
     }
 
     /** The raw (not aggregated) requests the module made. */
@@ -127,6 +147,15 @@ class TwaFakeFactry extends FactryGrpcClient {
             all.removeIf(p -> statusFilter != null && !p.status().equals(statusFilter));
             all.sort(Comparator.comparingLong(Pt::ts));
 
+            String datatype = measurements.get(uuid).getDatatype();
+            if (request.hasAggregation() && datatype.startsWith("[]")
+                    && !List.of("first", "last", "count").contains(request.getAggregation().getName())) {
+                // Factry 8.2.3 aggregates an array measurement only with first, last and count
+                // (checked live).
+                throw Status.UNKNOWN.withDescription("error building query: aggregation "
+                        + request.getAggregation().getName() + " not supported for datatype " + datatype)
+                        .asRuntimeException();
+            }
             if (request.hasAggregation() && request.getAggregation().getName().equals("twa")) {
                 if (byStatus) {
                     throw Status.INVALID_ARGUMENT

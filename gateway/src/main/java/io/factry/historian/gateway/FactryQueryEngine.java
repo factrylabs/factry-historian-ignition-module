@@ -354,20 +354,22 @@ public class FactryQueryEngine extends AbstractQueryEngine {
                 return Optional.of(0);
             }
 
-            // Map query keys to measurement UUIDs
-            List<String> measurementUUIDs = new ArrayList<>();
-            Map<String, RawQueryKey> uuidToKeyMap = new HashMap<>();
+            // Map query keys to measurement UUIDs. Several keys can read one measurement: the
+            // elements of an array tag (Arr[0], Arr[1], ...) are all stored in measurement Arr.
+            Map<String, List<RawQueryKey>> keysByUuid = new LinkedHashMap<>();
             Map<RawQueryKey, QualityCode> failures = new HashMap<>();
 
             for (RawQueryKey key : options.getQueryKeys()) {
                 QualifiedPath source = key.source();
                 String tagPath = toStoredTagPath(source);
                 // Only query keys that resolved to a node; mapKeysToNodes omits the rest.
-                String uuid = keyToNode.containsKey(key) ? lookupUUID(tagPath) : null;
+                HistoricalNode node = keyToNode.get(key);
+                String uuid = measurementUUID(node);
 
-                if (uuid != null) {
-                    measurementUUIDs.add(uuid);
-                    uuidToKeyMap.put(uuid, key);
+                if (node instanceof FactryRecord r && r.isArray()) {
+                    failures.put(key, wholeArray(tagPath));
+                } else if (uuid != null) {
+                    keysByUuid.computeIfAbsent(uuid, k -> new ArrayList<>()).add(key);
                     if (settings.isDebugLogging()) {
                         logger.debug("Mapped " + source + " -> " + tagPath + " -> " + uuid);
                     }
@@ -379,6 +381,7 @@ public class FactryQueryEngine extends AbstractQueryEngine {
                 }
             }
 
+            List<String> measurementUUIDs = new ArrayList<>(keysByUuid.keySet());
             if (measurementUUIDs.isEmpty()) {
                 held.initialize(failures);
                 processor.onComplete();
@@ -401,9 +404,9 @@ public class FactryQueryEngine extends AbstractQueryEngine {
             // the first returnSize, so never fetch more per series.
             Integer returnSize = options.getReturnSize().filter(n -> n > 0).orElse(null);
 
-            // A measurement now spans multiple status-series. Collect all of a measurement's points
+            // A measurement now spans multiple status-series. Collect all of a pen's points
             // (each carrying its series' quality), then merge-sort by timestamp before emitting.
-            Map<String, List<RawPt>> pointsByUuid = new LinkedHashMap<>();
+            Map<RawQueryKey, List<RawPt>> pointsByKey = new LinkedHashMap<>();
 
             // Read in pages: one answer for a long range does not fit in a gRPC message. Factry
             // applies limit and offset to each series (measurement and status) on its own, in time
@@ -427,9 +430,10 @@ public class FactryQueryEngine extends AbstractQueryEngine {
                 }
                 // Ask each pen still paging for its share of what is left under maxRawPoints, plus
                 // one. If every series comes back full, the range holds more than the cap and the
-                // read fails below; if not, the pens that came back short are done.
+                // read fails below; if not, the pens that came back short are done. A point of an
+                // array measurement gives a point to each of its element pens.
                 long room = Math.max(0, maxRawPoints - collected);
-                limit = Math.min(limit, room / pending.size() + 1);
+                limit = Math.min(limit, room / pending.stream().mapToInt(u -> keysByUuid.get(u).size()).sum() + 1);
                 QueryTimeseriesResponse reply;
                 try {
                     reply = grpcClient.queryTimeseries(reqBuilder
@@ -455,7 +459,7 @@ public class FactryQueryEngine extends AbstractQueryEngine {
                     if (failed.isEmpty()) {
                         throw e;
                     }
-                    failed.forEach((uuid, why) -> failures.put(uuidToKeyMap.get(uuid), penFailed(why)));
+                    failed.forEach((uuid, why) -> keysByUuid.get(uuid).forEach(k -> failures.put(k, penFailed(why))));
                     refused.addAll(failed.keySet());
                     // It also fails when every pen is refused, as when Factry's own database is
                     // down (UNKNOWN on every call). Raw rows come only from points, so Bad_Failure
@@ -467,7 +471,7 @@ public class FactryQueryEngine extends AbstractQueryEngine {
                     // Bad_Failure from the context; old points would make it look partly good),
                     // and with returnSize they may have decided which other pens stopped paging.
                     // Rare, so reading again is cheaper than undoing that.
-                    pointsByUuid.clear();
+                    pointsByKey.clear();
                     lastTsBySeries.clear();
                     collected = 0;
                     offset = 0;
@@ -502,7 +506,7 @@ public class FactryQueryEngine extends AbstractQueryEngine {
                 Map<String, Long> nextFrom = new HashMap<>();
                 for (Series series : reply.getSeriesList()) {
                     String uuid = series.hasMeasurementUUID() ? series.getMeasurementUUID() : "";
-                    if (!uuidToKeyMap.containsKey(uuid)) {
+                    if (!keysByUuid.containsKey(uuid)) {
                         continue;
                     }
                     if (series.getDataPointsCount() >= limit) {
@@ -511,14 +515,13 @@ public class FactryQueryEngine extends AbstractQueryEngine {
                                 series.getDataPoints(series.getDataPointsCount() - 1).getTimestamp(), Math::min);
                     }
                     QualityCode quality = statusToQuality(seriesStatus(series));
-                    RawQueryKey key = uuidToKeyMap.get(uuid);
-                    boolean asDate = isDateTime(keyToNode.get(key));
-                    List<RawPt> pts = pointsByUuid.computeIfAbsent(uuid, k -> new ArrayList<>());
-                    for (SeriesPoint pt : series.getDataPointsList()) {
-                        Object value = protoValueToJava(pt.getValue());
-                        pts.add(new RawPt(key, pt.getTimestamp(), asDate ? toDate(value) : value, quality));
+                    for (RawQueryKey key : keysByUuid.get(uuid)) {
+                        List<RawPt> pts = pointsByKey.computeIfAbsent(key, k -> new ArrayList<>());
+                        for (SeriesPoint pt : series.getDataPointsList()) {
+                            pts.add(rawPoint(key, keyToNode.get(key), pt, quality));
+                        }
+                        collected += series.getDataPointsCount();
                     }
-                    collected += series.getDataPointsCount();
                     if (series.getDataPointsCount() > 0) {
                         lastTsBySeries.put(uuid + "|" + seriesStatus(series),
                                 series.getDataPoints(series.getDataPointsCount() - 1).getTimestamp());
@@ -529,11 +532,11 @@ public class FactryQueryEngine extends AbstractQueryEngine {
                 // Otherwise every pen would hold up to returnSize points and many pens would hit
                 // the cap although few points are wanted.
                 if (returnSize != null && collected > returnSize) {
-                    long[] times = pointsByUuid.values().stream().flatMap(List::stream)
+                    long[] times = pointsByKey.values().stream().flatMap(List::stream)
                             .mapToLong(RawPt::ts).sorted().toArray();
                     long last = times[returnSize - 1];
                     collected = 0;
-                    for (List<RawPt> pts : pointsByUuid.values()) {
+                    for (List<RawPt> pts : pointsByKey.values()) {
                         pts.removeIf(p -> p.ts() > last);
                         collected += pts.size();
                     }
@@ -569,19 +572,19 @@ public class FactryQueryEngine extends AbstractQueryEngine {
                 bounded.removeAll(refused);
                 long rangeStart = options.getTimeRange().get().startTime().toEpochMilli();
                 long rangeEnd = options.getTimeRange().get().endTime().toEpochMilli();
-                List<Map<String, RawPt>> bounds = new ArrayList<>();
-                bounds.add(boundingPoints(sampleBeforeRequest(bounded, rangeStart), true, uuidToKeyMap, keyToNode));
+                List<Map<RawQueryKey, RawPt>> bounds = new ArrayList<>();
+                bounds.add(boundingPoints(sampleBeforeRequest(bounded, rangeStart), true, keysByUuid, keyToNode));
                 // Nothing is stored after now, so a range that ends later has no value after it.
                 long nowMs = now.getAsLong();
                 if (rangeEnd < nowMs) {
                     bounds.add(boundingPoints(QueryTimeseriesRequest.newBuilder()
                             .addAllMeasurementUUIDs(bounded).addGroupBy("status")
                             .setStart(Timestamps.fromMillis(rangeEnd)).setEnd(Timestamps.fromMillis(nowMs))
-                            .setLimit(1).build(), false, uuidToKeyMap, keyToNode));
+                            .setLimit(1).build(), false, keysByUuid, keyToNode));
                 }
-                for (Map<String, RawPt> byUuid : bounds) {
-                    for (Map.Entry<String, RawPt> e : byUuid.entrySet()) {
-                        List<RawPt> pts = pointsByUuid.computeIfAbsent(e.getKey(), k -> new ArrayList<>());
+                for (Map<RawQueryKey, RawPt> byKey : bounds) {
+                    for (Map.Entry<RawQueryKey, RawPt> e : byKey.entrySet()) {
+                        List<RawPt> pts = pointsByKey.computeIfAbsent(e.getKey(), k -> new ArrayList<>());
                         // The range end is exclusive, so the value after it is a new sample; a
                         // Factry that included the end would otherwise give that sample twice.
                         if (pts.stream().noneMatch(p -> p.ts() == e.getValue().ts())) {
@@ -599,7 +602,7 @@ public class FactryQueryEngine extends AbstractQueryEngine {
             List<RawPt> merged = new ArrayList<>((int) collected);
             // Each point carries its key, so merging adds no wrapper object per point, and each pen's
             // list is dropped once copied. A large read is held about once in the module.
-            for (var it = pointsByUuid.values().iterator(); it.hasNext(); ) {
+            for (var it = pointsByKey.values().iterator(); it.hasNext(); ) {
                 merged.addAll(it.next());
                 it.remove();
             }
@@ -640,13 +643,13 @@ public class FactryQueryEngine extends AbstractQueryEngine {
     private record RawPt(RawQueryKey key, long ts, Object value, QualityCode quality) {}
 
     /**
-     * Per pen UUID, the latest ({@code latest}) or earliest sample in a request with limit 1 grouped by
-     * status: Factry applies the limit to each series, so it answers one sample per pen and
-     * status. None when Factry refuses the request: the range itself was read, and a missing
+     * Per pen, the latest ({@code latest}) or earliest sample in a request with limit 1 grouped by
+     * status: Factry applies the limit to each series, so it answers one sample per measurement
+     * and status. None when Factry refuses the request: the range itself was read, and a missing
      * bound is better than a failed read.
      */
-    private Map<String, RawPt> boundingPoints(QueryTimeseriesRequest request, boolean latest,
-                                       Map<String, RawQueryKey> uuidToKeyMap,
+    private Map<RawQueryKey, RawPt> boundingPoints(QueryTimeseriesRequest request, boolean latest,
+                                       Map<String, List<RawQueryKey>> keysByUuid,
                                        Map<RawQueryKey, ? extends HistoricalNode> keyToNode) {
         if (request.getMeasurementUUIDsCount() == 0) {
             return Map.of();
@@ -664,20 +667,33 @@ public class FactryQueryEngine extends AbstractQueryEngine {
                     + e.getMessage());
             return Map.of();
         }
-        Map<String, RawPt> byUuid = new LinkedHashMap<>();
+        Map<RawQueryKey, RawPt> byKey = new LinkedHashMap<>();
         for (Series series : reply.getSeriesList()) {
-            RawQueryKey key = uuidToKeyMap.get(series.getMeasurementUUID());
-            if (key == null || series.getDataPointsCount() == 0) {
+            List<RawQueryKey> keys = keysByUuid.get(series.getMeasurementUUID());
+            if (keys == null || series.getDataPointsCount() == 0) {
                 continue;
             }
-            SeriesPoint pt = series.getDataPoints(0);
-            Object value = protoValueToJava(pt.getValue());
-            RawPt p = new RawPt(key, pt.getTimestamp(), isDateTime(keyToNode.get(key)) ? toDate(value) : value,
-                    statusToQuality(seriesStatus(series)));
-            byUuid.merge(series.getMeasurementUUID(), p,
-                    (a, b) -> (latest ? b.ts() > a.ts() : b.ts() < a.ts()) ? b : a);
+            for (RawQueryKey key : keys) {
+                RawPt p = rawPoint(key, keyToNode.get(key), series.getDataPoints(0),
+                        statusToQuality(seriesStatus(series)));
+                byKey.merge(key, p, (a, b) -> (latest ? b.ts() > a.ts() : b.ts() < a.ts()) ? b : a);
+            }
         }
-        return byUuid;
+        return byKey;
+    }
+
+    /**
+     * A stored point as the pen's column takes it: a Date for a DateTime tag, one element for an
+     * array element. An element the stored row does not hold is Bad; with the row's quality its
+     * null would read as 0.0, Good.
+     */
+    private static RawPt rawPoint(RawQueryKey key, HistoricalNode node, SeriesPoint pt, QualityCode quality) {
+        int element = element(node);
+        Object value = storedValue(pt.getValue(), element);
+        if (element >= 0 && value == null) {
+            quality = QualityCode.Bad;
+        }
+        return new RawPt(key, pt.getTimestamp(), isDateTime(node) ? toDate(value) : value, quality);
     }
 
     /**
@@ -905,11 +921,16 @@ public class FactryQueryEngine extends AbstractQueryEngine {
                 QualifiedPath source = key.source();
                 String tagPath = toStoredTagPath(source);
                 // Only query keys that resolved to a node; mapKeysToNodes omits the rest.
-                String uuid = keyToNode.containsKey(key) ? lookupUUID(tagPath) : null;
+                HistoricalNode node = keyToNode.get(key);
+                String uuid = measurementUUID(node);
 
                 if (uuid == null) {
                     logger.warn("No measurement UUID found for aggregated query: " + tagPath);
                     failures.put(key, QualityCode.Bad_NotFound);
+                    continue;
+                }
+                if (node instanceof FactryRecord r && r.isArray()) {
+                    failures.put(key, wholeArray(tagPath));
                     continue;
                 }
 
@@ -919,6 +940,14 @@ public class FactryQueryEngine extends AbstractQueryEngine {
                     boolean dateTime = isDateTime(keyToNode.get(key));
 
                     DataType dataType = keyToNode.get(key).dataType().orElse(DataType.Float8);
+                    int element = element(node);
+                    if (element >= 0 && !ARRAY_AGGREGATES.contains(aggName)) {
+                        // Factry refuses every other aggregate of an array measurement. Refused
+                        // here, so no request fails and Average never reaches the twa path.
+                        logger.debug("Aggregate " + aggName + " is not supported for array element: " + tagPath);
+                        failures.put(key, QualityCode.Bad_Unsupported);
+                        continue;
+                    }
                     if (dataType == DataType.String && !STRING_AGGREGATES.contains(aggName)) {
                         // Factry refuses every other aggregate of a string measurement.
                         logger.debug("Aggregate " + aggName + " is not supported for String tag: " + tagPath);
@@ -948,8 +977,8 @@ public class FactryQueryEngine extends AbstractQueryEngine {
                     } else {
                         // MinMax asks Factry for min and max, and gives each bucket both.
                         List<String> functions = factryFunction == null ? List.of("min", "max") : List.of(factryFunction);
-                        pointCount += queryEveryBucket(uuid, source, key, functions, period, periodMs, options,
-                                pts, asDate);
+                        pointCount += queryEveryBucket(uuid, element, source, key, functions, period, periodMs,
+                                options, pts, asDate);
                     }
                     pointsByKey.put(key, pts);
                 } catch (Exception e) {
@@ -1405,10 +1434,12 @@ public class FactryQueryEngine extends AbstractQueryEngine {
      * count. A {@code last} per status says which statuses each bucket holds and the value held
      * after it, and the sample before a bucket fills the empty buckets at the start.
      *
+     * @param element   for an array element, its index in the stored list (only LastValue gets
+     *                  here for one); else -1
      * @param functions the Factry functions; each bucket gets one point per function, in order
      */
     private int queryEveryBucket(
-            String uuid, QualifiedPath source, AggregatedQueryKey key, List<String> functions,
+            String uuid, int element, QualifiedPath source, AggregatedQueryKey key, List<String> functions,
             String period, long periodMs, AggregatedQueryOptions options,
             List<AggregatedPoint<?, ?>> out, boolean asDate) {
         TimeRange range = options.getTimeRange()
@@ -1428,7 +1459,7 @@ public class FactryQueryEngine extends AbstractQueryEngine {
                 boolean isGood = isGoodStatus(seriesStatus(series));
                 for (SeriesPoint pt : series.getDataPointsList()) {
                     statuses.computeIfAbsent(pt.getTimestamp(), t -> new BucketFill.Status())
-                            .add(isGood, protoValueToJava(pt.getValue()));
+                            .add(isGood, storedValue(pt.getValue(), element));
                 }
             }
             for (String function : functions) {
@@ -1446,7 +1477,7 @@ public class FactryQueryEngine extends AbstractQueryEngine {
         }
 
         List<BucketFill.Bucket> buckets = BucketFill.fill(startMs, rangeEndMs, periodMs, nowMs, statuses,
-                ts -> samplesBefore(uuid, ts), RAW_BUDGET.seedReadsPerPen(), functions.contains("last"));
+                ts -> samplesBefore(uuid, element, ts), RAW_BUDGET.seedReadsPerPen(), functions.contains("last"));
         int count = 0;
         for (BucketFill.Bucket bucket : buckets) {
             for (int f = 0; f < functions.size(); f++) {
@@ -1608,13 +1639,13 @@ public class FactryQueryEngine extends AbstractQueryEngine {
         return a;
     }
 
-    /** The last sample of each status before {@code ts}. */
-    private List<BucketFill.Sample> samplesBefore(String uuid, long ts) {
+    /** The last sample of each status before {@code ts}; for an array, that {@code element}. */
+    private List<BucketFill.Sample> samplesBefore(String uuid, int element, long ts) {
         List<BucketFill.Sample> out = new ArrayList<>();
         for (Series series : grpcClient.queryTimeseries(sampleBeforeRequest(uuid, ts)).getSeriesList()) {
             boolean isGood = isGoodStatus(seriesStatus(series));
             for (SeriesPoint pt : series.getDataPointsList()) {
-                out.add(new BucketFill.Sample(pt.getTimestamp(), protoValueToJava(pt.getValue()), isGood));
+                out.add(new BucketFill.Sample(pt.getTimestamp(), storedValue(pt.getValue(), element), isGood));
             }
         }
         return out;
@@ -1719,17 +1750,13 @@ public class FactryQueryEngine extends AbstractQueryEngine {
 
     private Optional<FactryRecord> findNode(String tagPath, QualifiedPath path) {
         // Try measurement
-        Measurement m = measurementCache.getMeasurementByName(tagPath);
-        if (m == null) {
+        Optional<FactryRecord> node = measurementNode(tagPath, path);
+        if (node.isEmpty()) {
             measurementCache.refresh(grpcClient);
-            m = measurementCache.getMeasurementByName(tagPath);
+            node = measurementNode(tagPath, path);
         }
-        if (m != null) {
-            Instant createdTime = m.hasCreatedAt()
-                    ? Instant.ofEpochSecond(m.getCreatedAt().getSeconds(), m.getCreatedAt().getNanos())
-                    : Instant.EPOCH;
-            return Optional.of(new FactryRecord(m.getUuid(), path, m.getDatatype(),
-                    MeasurementCache.ignitionDataType(m), createdTime));
+        if (node.isPresent()) {
+            return node;
         }
 
         // Try asset
@@ -1744,21 +1771,49 @@ public class FactryQueryEngine extends AbstractQueryEngine {
         return Optional.empty();
     }
 
-    private String lookupUUID(String tagPath) {
-        // Try measurement
-        String uuid = measurementCache.getUUID(tagPath);
-        if (uuid != null) return uuid;
+    /**
+     * The node of a cached measurement, or of one element of an array measurement: Ignition
+     * historizes {@code Arr[2]} as its own path, PointWriter stores it in the list of measurement
+     * {@code Arr}. A measurement whose own name ends in {@code [i]} still wins.
+     */
+    private Optional<FactryRecord> measurementNode(String tagPath, QualifiedPath path) {
+        Measurement m = measurementCache.getMeasurementByName(tagPath);
+        if (m != null) {
+            return Optional.of(new FactryRecord(m.getUuid(), -1, path, m.getDatatype(),
+                    MeasurementCache.ignitionDataType(m), createdTime(m)));
+        }
+        ArrayPointMerger.ArrayRef ref = ArrayPointMerger.parseArrayPath(tagPath);
+        Measurement base = ref != null ? measurementCache.getMeasurementByName(ref.basePath) : null;
+        if (base != null && base.getDatatype().startsWith("[]")) {
+            String ignitionType = MeasurementCache.ignitionDataType(base);
+            return Optional.of(new FactryRecord(base.getUuid(), ref.index, path, base.getDatatype().substring(2),
+                    ignitionType != null ? ignitionType.replaceFirst("Array$", "") : null, createdTime(base)));
+        }
+        return Optional.empty();
+    }
 
-        // Try asset
-        uuid = measurementCache.getAssetUUID(tagPath);
-        if (uuid != null) return uuid;
+    private static Instant createdTime(Measurement m) {
+        return m.hasCreatedAt()
+                ? Instant.ofEpochSecond(m.getCreatedAt().getSeconds(), m.getCreatedAt().getNanos())
+                : Instant.EPOCH;
+    }
 
-        // Refresh and retry
-        measurementCache.refresh(grpcClient);
-        uuid = measurementCache.getUUID(tagPath);
-        if (uuid != null) return uuid;
-        uuid = measurementCache.getAssetUUID(tagPath);
-        return uuid;
+    /** The Factry UUID a resolved query key reads from, or null when the key did not resolve. */
+    private static String measurementUUID(HistoricalNode node) {
+        return node instanceof FactryRecord r ? r.measurementUUID() : null;
+    }
+
+    private static int element(HistoricalNode node) {
+        return node instanceof FactryRecord r ? r.element() : -1;
+    }
+
+    /**
+     * The quality of the base path of an array tag. Ignition historizes the elements, not the
+     * array, and a whole list has no place in one column; read as a value it was 0.0, Good.
+     */
+    private static QualityCode wholeArray(String tagPath) {
+        return QualityCode.Bad_Unsupported.derive("'" + tagPath + "' is an array tag: query its elements,"
+                + " such as '" + tagPath + "[0]'");
     }
 
     void updateSettings(FactryHistorianSettings newSettings) {
@@ -1808,6 +1863,14 @@ public class FactryQueryEngine extends AbstractQueryEngine {
      * measurement (checked live), so those read Bad_Unsupported, like a Sum of dates.
      */
     private static final Set<String> STRING_AGGREGATES = Set.of("LastValue", "Count");
+
+    /**
+     * Aggregates of an array element. Factry stores an array tag as one measurement holding a list
+     * per row, and aggregates it only with first, last and count; it refuses every other
+     * aggregate, twa included (checked live on 8.2.3). Count counts stored rows, and a row is
+     * written whenever any element changes.
+     */
+    private static final Set<String> ARRAY_AGGREGATES = Set.of("LastValue", "Count");
 
     /**
      * Aggregates that still mean something for a DateTime tag. Factry stores dates as epoch
@@ -1891,6 +1954,19 @@ public class FactryQueryEngine extends AbstractQueryEngine {
         public void onComplete() {
             delegate.onComplete();
         }
+    }
+
+    /**
+     * The Java value of a stored value. For an array element ({@code element >= 0}) that element of
+     * the stored list, or null when the list is shorter.
+     */
+    static Object storedValue(com.google.protobuf.Value value, int element) {
+        if (element < 0) {
+            return protoValueToJava(value);
+        }
+        return value.getKindCase() == com.google.protobuf.Value.KindCase.LIST_VALUE
+                && element < value.getListValue().getValuesCount()
+                ? protoValueToJava(value.getListValue().getValues(element)) : null;
     }
 
     static Object protoValueToJava(com.google.protobuf.Value value) {
