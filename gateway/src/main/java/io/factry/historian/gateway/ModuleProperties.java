@@ -84,6 +84,11 @@ public final class ModuleProperties {
         return getLong("measurement.cache.refresh.seconds", 30);
     }
 
+    /** How long a read remembers that Factry has no measurement with a name. */
+    public static long getMeasurementLookupMissSeconds() {
+        return getLong("measurement.lookup.miss.seconds", 60);
+    }
+
     public static int getMeasurementCachePageSize() {
         return (int) getLong("measurement.cache.page.size", 5000);
     }

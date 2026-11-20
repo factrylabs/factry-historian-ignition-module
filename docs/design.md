@@ -269,6 +269,7 @@ Loads tuning values from `factry-historian.properties` (bundled in the .modl). T
 | `grpc.shutdown.grace.seconds` | 3 | How long a settings save or shutdown waits for running calls before it cancels them |
 | `status.cache.ms` | 30000 | How often the connection check runs; it pauses S&F while Factry is unreachable and resumes it when it is back |
 | `measurement.cache.refresh.seconds` | 30 | How often to reload measurements from Factry |
+| `measurement.lookup.miss.seconds` | 60 | How long a read remembers that Factry has no measurement with a name, before it looks the name up again |
 | `query.raw.max.points` | 500000 | Most raw points one query reads over all its pens; a range that holds more fails the read with an error. An aggregated read fails the same way, before it asks Factry, when pens x intervals (twice for MinMax) is more. About 200 bytes of heap per point while the query runs, so about 100 MB per query |
 
 ---
@@ -305,7 +306,7 @@ Steps 2 to 7 live in `PointWriter`, which the engine calls; it uses no Ignition 
 Extends `AbstractQueryEngine`. Handles all data retrieval from Factry.
 
 **`doQueryRaw(options, processor)`**:
-1. Maps each `RawQueryKey` to the measurement UUID of the node `mapKeysToNodes` resolved (the cache, refreshed from Factry on a miss)
+1. Maps each `RawQueryKey` to the measurement UUID of the node `mapKeysToNodes` resolved (the cache; on a miss, one exact-name lookup in Factry, see "Resolving a tag" below)
 2. Several keys can read one measurement: the elements `Arr[0]`, `Arr[1]`, ... of an array tag, which Ignition historizes as paths of their own and `PointWriter` stores as one list per row in measurement `Arr`. Each element key gets its element of every stored row; an element a row does not hold is a Bad point without a value. Every element counts as a point for `returnSize` and `query.raw.max.points`, as separate tags would; a pen Factry refuses fails all its element columns. The base path `Arr` reads null with `Bad_Unsupported` on every row: Ignition historizes the elements, not the array, and a whole list has no place in one column (read as a value it was 0.0, Good). Ignition's wide writer starts a row for every point, also for two pens at the same time, so a stored array row gives one row per element read
 3. Builds `QueryTimeseriesRequest` with measurement UUIDs and time range, grouped by status
 4. Reads in pages of `limit`/`offset` (Factry applies both per series), halving the page when an answer is too large, and keeps only the first `returnSize` points across all pens when Ignition sets one. With `returnSize`, each page drops the points past the first `returnSize` and stops paging pens whose next points come after them, so a read holds about `returnSize` points plus one page per pen, and the cap counts only the points kept. When Factry refuses a pen (see item 7), the read starts again from the first page without that pen: its points may have decided where the first `returnSize` end and which pens stopped paging. Fails the read when the range holds more than `query.raw.max.points` points over all pens, or when a page starts before the previous one ended, as a Factry that ignores `offset` would answer. Part of a range is never returned: Ignition repeats a pen's last value with Good quality into every row after its data stops, so a pen cut short looks like a flat line. Ignition's own `HistoryWriter` fails the same way at its row limit
@@ -359,14 +360,14 @@ Extends `AbstractQueryEngine`. Handles all data retrieval from Factry.
 - Measurements: parses stored paths into hierarchical sys/prov/tag structure, publishes folders and leaf nodes
 - Assets: splits asset names on "/" to build folder hierarchy
 - Uses `BrowsePublisher` to emit folder and tag nodes
+- Reads the cache only; it never asks Factry. A measurement made by hand or by another collector shows up from the next cache refresh
 
 **`doQueryMetadata(options, processor)`**:
 - Returns measurement metadata: data type, status, name, engineering specs (UOM, hi/lo limits)
 
-**`lookupUUID(tagPath)`**:
-- Cache hit → return
-- Cache miss → `measurementCache.refresh()` → retry
-- Checks both measurements and assets
+**Resolving a tag** (`findNode` and `doQueryMetadata`, through `MeasurementCache.findForRead`):
+- Cache hit, or an asset with that name → return. An array element `Arr[i]` first checks the cache for `Arr[i]` and for its array `Arr`, and only then asks Factry for either
+- Cache miss → one exact-name lookup in Factry (`GetMeasurementsByFilter` with the name as keyword), so a measurement made since the last refresh reads at once. A name Factry does not have is remembered for `measurement.lookup.miss.seconds` (60 s), so a trend of a misspelt or deleted tag does not ask on every poll. Before, every miss downloaded every measurement of the organisation, twice per read
 
 ---
 

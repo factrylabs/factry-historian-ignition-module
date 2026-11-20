@@ -124,7 +124,8 @@ public class FactryQueryEngine extends AbstractQueryEngine {
     @Override
     protected void doBrowse(QualifiedPath root, BrowseFilter filter, BrowsePublisher publisher) {
         try {
-            measurementCache.refresh(grpcClient);
+            // From the cache only: the scheduled refresh keeps it current. Reloading every
+            // measurement on each browse step cost a full download per click.
 
             // Extract browse prefix from root (AdaptedQualifiedPath)
             String prefix = extractBrowsePrefix(root);
@@ -1024,12 +1025,7 @@ public class FactryQueryEngine extends AbstractQueryEngine {
             int pointCount = 0;
             for (MetadataQueryKey key : options.getQueryKeys()) {
                 String tagPath = toStoredTagPath(key.identifier());
-                Measurement m = measurementCache.getMeasurementByName(tagPath);
-
-                if (m == null) {
-                    measurementCache.refresh(grpcClient);
-                    m = measurementCache.getMeasurementByName(tagPath);
-                }
+                Measurement m = measurementCache.findForRead(tagPath, grpcClient);
 
                 if (m == null) {
                     processor.onKeyFailure(key, QualityCode.Bad_NotFound);
@@ -1750,10 +1746,10 @@ public class FactryQueryEngine extends AbstractQueryEngine {
 
     private Optional<FactryRecord> findNode(String tagPath, QualifiedPath path) {
         // Try measurement
-        Optional<FactryRecord> node = measurementNode(tagPath, path);
+        // The cache first, for the tag and for the array it may be an element of; then Factry.
+        Optional<FactryRecord> node = measurementNode(tagPath, path, false);
         if (node.isEmpty()) {
-            measurementCache.refresh(grpcClient);
-            node = measurementNode(tagPath, path);
+            node = measurementNode(tagPath, path, true);
         }
         if (node.isPresent()) {
             return node;
@@ -1774,16 +1770,20 @@ public class FactryQueryEngine extends AbstractQueryEngine {
     /**
      * The node of a cached measurement, or of one element of an array measurement: Ignition
      * historizes {@code Arr[2]} as its own path, PointWriter stores it in the list of measurement
-     * {@code Arr}. A measurement whose own name ends in {@code [i]} still wins.
+     * {@code Arr}. A measurement whose own name ends in {@code [i]} still wins. With
+     * {@code lookUp}, a name the cache does not have is looked up in Factry
+     * ({@link MeasurementCache#findForRead}); without, only the cache is read.
      */
-    private Optional<FactryRecord> measurementNode(String tagPath, QualifiedPath path) {
-        Measurement m = measurementCache.getMeasurementByName(tagPath);
+    private Optional<FactryRecord> measurementNode(String tagPath, QualifiedPath path, boolean lookUp) {
+        Measurement m = lookUp ? measurementCache.findForRead(tagPath, grpcClient) : measurementCache.cachedForRead(tagPath);
         if (m != null) {
             return Optional.of(new FactryRecord(m.getUuid(), -1, path, m.getDatatype(),
                     MeasurementCache.ignitionDataType(m), createdTime(m)));
         }
         ArrayPointMerger.ArrayRef ref = ArrayPointMerger.parseArrayPath(tagPath);
-        Measurement base = ref != null ? measurementCache.getMeasurementByName(ref.basePath) : null;
+        Measurement base = ref == null ? null : lookUp
+                ? measurementCache.findForRead(ref.basePath, grpcClient)
+                : measurementCache.cachedForRead(ref.basePath);
         if (base != null && base.getDatatype().startsWith("[]")) {
             String ignitionType = MeasurementCache.ignitionDataType(base);
             return Optional.of(new FactryRecord(base.getUuid(), ref.index, path, base.getDatatype().substring(2),

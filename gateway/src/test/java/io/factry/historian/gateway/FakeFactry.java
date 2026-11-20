@@ -39,6 +39,8 @@ class FakeFactry extends FactryGrpcClient {
     final List<Points> sent = new ArrayList<>();
     /** Number of single-name lookup calls (pages) made. */
     int lookups = 0;
+    /** Number of measurement list calls without a keyword (pages of a full cache refresh). */
+    int fullLoads = 0;
     /** How many of the next single-name lookups fail, and with which gRPC status. */
     int lookupFailures = 0;
     Status lookupFailure = Status.INVALID_ARGUMENT;
@@ -94,6 +96,9 @@ class FakeFactry extends FactryGrpcClient {
 
     @Override
     public Measurements getMeasurementsByFilter(GetMeasurementsByFilterRequest request) {
+        if (!request.hasKeyword()) {
+            fullLoads++;
+        }
         List<Measurement> found = new ArrayList<>();
         for (Measurement m : measurements) {
             if (!request.hasKeyword() || m.getName().contains(request.getKeyword())) {

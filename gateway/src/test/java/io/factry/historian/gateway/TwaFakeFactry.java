@@ -113,6 +113,12 @@ class TwaFakeFactry extends FactryGrpcClient {
         return queries.stream().filter(q -> q.hasAggregation() && q.getAggregation().getName().equals(name)).toList();
     }
 
+    /** The single-name lookup a read makes for a name the cache does not have: same list. */
+    @Override
+    public Measurements getMeasurementsByFilterWithDeadline(GetMeasurementsByFilterRequest request) {
+        return getMeasurementsByFilter(request);
+    }
+
     @Override
     public Measurements getMeasurementsByFilter(GetMeasurementsByFilterRequest request) {
         return Measurements.newBuilder().addAllMeasurements(measurements.values())

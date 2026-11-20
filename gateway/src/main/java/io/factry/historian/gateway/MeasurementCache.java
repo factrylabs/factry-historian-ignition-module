@@ -30,6 +30,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.LongSupplier;
 
 public class MeasurementCache {
     private static final Logger logger = LoggerFactory.getLogger(MeasurementCache.class);
@@ -70,6 +71,9 @@ public class MeasurementCache {
     private final ConcurrentHashMap<String, Map<String, String>> tagMetadata = new ConcurrentHashMap<>();
 
     private final int pageSize = ModuleProperties.getMeasurementCachePageSize();
+
+    /** The current time; tests replace it. */
+    LongSupplier now = System::currentTimeMillis;
 
     /** Sleeps between the polls for a just-created measurement: about 3 s in all. */
     private final long[] pollBackoffMs;
@@ -437,11 +441,12 @@ public class MeasurementCache {
 
     /**
      * Targeted lookup of a measurement by its exact name, used before creating a measurement
-     * (to reuse one Factry already has) and while polling for a just-created measurement to
-     * become visible. Uses the server-side keyword filter, bounded by the write deadline,
-     * instead of reloading the entire cache (measurements, collectors, assets, asset
-     * properties), so a burst of new tags doesn't trigger repeated full reloads on the
-     * store-and-forward thread. The keyword filter matches substrings, so a common name can
+     * (to reuse one Factry already has), while polling for a just-created measurement to
+     * become visible, and for a read of a name the cache does not have. Uses the server-side
+     * keyword filter, bounded by the write deadline, instead of reloading the entire cache
+     * (measurements, collectors, assets, asset properties), so a burst of new tags doesn't
+     * trigger repeated full reloads on the store-and-forward thread. The keyword filter matches
+     * substrings, so a common name can
      * have many matches: it reads further pages until an Active measurement with the name
      * that this collector may write to, or its Paused one, turns up, up to
      * {@link #LOOKUP_MAX_PAGES}.
@@ -498,6 +503,44 @@ public class MeasurementCache {
             logger.warn("Lookup of '{}' stopped after {} of {} keyword matches without finding an Active"
                     + " measurement with that name (logged at most every 10 minutes per tag)", tagPath, read, total);
         }
+    }
+
+    /** Names a read looked up in Factry without finding them, with the time of that lookup. */
+    private final ConcurrentHashMap<String, Long> readMisses = new ConcurrentHashMap<>();
+    private final long readMissMillis = ModuleProperties.getMeasurementLookupMissSeconds() * 1000;
+
+    /**
+     * The Active measurement a read of {@code name} uses. Not in the cache and not an asset's
+     * name: one exact-name lookup in Factry, so a measurement created by hand or by another
+     * collector reads at once, without waiting for the next refresh. A name Factry does not have
+     * is not asked for again for {@code measurement.lookup.miss.seconds}, so a trend with a
+     * misspelt or deleted tag does not cost a lookup on every poll. A connection error is thrown.
+     */
+    public Measurement findForRead(String name, FactryGrpcClient grpcClient) {
+        Measurement m = getMeasurementByName(name);
+        if (m != null || assetNameToUUID.containsKey(name)) {
+            return m;
+        }
+        long time = now.getAsLong();
+        Long missed = readMisses.get(name);
+        if (missed != null && time - missed < readMissMillis) {
+            return null;
+        }
+        String collectorUUID = grpcClient.getCollectorUUID();
+        lookUpByName(name, grpcClient).forEach(found -> cacheMeasurement(found, collectorUUID));
+        m = getMeasurementByName(name);
+        if (m == null) {
+            readMisses.values().removeIf(t -> time - t >= readMissMillis);
+            readMisses.put(name, time);
+        } else {
+            readMisses.remove(name);
+        }
+        return m;
+    }
+
+    /** The Active measurement a read of {@code name} uses, from the cache only. */
+    public Measurement cachedForRead(String name) {
+        return getMeasurementByName(name);
     }
 
     private static boolean isActive(Measurement m) {
