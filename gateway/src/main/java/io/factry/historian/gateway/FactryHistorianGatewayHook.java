@@ -30,6 +30,7 @@ public class FactryHistorianGatewayHook extends AbstractGatewayModuleHook {
         logger.info("MODULE VERSION: {}", FactryHistorianModule.MODULE_VERSION);
 
         this.gatewayContext = context;
+        extensionPoint.setGatewayContext(context);
 
         BundleUtil.get().addBundle(FactryHistorianExtensionPoint.class);
     }

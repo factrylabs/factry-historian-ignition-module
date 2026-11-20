@@ -15,10 +15,9 @@ import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.*;
 
-/** Verifies the combined TLS trust store trusts the system CAs, the bundled Factry CA, and any custom CA. */
+/** Verifies the combined TLS trust store trusts the system CAs and any custom CA, and the bundled Factry CA. */
 class FactryGrpcClientTlsTest {
 
-    private static final String CA_RESOURCE = "factry-historian-ca.crt";
     /** A self-signed cert (CN=localhost) standing in for an internal-CA-signed or self-signed server cert. */
     private static final String SELF_SIGNED_RESOURCE = "test-selfsigned-localhost.crt";
 
@@ -40,10 +39,6 @@ class FactryGrpcClientTlsTest {
         throw new IllegalStateException("no X509TrustManager");
     }
 
-    private static InputStream caStream() {
-        return FactryGrpcClientTlsTest.class.getClassLoader().getResourceAsStream(CA_RESOURCE);
-    }
-
     private static String selfSignedPem() throws Exception {
         try (InputStream in = FactryGrpcClientTlsTest.class.getClassLoader()
                 .getResourceAsStream(SELF_SIGNED_RESOURCE)) {
@@ -61,31 +56,31 @@ class FactryGrpcClientTlsTest {
 
     @Test
     void systemOnly_trustsPublicCAs() throws Exception {
-        X509Certificate[] issuers = issuers(FactryGrpcClient.buildCombinedTrustManagerFactory(null));
+        X509Certificate[] issuers = issuers(FactryGrpcClient.buildCombinedTrustManagerFactory(null, null));
         assertTrue(issuers.length > 0, "Should trust the JVM's built-in system/public CAs");
     }
 
+    /**
+     * The bundled certificate used to be a 2022 leaf for historian.factry.local, trusted as an anchor
+     * for every server: it matched no current Factry (#15). Now it is Factry's root CA, used only
+     * when the token says Factry serves its built-in certificate.
+     */
     @Test
-    void combined_trustsSystemCAsAndBundledFactryCA() throws Exception {
-        // The bundled Factry CA (a private CA) should not already be a system CA.
-        X509Certificate factryCa;
-        try (InputStream ca = caStream()) {
-            assertNotNull(ca, "bundled Factry CA cert resource should be present");
-            factryCa = (X509Certificate) CertificateFactory.getInstance("X.509").generateCertificate(ca);
-        }
+    void bundledCertificateIsFactrysRootCa() {
+        List<X509Certificate> bundled = FactryGrpcClient.bundledFactryCa();
+        assertEquals(1, bundled.size());
+        X509Certificate ca = bundled.get(0);
+        assertEquals(ca.getSubjectX500Principal(), ca.getIssuerX500Principal(), "a root CA signs itself");
+        assertTrue(ca.getSubjectX500Principal().getName().contains("O=FACTRY BVBA CA"));
+        assertFalse(ca.getSubjectX500Principal().getName().contains("historian.factry.local"));
+    }
 
-        X509Certificate[] systemOnly = issuers(FactryGrpcClient.buildCombinedTrustManagerFactory(null));
-        assertFalse(contains(systemOnly, factryCa),
-                "The private Factry CA should not already be in the system trust store");
-
-        // The combined store must trust the Factry CA AND keep all the system CAs.
-        X509Certificate[] combined;
-        try (InputStream ca = caStream()) {
-            combined = issuers(FactryGrpcClient.buildCombinedTrustManagerFactory(ca));
+    @Test
+    void normalCheckTrustsNoFactryCertificate() throws Exception {
+        for (X509Certificate issuer : issuers(FactryGrpcClient.buildCombinedTrustManagerFactory(null, null))) {
+            String subject = issuer.getSubjectX500Principal().getName();
+            assertFalse(subject.contains("historian.factry.local") || subject.contains("FACTRY"), subject);
         }
-        assertTrue(contains(combined, factryCa), "Combined store must trust the bundled Factry CA");
-        assertTrue(combined.length >= systemOnly.length + 1,
-                "Combined store must keep the system CAs and add the Factry CA");
     }
 
     // --- parseCaCertificates ---
@@ -119,18 +114,14 @@ class FactryGrpcClientTlsTest {
         X509Certificate custom = selfSignedCert();
 
         X509Certificate[] withoutCustom;
-        try (InputStream ca = caStream()) {
-            withoutCustom = issuers(FactryGrpcClient.buildCombinedTrustManagerFactory(ca, null));
-        }
+        withoutCustom = issuers(FactryGrpcClient.buildCombinedTrustManagerFactory(null, null));
         assertFalse(contains(withoutCustom, custom), "custom cert should not be trusted unless supplied");
 
         X509Certificate[] withCustom;
-        try (InputStream ca = caStream()) {
-            withCustom = issuers(FactryGrpcClient.buildCombinedTrustManagerFactory(ca, selfSignedPem()));
-        }
+        withCustom = issuers(FactryGrpcClient.buildCombinedTrustManagerFactory(null, selfSignedPem()));
         assertTrue(contains(withCustom, custom), "combined store must trust the supplied custom CA");
         assertEquals(withoutCustom.length + 1, withCustom.length,
-                "custom CA must be added, not replace the system + bundled CAs");
+                "custom CA must be added, not replace the system CAs");
     }
 
     /**
@@ -144,16 +135,12 @@ class FactryGrpcClientTlsTest {
         X509Certificate[] chain = { selfSignedCert() };
 
         X509TrustManager without;
-        try (InputStream ca = caStream()) {
-            without = x509TrustManager(FactryGrpcClient.buildCombinedTrustManagerFactory(ca, null));
-        }
+        without = x509TrustManager(FactryGrpcClient.buildCombinedTrustManagerFactory(null, null));
         assertThrows(CertificateException.class, () -> without.checkServerTrusted(chain, "RSA"),
                 "without the custom CA the self-signed server cert must not verify");
 
         X509TrustManager with;
-        try (InputStream ca = caStream()) {
-            with = x509TrustManager(FactryGrpcClient.buildCombinedTrustManagerFactory(ca, selfSignedPem()));
-        }
+        with = x509TrustManager(FactryGrpcClient.buildCombinedTrustManagerFactory(null, selfSignedPem()));
         assertDoesNotThrow(() -> with.checkServerTrusted(chain, "RSA"),
                 "with the custom CA supplied the same server cert must verify");
     }

@@ -5,13 +5,7 @@
   "settings": {
     "batchIntervalMs": 5000,
     "batchSize": 100,
-    "collectorUUID": "ff87b4ea-275f-11f1-9d9b-9649cbb854a0",
-    "debugLogging": true,
-    "grpcHost": "historian",
-    "grpcPort": 8001,
-    "skipTlsVerification": true,
-    "storeAndForwardEngine": "",
-    "token": {
+    "collectorToken": {
       "data": {
         "ciphertext": "mW17H5SUCr9npEPThQpqefdjiykbAq0DtZIOLI5fQpvq8ib_hIqF5IvZ3r84Qx6_qC1as3ERgW-XPfa3JnHM_qzi-TNVmHSRwX-5FExm9RjnHxkWUl5OvWauFEHtyhS1I52CQ3umubxiOrrGODb_0dJppGjdZYK2PgkieZeAM7m0ylksKGNss9-WSSMWoyEs-snSnDFiRLC-l1UfMeZonULZdkR74tseyZWwxeGeKFF6HF694eDeFL99GWz6945CcN3VdMz1iA3fQStDs1BNrX43z80Mt-sQ_DG3MxkEP9lTAjQrtHJqvBhfTiat__O8itTOqpF9OaGXos8E4uv9aricaCLJc_xeJImig2qpytKKq5SS8-0CFEad9gV7OJEA36SUE6w5s9TIr42kkl-dioA-iNn-tizWQMJoBQp8PLoO77nlTiSWKRW4wUSh-cg-0v_4yUtMHxyqeGWORVjc_vCPZwekrYaCeIUZD4Vcu0tKaZuzTWGi2LqFXSdm4A",
         "encrypted_key": "nll7Ut7W-XICaeHmdOYLQjZ7YW8a8xzbvjzx3k_w_xvBynJB1ZboXA",
@@ -21,6 +15,11 @@
       },
       "type": "Embedded"
     },
-    "useTls": true
+    "collectorUUID": "ff87b4ea-275f-11f1-9d9b-9649cbb854a0",
+    "debugLogging": true,
+    "hostOverride": "historian",
+    "portOverride": 8001,
+    "skipTlsVerification": true,
+    "storeAndForwardEngine": ""
   }
 }

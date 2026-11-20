@@ -45,12 +45,11 @@ create_historian() {
     "collectorName": "",
     "collectorUUID": "",
     "debugLogging": false,
-    "grpcHost": "historian",
-    "grpcPort": 8001,
+    "hostOverride": "historian",
+    "portOverride": 8001,
     "skipTlsVerification": true,
     "storeAndForwardEngine": "${sf_engine}",
-    "token": "${TOKEN}",
-    "useTls": true
+    "token": "${TOKEN}"
   }
 }
 EOF
