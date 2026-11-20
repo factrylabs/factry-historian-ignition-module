@@ -128,4 +128,22 @@ class FactryStorageEngineRefusalTest {
 
         assertEquals(expectedCalls, createPointsCalls.get(), "CreatePoints calls for " + code);
     }
+
+    /**
+     * Factry v8.2.3 answers every call with NOT_FOUND "collector is deleted" once the collector
+     * is deleted. That is no news about the measurements: evicting them would look each one up
+     * again, against a Factry that refuses them all.
+     */
+    @org.junit.jupiter.api.Test
+    void aDeletedCollectorKeepsTheMeasurementsCached() throws Exception {
+        createPointsStatus = Status.NOT_FOUND.withDescription("collector is deleted");
+        AtomicPoint<?> point = DataPointFactory.createAtomicPoint(42.0, QualityCode.Good, Instant.now(),
+                QualifiedPath.newBuilder().setProvider("default").setTag("Pump1/Flow").build());
+
+        StorageResult<AtomicPoint<?>> result = engine(client)
+                .storeAtomic(List.of(point)).toCompletableFuture().get(30, TimeUnit.SECONDS);
+
+        assertTrue(result.error().isPresent(), "kept in store and forward");
+        assertEquals(1, createPointsCalls.get(), "no eviction and second attempt");
+    }
 }

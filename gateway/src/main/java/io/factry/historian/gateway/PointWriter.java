@@ -188,7 +188,10 @@ class PointWriter {
             // Only an answer about the measurements themselves justifies dropping them from
             // the cache: evicting on INTERNAL (e.g. InfluxDB down) would send a lookup per
             // measurement to a Factry that is already struggling, on every retry.
-            boolean aboutMeasurements = code == Status.Code.NOT_FOUND || code == Status.Code.INVALID_ARGUMENT;
+            // Factry also answers NOT_FOUND when the collector itself was deleted; evicting would
+            // then only send a lookup per measurement to a Factry that refuses them all.
+            boolean aboutMeasurements = (code == Status.Code.NOT_FOUND || code == Status.Code.INVALID_ARGUMENT)
+                    && !FactryGrpcClient.isCollectorDeleted(e.getStatus());
             if (retryOnRejection && aboutMeasurements && !built.usedUUIDs.isEmpty()) {
                 logger.warn("Server rejected points (" + code + "), evicting "
                         + built.usedUUIDs.size() + " measurement UUIDs and retrying: " + e.getMessage());

@@ -104,7 +104,7 @@ class RefusedWritesStatusTest {
         engine = new FactryStorageEngine(context, "factry", new FactryHistorianSettings(), client,
                 new MeasurementCache(), new HistorianMetrics(), health);
         // What the provider's scheduled connection check does
-        health.connectionChecked(client.testConnection());
+        health.connectionChecked(client.checkConnection());
     }
 
     @AfterEach
@@ -152,7 +152,7 @@ class RefusedWritesStatusTest {
 
         after(1);
         flush();
-        health.connectionChecked(client.testConnection());
+        health.connectionChecked(client.checkConnection());
         ProfileStatus status = health.status();
         assertEquals(ProfileStatus.State.Errored, status.getState(), "the connection check passes, writes don't");
         assertEquals("Factry does not store writes", status.getMessage().toString());
@@ -193,7 +193,7 @@ class RefusedWritesStatusTest {
         assertTrue(flush().error().isPresent());
         after(60);
         assertTrue(flush().error().isPresent());
-        health.connectionChecked(client.testConnection());
+        health.connectionChecked(client.checkConnection());
 
         ProfileStatus status = health.status();
         assertEquals(ProfileStatus.State.Errored, status.getState(), "nothing stored for 60 s, check passes");
@@ -207,7 +207,7 @@ class RefusedWritesStatusTest {
         flush();
         createPointsStatus = Status.OK;
         after(31);
-        health.connectionChecked(client.testConnection());
+        health.connectionChecked(client.checkConnection());
 
         assertEquals(ProfileStatus.State.Good, health.status().getState(), "only one write was refused");
     }
@@ -223,9 +223,9 @@ class RefusedWritesStatusTest {
         after(25);
         flush();
         after(10);
-        health.connectionChecked(false);
+        health.connectionChecked(Status.UNAVAILABLE.withDescription("io exception"));
         after(120);
-        health.connectionChecked(client.testConnection());
+        health.connectionChecked(client.checkConnection());
         assertEquals(ProfileStatus.State.Good, health.status().getState(), "back, no write tried yet");
 
         after(5);
@@ -249,7 +249,7 @@ class RefusedWritesStatusTest {
 
     @Test
     void aFailedConnectionCheckIsErrored() {
-        health.connectionChecked(false);
+        health.connectionChecked(Status.UNAVAILABLE.withDescription("io exception"));
 
         assertEquals(ProfileStatus.State.Errored, health.status().getState());
     }
@@ -267,7 +267,7 @@ class RefusedWritesStatusTest {
             for (int i = 0; i < 5; i++) {
                 after(10);
                 flush();
-                health.connectionChecked(client.testConnection());
+                health.connectionChecked(client.checkConnection());
             }
         });
         createPointsStatus = Status.INTERNAL.withDescription("influx timeout");
@@ -276,7 +276,7 @@ class RefusedWritesStatusTest {
         String summary = logOf(() -> {
             after(300);
             flush();
-            health.connectionChecked(client.testConnection());
+            health.connectionChecked(client.checkConnection());
         });
         createPointsStatus = Status.OK;
         String back = logOf(this::flush);

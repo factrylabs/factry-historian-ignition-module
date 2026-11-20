@@ -607,12 +607,20 @@ public class FactryGrpcClient {
      * @return true if the server answers for this collector
      */
     public boolean testConnection() {
+        return checkConnection().isOk();
+    }
+
+    /**
+     * {@link #testConnection()}, with Factry's answer: OK, or why not (unreachable, a refused
+     * token, a deleted collector), for the profile status.
+     */
+    public Status checkConnection() {
         channelLock.readLock().lock();
         try {
             blockingStub.withDeadlineAfter(5, TimeUnit.SECONDS)
                     .getCollector(Empty.getDefaultInstance());
             connected = true;
-            return true;
+            return Status.OK;
         } catch (Exception e) {
             connected = false;
             logger.debug("Connection test failed: {}", e.getMessage());
@@ -623,9 +631,19 @@ public class FactryGrpcClient {
                 // 16 minutes on Linux. Drop it, so the next call opens a new connection.
                 channel.enterIdle();
             }
-            return false;
+            return Status.fromThrowable(e);
         } finally {
             channelLock.readLock().unlock();
         }
+    }
+
+    /**
+     * Whether Factry says the collector of the token was deleted. Factry v8.2.3 answers every
+     * call with NOT_FOUND "collector is deleted" then; there is no distinct code for it.
+     */
+    static boolean isCollectorDeleted(Status status) {
+        return status.getCode() == Status.Code.NOT_FOUND
+                && status.getDescription() != null
+                && status.getDescription().contains("collector is deleted");
     }
 }

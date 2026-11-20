@@ -43,7 +43,7 @@ class WriteHealthLoggingTest {
     /** Two answers taking turns (some writes time out, some are refused): not a WARN per flush. */
     @Test
     void alternatingAnswersAreEachLoggedOnce() {
-        health.connectionChecked(true);
+        health.connectionChecked(Status.OK);
         String log = logOf(() -> {
             for (int i = 0; i < 100; i++) {
                 now.addAndGet(1000);
@@ -64,20 +64,37 @@ class WriteHealthLoggingTest {
     void aFlappingCheckDoesNotRepeatTheStory() {
         String log = logOf(() -> {
             for (int cycle = 0; cycle < 10; cycle++) {
-                health.connectionChecked(true);
+                health.connectionChecked(Status.OK);
                 for (int i = 0; i < 31; i++) {
                     now.addAndGet(1000);
                     health.writeFailed(Status.UNKNOWN.withDescription("error writing points"), 5);
                 }
-                health.connectionChecked(false);
+                health.connectionChecked(Status.DEADLINE_EXCEEDED.withDescription("deadline exceeded after 5s"));
             }
-            health.connectionChecked(true);
+            health.connectionChecked(Status.OK);
             health.writeAccepted();
         });
         assertTrue(count(log, "WARN") + count(log, "INFO") <= 10, log);
         assertEquals(1, count(log, "did not store"), log);
+        assertEquals(1, count(log, "Cannot reach Factry Historian"), "the check failure once: " + log);
+        assertEquals(1, count(log, "answers the connection check again"), "and its recovery once: " + log);
         assertTrue(log.contains("Historian 'factry': Factry stores writes again, after 310 failed flushes / 1550"
                 + " points"), log);
+    }
+
+    /** A check that fails again with the same reason after passing for 5 minutes is news again. */
+    @Test
+    void aCheckFailureAfterALongGoodSpellIsLoggedAgain() {
+        Status down = Status.UNAVAILABLE.withDescription("io exception");
+        health.connectionChecked(Status.OK);
+        health.connectionChecked(down);
+        health.connectionChecked(Status.OK);
+        now.addAndGet(5 * 60_000);
+        health.connectionChecked(Status.OK);
+
+        String log = logOf(() -> health.connectionChecked(down));
+
+        assertEquals(1, count(log, "Cannot reach Factry Historian"), log);
     }
 
     /** Ignition keeps the instance when a profile is renamed; the log lines follow the new name. */
@@ -94,7 +111,7 @@ class WriteHealthLoggingTest {
     @Test
     void theQuarantineRetryIsDebugWhileWritesFail() {
         StoreAndForwardManager storeAndForward = storeAndForwardWithOneQuarantinedEntry();
-        health.connectionChecked(true);
+        health.connectionChecked(Status.OK);
 
         String healthy = logOf(() -> FactryHistoryProvider.retryQuarantinedData(storeAndForward, true, health, "factry"));
         health.writeFailed(Status.INTERNAL.withDescription("influx down"), 1);

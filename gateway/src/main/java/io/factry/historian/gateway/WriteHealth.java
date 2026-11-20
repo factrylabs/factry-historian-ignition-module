@@ -16,7 +16,8 @@ import java.util.function.LongSupplier;
  * CreatePoints (INTERNAL while its InfluxDB is down) or lets them all time out (InfluxDB
  * hanging). Store and forward keeps that data and retries it, but the profile would show
  * Running. So writes that all failed over at least {@link #FAILING_AFTER_MS} turn the status
- * Errored, until one is stored again. A failed check comes first: it says Factry is unreachable.
+ * Errored, until one is stored again. A failed check comes first and says why: unreachable, a
+ * refused token or a deleted collector.
  * <p>
  * Also logs the failed writes: one WARN per new answer from Factry, a summary about every
  * {@link #SUMMARY_EVERY_MS} while it lasts, and the totals when writes are stored again.
@@ -31,8 +32,16 @@ final class WriteHealth {
     private volatile String prefix;
     private final LongSupplier clock;
 
-    /** Null until the first connection check. */
-    private Boolean connected;
+    /** Factry's answer to the last connection check; null until the first one. */
+    private Status check;
+    /**
+     * The check failures logged at WARN (kind and code), and whether the current failure was
+     * one of them. Forgotten after the check passed for {@link #SUMMARY_EVERY_MS}, so a check
+     * that comes and goes does not log the same failure and recovery every cycle.
+     */
+    private final Set<String> loggedCheckFailures = new HashSet<>();
+    private boolean checkFailureLogged;
+    private long checkPassingSince;
     /** When the first write failed after the last stored one; null while writes are stored. */
     private Long failingSince;
     private long lastFailedAt;
@@ -71,14 +80,35 @@ final class WriteHealth {
     }
 
     /**
+     * Record the connection check. A failure is logged once with its reason, the recovery once
+     * after it; a check that comes and goes repeats neither (see {@link #loggedCheckFailures}).
      * A failed check restarts the status's count of failed writes, so after an outage they are
-     * judged afresh. What was logged stays, and the totals keep counting, until a write is stored.
+     * judged afresh. What was logged about writes stays, and the totals keep counting, until a
+     * write is stored.
      */
-    synchronized void connectionChecked(boolean ok) {
-        connected = ok;
-        if (!ok) {
+    synchronized void connectionChecked(Status status) {
+        long now = clock.getAsLong();
+        boolean wasPassing = check == null || check.isOk();
+        check = status;
+        if (!status.isOk()) {
+            CheckFailure failure = checkFailure(status);
+            if (loggedCheckFailures.add(failure + ":" + status.getCode())) {
+                logger.warn(prefix + failure.details(status));
+                checkFailureLogged = true;
+            } else if (wasPassing) {
+                checkFailureLogged = false;
+            }
             failingSince = null;
             return;
+        }
+        if (!wasPassing) {
+            checkPassingSince = now;
+            if (checkFailureLogged) {
+                logger.info(prefix + "Factry Historian answers the connection check again");
+            }
+            checkFailureLogged = false;
+        } else if (now - checkPassingSince >= SUMMARY_EVERY_MS) {
+            loggedCheckFailures.clear();
         }
         if (failingLogged && clock.getAsLong() - summaryAt >= SUMMARY_EVERY_MS) {
             summaryAt = clock.getAsLong();
@@ -147,11 +177,13 @@ final class WriteHealth {
     }
 
     synchronized ProfileStatus status() {
-        if (connected == null) {
+        if (check == null) {
             return ProfileStatus.UNKNOWN;
         }
-        if (!connected) {
-            return ProfileStatus.ERRORED;
+        if (!check.isOk()) {
+            CheckFailure failure = checkFailure(check);
+            return new ProfileStatus(ProfileStatus.State.Errored, LocalizedString.createRaw(failure.message),
+                    failure.details(check));
         }
         if (failing()) {
             // The gateway's historian page shows an Errored profile as "Error" with the details as
@@ -173,10 +205,56 @@ final class WriteHealth {
                 + " retries it.";
     }
 
+    /** Why the connection check fails, in words an operator can act on. */
+    enum CheckFailure {
+        UNREACHABLE("Factry Historian unreachable", "Cannot reach Factry Historian (%s)."),
+        TOKEN_REFUSED("Factry refused the collector token",
+                "Factry refused the collector token (%s). Replace the token in the profile settings."),
+        COLLECTOR_DELETED("Collector deleted in Factry",
+                "The collector of this token was deleted in Factry (%s). Create a collector in Factry"
+                        + " and paste its token in the profile settings."),
+        OTHER("Factry Historian check failed", "The connection check to Factry Historian failed (%s).");
+
+        final String message;
+        private final String details;
+
+        CheckFailure(String message, String details) {
+            this.message = message;
+            this.details = details;
+        }
+
+        String details(Status status) {
+            return String.format(details, describe(status)) + " Store and forward keeps the data until it can"
+                    + " be stored.";
+        }
+    }
+
+    static CheckFailure checkFailure(Status status) {
+        switch (status.getCode()) {
+            case UNAVAILABLE:
+            case DEADLINE_EXCEEDED:
+                return CheckFailure.UNREACHABLE;
+            case UNAUTHENTICATED:
+            case PERMISSION_DENIED:
+                return CheckFailure.TOKEN_REFUSED;
+            default:
+                return FactryGrpcClient.isCollectorDeleted(status) ? CheckFailure.COLLECTOR_DELETED : CheckFailure.OTHER;
+        }
+    }
+
+    /** Code, Factry's text and the underlying cause (an SSL or socket error says most). */
     static String describe(Status status) {
+        StringBuilder sb = new StringBuilder(status.getCode().toString());
         String description = status.getDescription();
-        return description == null || description.isEmpty()
-                ? status.getCode().toString() : status.getCode() + ": " + description;
+        if (description != null && !description.isEmpty()) {
+            sb.append(": ").append(description);
+        }
+        Throwable cause = status.getCause();
+        if (cause != null && cause.getMessage() != null
+                && (description == null || !description.contains(cause.getMessage()))) {
+            sb.append(": ").append(cause.getMessage());
+        }
+        return sb.toString();
     }
 
     private static String duration(long millis) {
