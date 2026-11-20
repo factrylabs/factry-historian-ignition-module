@@ -26,6 +26,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 
 /**
@@ -167,7 +168,9 @@ class FakeFactry extends FactryGrpcClient {
         }
         List<Measurement> found = new ArrayList<>();
         for (Measurement m : measurements) {
-            if (!isDeleted(m) && (!request.hasKeyword() || m.getName().contains(request.getKeyword()))
+            // Factry's keyword search ignores case (checked live on v8.2.3)
+            if (!isDeleted(m) && (!request.hasKeyword()
+                        || m.getName().toLowerCase(Locale.ROOT).contains(request.getKeyword().toLowerCase(Locale.ROOT)))
                     && (request.getDatabaseUUIDsCount() == 0
                         || request.getDatabaseUUIDsList().contains(databaseOf.get(m.getUuid())))
                     && (request.getCollectorUUIDsCount() == 0

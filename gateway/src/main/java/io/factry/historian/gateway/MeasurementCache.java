@@ -30,11 +30,13 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Consumer;
+import java.util.function.Function;
 import java.util.function.LongSupplier;
 import java.util.function.Predicate;
 
@@ -81,6 +83,17 @@ public class MeasurementCache {
     private volatile ConcurrentHashMap<String, String> readKeyToUUID = new ConcurrentHashMap<>();
     /** UUID → the key browse publishes: the bare name when it reads this measurement, else qualified. */
     private volatile ConcurrentHashMap<String, String> uuidToReadKey = new ConcurrentHashMap<>();
+    /**
+     * Lowercased name → the name or read key with that spelling ignoring case (a String), or
+     * the several of them (an immutable Set, replaced on change; rare), from
+     * {@link #tagPathToUUID}, {@link #inactiveByName} and {@link #readKeyToUUID}. Lets a name
+     * nothing has exactly find a measurement whose name differs in case only, without walking
+     * the cache. Rebuilt on every refresh and only added to in between: a name removed since
+     * may linger, so every candidate is checked against those maps.
+     */
+    private volatile ConcurrentHashMap<String, Object> byLowerCase = new ConcurrentHashMap<>();
+    /** This collector, from the last refresh, so a read can prefer its measurement. */
+    private volatile String ownCollector = null;
     /** Measurement UUID → database UUID, where known. */
     private volatile ConcurrentHashMap<String, String> uuidToDatabase = new ConcurrentHashMap<>();
     /** Time-series database UUID → name, from the last full refresh. */
@@ -179,6 +192,7 @@ public class MeasurementCache {
             // the tag's measurement again.
             if (!"deleted".equalsIgnoreCase(m.getStatus())) {
                 putInactive(inactiveByName, m, collectorUUID);
+                index(m.getName());
             }
         }
     }
@@ -437,6 +451,14 @@ public class MeasurementCache {
             // Swap in freshly-built maps by reference so deleted measurements don't linger and
             // concurrent readers never observe a half-filled map. The UUID map goes first, so a
             // name found in the new path map always has its measurement.
+            // The index goes before the maps: a name another thread caches after the swap of the
+            // maps is then indexed too.
+            ConcurrentHashMap<String, Object> freshLowerCase = new ConcurrentHashMap<>();
+            for (Set<String> names : List.of(freshPaths.keySet(), freshInactive.keySet(), freshReadKeys.keySet())) {
+                names.forEach(name -> index(freshLowerCase, name));
+            }
+            byLowerCase = freshLowerCase;
+            ownCollector = ownCollectorUUID;
             uuidToMeasurement = new ConcurrentHashMap<>(freshMeasurements);
             tagPathToUUID = new ConcurrentHashMap<>(freshPaths);
             inactiveByName = new ConcurrentHashMap<>(freshInactive);
@@ -753,9 +775,9 @@ public class MeasurementCache {
      * that this collector may write to, or its Paused one, turns up, up to
      * {@link #LOOKUP_MAX_PAGES}.
      *
-     * Returns every measurement with exactly that name, of any status; empty when Factry has
-     * none. A connection error (UNAVAILABLE, DEADLINE_EXCEEDED) is thrown, so the caller
-     * stops rather than waiting out the deadline once per tag. Any other error is logged and
+     * Returns every measurement with that name, of any status, also those whose name differs
+     * in letter case only (the callers prefer the exact name); empty when Factry has none. A
+     * connection error (UNAVAILABLE, DEADLINE_EXCEEDED) is thrown, so the caller stops rather than waiting out the deadline once per tag. Any other error is logged and
      * ends the lookup with the matches so far, so the measurement is created as before.
      */
     private List<Measurement> lookUpByName(String tagPath, FactryGrpcClient grpcClient) {
@@ -781,8 +803,9 @@ public class MeasurementCache {
                         .build();
                 Measurements response = grpcClient.getMeasurementsByFilterWithDeadline(request);
                 for (Measurement m : response.getMeasurementsList()) {
-                    // Keyword search is fuzzy/substring, so match the exact name ourselves.
-                    if (tagPath.equals(m.getName())) {
+                    // Keyword search is fuzzy/substring and ignores case, so match the name
+                    // ourselves. Names that differ in case only are kept for a tag renamed that way.
+                    if (tagPath.equalsIgnoreCase(m.getName())) {
                         matches.add(m);
                     }
                 }
@@ -790,11 +813,14 @@ public class MeasurementCache {
                 offset += count;
                 boolean more = count == LOOKUP_PAGE_SIZE
                         && (response.getTotal() == 0 || offset < response.getTotal());
-                if (!more || matches.stream().anyMatch(enough)) {
+                if (!more || matches.stream().anyMatch(m -> tagPath.equals(m.getName()) && enough.test(m))) {
                     break;
                 }
                 if (page == LOOKUP_MAX_PAGES) {
-                    warnLookupBound(tagPath, offset, response.getTotal());
+                    // Another spelling may do, if no exact name turns up (see oneIgnoringCase)
+                    if (matches.stream().noneMatch(enough)) {
+                        warnLookupBound(tagPath, offset, response.getTotal());
+                    }
                     break;
                 }
             }
@@ -867,7 +893,59 @@ public class MeasurementCache {
 
     private Measurement measurementForReadKey(String readKey) {
         String uuid = readKeyToUUID.get(readKey);
+        if (uuid == null) {
+            Map<String, String> keys = readKeyToUUID;
+            String own = ownCollector;
+            // Several: this collector's wins, as for an exact name (takesName), so a tag reads
+            // the measurement it writes to.
+            String key = oneIgnoringCase(readKey, sameIgnoringCase(readKey), keys::get, uuid2 -> {
+                Measurement m = uuidToMeasurement.get(uuid2);
+                // The write path's check: one without a collector counts as this collector's
+                return m != null && isOwnedBy(m, own);
+            });
+            uuid = key != null ? keys.get(key) : null;
+        }
         return uuid != null ? uuidToMeasurement.get(uuid) : null;
+    }
+
+    /** Names already reported as matching several measurements ignoring case. */
+    private final Set<String> caseClashesReported = ConcurrentHashMap.newKeySet();
+    /** How many candidate names the case fallback has looked at; tests check it stays small. */
+    volatile long caseCandidatesExamined = 0;
+
+    /**
+     * For a name nothing has exactly (a tag renamed in letter case only, {@code Tank/Flow} to
+     * {@code Tank/flow}): the key among {@code candidates} that matches it ignoring case and
+     * names a measurement ({@code uuidOf}). When several measurements match, the one
+     * {@code preferred} says is the only preferred one; else none is guessed, and that is logged
+     * once per name until the name resolves again. Factry names are case-sensitive, so several
+     * can exist.
+     */
+    private String oneIgnoringCase(String name, Collection<String> candidates, Function<String, String> uuidOf,
+                                   Predicate<String> preferred) {
+        Map<String, String> keyOf = new LinkedHashMap<>();
+        for (String key : candidates) {
+            caseCandidatesExamined++;
+            String uuid = key.equalsIgnoreCase(name) ? uuidOf.apply(key) : null;
+            if (uuid != null) {
+                keyOf.putIfAbsent(uuid, key);
+            }
+        }
+        if (keyOf.size() > 1) {
+            List<String> own = keyOf.keySet().stream().filter(preferred).toList();
+            if (own.size() == 1) {
+                keyOf.keySet().retainAll(own);
+            }
+        }
+        if (keyOf.size() == 1) {
+            caseClashesReported.remove(name);
+            return keyOf.values().iterator().next();
+        }
+        if (keyOf.size() > 1 && caseClashesReported.add(name)) {
+            logger.warn("Measurements {} all match '{}' ignoring case; none is used for it. Factry names are"
+                    + " case-sensitive: name the tag like one of them exactly", keyOf.values(), name);
+        }
+        return null;
     }
 
     /** The database UUID a known database name in a read key names, or null. */
@@ -925,7 +1003,12 @@ public class MeasurementCache {
                 if (database != null) {
                     uuidToDatabase.put(found.getUuid(), database);
                 }
-                putReadKey(readKey, found, collectorUUID);
+                // A name that differs in case only gets its own key; measurementForReadKey
+                // falls back to it when nothing has the exact one.
+                String key = name.equals(found.getName()) ? readKey
+                        : readKey.equals(name) ? found.getName()
+                        : TagPathUtil.qualify(TagPathUtil.database(readKey), found.getName());
+                putReadKey(key, found, collectorUUID);
             }
         }
     }
@@ -959,6 +1042,7 @@ public class MeasurementCache {
             return;
         }
         readKeyToUUID.put(key, uuid);
+        index(key);
         if (bare) {
             uuidToReadKey.put(uuid, key);
         } else {
@@ -1019,6 +1103,7 @@ public class MeasurementCache {
             Measurement cached = getMeasurementByName(m.getName());
             if (cached == null || !isOwnedBy(cached, collectorUUID) || isOwnedBy(m, collectorUUID)) {
                 tagPathToUUID.put(m.getName(), m.getUuid());
+                index(m.getName());
             }
             // This collector's measurements are the own Site's by definition; another
             // collector's, found by name for the write path, may be another Site's.
@@ -1031,7 +1116,36 @@ public class MeasurementCache {
             }
         } else {
             putInactive(inactiveByName, m, collectorUUID);
+            index(m.getName());
         }
+    }
+
+    private void index(String name) {
+        index(byLowerCase, name);
+    }
+
+    private static void index(ConcurrentHashMap<String, Object> byLowerCase, String name) {
+        // toLowerCase returns the name itself when it is lowercase already: no copy then
+        byLowerCase.merge(name.toLowerCase(Locale.ROOT), name, (current, added) -> {
+            Set<String> names = asSet(current);
+            if (names.contains(name)) {
+                return current;
+            }
+            Set<String> more = new HashSet<>(names);
+            more.add(name);
+            return Set.copyOf(more);
+        });
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Set<String> asSet(Object indexed) {
+        return indexed instanceof String one ? Set.of(one) : (Set<String>) indexed;
+    }
+
+    /** The indexed names that may match {@code name} ignoring case; check each. */
+    private Set<String> sameIgnoringCase(String name) {
+        Object names = byLowerCase.get(name.toLowerCase(Locale.ROOT));
+        return names != null ? asSet(names) : Set.of();
     }
 
     /** Why the module does not write a tag's values to the measurement Factry has under its name. */
@@ -1088,9 +1202,34 @@ public class MeasurementCache {
     /**
      * The cached measurement the write path judges for {@code tagPath}: this collector's
      * Active one, else its Paused one, else another Active one, else one in another status
-     * (this collector's if several); or null when the cache has none.
+     * (this collector's if several); or null when the cache has none. Without one under the exact
+     * name, this collector's Active or Paused one whose name matches ignoring case.
      */
     Measurement writeTarget(String tagPath, String collectorUUID) {
+        Measurement exact = exactWriteTarget(tagPath, collectorUUID);
+        if (exact != null) {
+            return exact;
+        }
+        // Renamed in letter case only: this collector's measurement under the old spelling, if it
+        // writes there or has it Paused. Not another collector's, nor one it has only Discovered:
+        // for those the tag gets its own measurement, as before.
+        Map<String, String> owned = new HashMap<>();
+        for (String name : sameIgnoringCase(tagPath)) {
+            String uuid = tagPathToUUID.get(name);
+            Measurement m = uuid != null ? uuidToMeasurement.get(uuid) : null;
+            if (m != null && isOwnedBy(m, collectorUUID)) {
+                owned.put(name, uuid);
+            }
+            Measurement inactive = inactiveByName.get(name);
+            if (inactive != null && writeRefusal(inactive, collectorUUID) == WriteRefusal.PAUSED) {
+                owned.putIfAbsent(name, inactive.getUuid());
+            }
+        }
+        String name = oneIgnoringCase(tagPath, owned.keySet(), owned::get, uuid -> false);
+        return name != null ? exactWriteTarget(name, collectorUUID) : null;
+    }
+
+    private Measurement exactWriteTarget(String tagPath, String collectorUUID) {
         Measurement active = getMeasurementByName(tagPath);
         if (active != null && isOwnedBy(active, collectorUUID)) {
             return active;
