@@ -27,9 +27,11 @@ The module implements a custom historian that writes tag data to Factry via gRPC
 1. Open the Factry Historian web UI
 2. Go to **Collectors** in the sidebar
 3. Click **Create Collector**
-4. Select your time series database
+4. Select your time series database as the collector's default database. Without a default database, Factry keeps new measurements in Discovered and stores nothing
 5. Give it a name (e.g., `Ignition`)
 6. Click **Generate Token** and **copy the token**
+
+For a dev setup, `script/setup-factry.sh` does the same through Factry's REST API (checked against Factry v8.2.3). Set `FACTRY_URL` if Factry is not on `http://localhost:8000`.
 
 ### 2. Create a Historian in Ignition
 

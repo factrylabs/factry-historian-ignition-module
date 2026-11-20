@@ -133,14 +133,16 @@ The single point of contact with Factry. Wraps a gRPC `ManagedChannel` and expos
 | `createMeasurements(CreateMeasurementsRequest)` | `CreateMeasurements` | Auto-onboard new measurements |
 | `queryTimeseries(QueryTimeseriesRequest)` | `QueryTimeseries` | Read raw or aggregated data |
 | `getAssets()` | `GetAssets` | List all assets |
-| `testConnection()` | `GetMeasurements` (lightweight) | Connection health check |
+| `testConnection()` | `GetCollector` (5 s deadline) | Connection and token check; not `GetMeasurements`, which is too slow on large sites |
 
 **Key design points:**
 - **TLS modes**: plain text, TLS with bundled CA cert, TLS with insecure trust (skip verification), fallback to system trust store
 - **Connection tracking**: `connected` flag set to `false` on `createPoints()` failure, checked by `StorageEngine.isEngineUnavailable()` so S&F can buffer without hitting the network
-- **Write deadline**: 3-second timeout on writes (configurable via `ModuleProperties`)
+- **Deadlines**: every call has one, so a Factry that never answers cannot hang the module: 3 s for store lookups, 3 s plus 1 ms per point or measurement (at most 30 s) for writes and measurement creation, 30 s for history queries, each cache refresh page and the asset fetches, 10 s for the other small calls (configurable via `ModuleProperties`). The connection test has a fixed 5 s
+- **Dead connections**: no keepalive pings, because Factry closes a connection that pings without a call running (`too_many_pings`). When `testConnection()` times out, the channel drops its connection with `enterIdle()` so the next call opens a new one
 - **Auth headers**: every call includes `collectoruuid` + `authorization: Bearer <token>` metadata
-- **Read/write lock**: prevents race conditions during `reconfigure()` — old channel is shut down and replaced atomically
+- **Token stays out of the log**: Netty's frame logger `io.grpc.netty.shaded.io.grpc.netty.NettyClientHandler` writes every header at DEBUG, the token included. The client gives it its own INFO level before every call, so DEBUG on `io.grpc`, root or any level between does not reach it, also after a logback reload. That is why the Logs page shows INFO on this logger. Never set that exact logger to DEBUG on a production gateway.
+- **Read/write lock**: prevents race conditions during `reconfigure()` — old channel is shut down and replaced atomically. `reconfigure()` and `shutdown()` wait at most 3 s for running calls, then cancel them
 - **Reconfiguration**: `handleSettingsChange()` calls `reconfigure()` to swap the channel without restarting the module
 
 ### `MeasurementCache.java`
@@ -152,10 +154,14 @@ In-memory cache of Factry measurements and assets. Both the storage engine and q
 - `tagPathToUUID` — maps stored tag path (e.g., `Ignition-abc:[default]Temperature`) to Factry UUID
 - `uuidToMeasurement` — maps UUID to full `Measurement` proto object
 - `refresh(grpcClient)` — fetches all measurements from Factry, replaces the maps. Only keeps measurements with `status=Active`
-- `getOrCreateUUID(tagPath, grpcClient, value)` — cache lookup with auto-creation: on miss, creates the measurement in Factry, polls until visible, returns UUID. Includes concurrent creation prevention (`pendingCreations` set) and data type detection from the value
+- `sync(grpcClient)` — the scheduled update. Every 30 s it asks only for this collector's measurements changed since the newest `updatedAt` it has seen (`GetMeasurements` with `collectorUUID` and `since`; Factry compares strictly and also returns Paused and Deleted ones, checked live on 8.2.3), and applies them as a full refresh would: an Active one is cached, a Paused one refused, a Deleted one dropped so the next write creates it again. Every 10 minutes (`measurement.cache.full.refresh.seconds`), or while no full refresh has worked yet, it runs `refresh` instead. Measurements made by hand or by other collectors, and assets, show up in browse from that reload; a read by exact name finds them at once
+- `getOrCreateUUID(tagPath, grpcClient, value)` — cache lookup with auto-creation: on miss, creates the measurement in Factry, polls until visible, returns UUID. Includes concurrent creation prevention (`pendingCreations` set). The data type comes from the tag's Ignition `dataType` metadata when known (Store and Forward hands Boolean values over as Long 0/1), else from the value. Dates are stored as epoch milliseconds in a `number` measurement, and the tag's Ignition data type is written to the measurement settings (`ignitionDataType`, a Date value without metadata counts as `DateTime`) so queries can return Dates. NaN and Infinity are written as a Bad point without a value, and Longs above 2^53 as the nearest double, with a warning once per tag
 - `evictByUUID(uuid)` — removes a measurement so it gets re-created on next write (used when Factry rejects points for deleted measurements)
+- Before creating a measurement, the write path looks its exact name up in Factry and reuses an Active one. Measurements that are not Active (Discovered, ...) are kept in `inactiveByName`, for the write path only. Values for a tag whose measurement exists only in another status are discarded (`WriteRefusal.NOT_ACTIVE`): counted as handled, so store and forward does not retry them, with one warning per flush naming the newly refused tags and a count in `HistorianMetrics.getDiscardedPointCount()`. The measurement is not created again
+- `writeRefusal(measurement, collectorUUID)` — the one check of whether the module may write to a measurement. Factry answers OK to points written to another collector's measurement and drops them, so the write paths only use measurements of the module's own collector (or without a collector UUID). Browse and query keep every collector's measurements; when several have the same name (one per time-series database), the cache keeps the module's own under that name, so query by name prefers it too. When the measurement with a tag's name is another collector's (`WriteRefusal.OTHER_COLLECTOR`), the module asks Factry once per tag to create its own, since the other may be in another database, and polls until one of its own appears. If none Active appears, the tag's values are discarded like a `NOT_ACTIVE` tag's. A measurement of its own with that name in another status (the Discovered duplicate such a try leaves) counts as tried, so a restart does not try again
+- Paused measurements of the module's own collector (Factry's way to tell collectors to stop collecting) are refused as `WriteRefusal.PAUSED`: values for them are dropped and counted as handled (`HistorianMetrics.getPausedDroppedPointCount()`), with one warning per flush naming the newly paused tags and one info line when a tag is written again. The measurement is never created again. Array tags keep merging their element changes while paused, so the first value after the resume is the whole current array. From the first cache refresh after the measurement is Active again, new values are stored. Another collector's Paused measurement counts as `OTHER_COLLECTOR`
 
-**Refreshed every 30 seconds** by `FactryHistoryProvider`'s scheduled executor.
+**Synced every 30 seconds** by `FactryHistoryProvider`'s scheduled executor, with a full reload every 10 minutes. Measured against a live Factry with 84 measurements, 10 minutes of the timer went from 60 calls and 262 KB (a full reload every 30 s) to 22 calls and 13 KB. At 20,000 measurements (about 145 bytes each) the full reload is about 2.9 MB, so about 0.4 GB a day instead of 8 GB.
 
 ### `proto/historian/historian.proto`
 
@@ -193,7 +199,7 @@ The `toSettings()` / `fromSettings()` methods convert between the UI record and 
 
 Internal settings object implementing `HistorianSettings`. Holds all configuration plus derived fields:
 
-- `applyTokenDefaults(token)` — parses the JWT to extract `grpcHost`, `grpcPort`, `collectorUUID`
+- `applyTokenDefaults(token)`: cleans the token with `JwtTokenParser.normalize()`, parses the JWT to extract `grpcHost`, `grpcPort`, `collectorUUID`, and returns the cleaned token, which the provider gives to the gRPC client
 - `validate()` — checks that collector ID, host, port (1-65535), batch size (>0), batch interval (>0) are valid
 
 This is what the engines and gRPC client receive. The separation from `FactryHistorianConfig` allows internal fields (like parsed JWT claims) that aren't shown in the UI.
@@ -212,6 +218,8 @@ Parses the Factry collector JWT token **without signature verification** (the mo
 - `grpc-port` — gRPC port
 
 Used by `FactryHistorianSettings.applyTokenDefaults()`.
+
+`normalize(token)` removes all whitespace (a pasted token often ends with a newline or space, or is wrapped over two lines, and Factry refuses it then) and checks that what remains is three base64url parts separated by dots. Its error message never contains the token.
 
 ### `TagPathUtil.java`
 
@@ -239,6 +247,9 @@ Implements `HistoricalNode` — the Ignition SDK's representation of a browsable
 - `"boolean"` → `DataType.Boolean`
 - `"number"` → `DataType.Float8`
 - `"string"` → `DataType.String`
+- a measurement whose `ignitionDataType` setting is `DateTime` → `DataType.DateTime`. Factry keeps the dates as epoch milliseconds; the query engine returns them as `java.util.Date`. Aggregates of such a tag: LastValue, Minimum, Maximum, MinMax, Average and SimpleAverage are Dates, Count is a number, and Sum, Range, Variance and StdDev read null with `Bad_Unsupported` on every row (set in the processing context, like a refused pen's `Bad_Failure`). Measurements created before this setting existed read back as numbers. To have such a measurement read back as Dates and keep its history, add the setting in Factry instead of deleting the measurement: `GET /api/measurements/{uuid}`, then `PUT /api/measurements/{uuid}` with the same `Attributes`, `CollectorUUID`, `DatabaseUUID`, `Datatype`, `Description`, `Metadata`, `Name` and `Status`, and `Settings` plus `"ignitionDataType": "DateTime"`. The module reads Dates from its next cache sync (within 30 s for its own measurements, at most 10 minutes for another collector's). The bulk `PATCH /api/measurements` refuses it ("Setting ignitionDataType is not common to all selected measurements"). Checked on Factry v8.2.3.
+- Array tags get their Ignition type in the setting too (e.g. `DateTimeArray`); the elements of such a measurement read back as Dates.
+- An array element path `Arr[i]` gets a node of its own: the measurement `Arr` (data type `[]number`, `[]string`, `[]boolean`), element `i`, the element's type, and a node id that includes the index. A measurement whose own name is `Arr[i]` still wins. The base path `Arr` of an array measurement resolves too, but reads as unsupported (see the query engine).
 
 ### `ModuleProperties.java`
 
@@ -248,9 +259,20 @@ Loads tuning values from `factry-historian.properties` (bundled in the .modl). T
 
 | Property | Default | Controls |
 |----------|---------|----------|
-| `grpc.write.deadline.seconds` | 3 | Timeout on `createPoints()` calls |
-| `status.cache.ms` | 30000 | How long to cache historian status (avoids gRPC poll on every UI refresh) |
-| `measurement.cache.refresh.seconds` | 30 | How often to reload measurements from Factry |
+| `grpc.write.deadline.seconds` | 3 | Timeout on store lookups; base timeout on `createPoints()` and `createMeasurements()` |
+| `grpc.write.deadline.ms.per.point` | 1 | Added to the `createPoints()` timeout per point (plus time for its size, see `grpc.write.min.bytes.per.second`), and to the `createMeasurements()` timeout per measurement |
+| `grpc.write.deadline.max.seconds` | 30 | Ceiling on the `createPoints()` and `createMeasurements()` timeouts |
+| `grpc.write.max.message.bytes` | 4194304 | Largest `createPoints()` message (at least 64 KiB); a bigger flush goes in several calls |
+| `grpc.write.min.bytes.per.second` | 262144 | Link speed the `createPoints()` timeout allows for: the message's size divided by this is added to it, within the ceiling |
+| `grpc.write.gzip` | true | Send `createPoints()` gzip-compressed. If Factry has no gzip decompressor, the client resends the batch uncompressed and stops using gzip until the historian settings are saved |
+| `grpc.read.deadline.seconds` | 30 | Timeout on history queries, on each page of the measurement cache refresh, and on the asset and asset property fetches |
+| `grpc.call.deadline.seconds` | 10 | Timeout on the small calls: collectors, health, collector state |
+| `grpc.shutdown.grace.seconds` | 3 | How long a settings save or shutdown waits for running calls before it cancels them |
+| `status.cache.ms` | 30000 | How often the connection check runs; it pauses S&F while Factry is unreachable and resumes it when it is back |
+| `measurement.cache.refresh.seconds` | 30 | How often to ask Factry for this collector's changed measurements (new, Paused, Deleted) |
+| `measurement.cache.full.refresh.seconds` | 600 | How often to reload every measurement, collector and asset |
+| `measurement.lookup.miss.seconds` | 60 | How long a read remembers that Factry has no measurement with a name, before it looks the name up again |
+| `query.raw.max.points` | 500000 | Most raw points one query reads over all its pens; a range that holds more fails the read with an error. An aggregated read fails the same way, before it asks Factry, when pens x intervals (twice for MinMax) is more. About 200 bytes of heap per point while the query runs, so about 100 MB per query |
 
 ---
 
@@ -268,12 +290,16 @@ Extends `AbstractStorageEngine`. Receives data points from Ignition's tag system
 3. Looks up (or auto-creates) the measurement UUID via `MeasurementCache`
 4. Converts value to protobuf `Value` (Boolean, Number, String)
 5. Maps Ignition `QualityCode` to status string ("Good", "Uncertain", "Bad")
-6. Sends `CreatePoints` gRPC call
+6. Sends `CreatePoints` gRPC call, in parts of at most `grpc.write.max.message.bytes`. Factry refuses a message over 64 MiB (`RESOURCE_EXHAUSTED`, checked after decompression) every time, so a part it still finds too large is sent in halves; so is a part a proxy refuses with HTTP 413 (grpc-java: `UNKNOWN` "HTTP status code 413"). Half the refused size is then the most per call until the settings are saved, so the next flush is not refused again. A single point too large on its own can never be stored; it is sent as a Bad point without a value, with a WARN naming the tag and time. Factry v8.2.3 also answers OK to string values over about 1 MiB but does not store them.
 7. On failure: distinguishes connection errors (UNAVAILABLE, DEADLINE_EXCEEDED) from server rejections. On rejection, evicts the measurement UUID and retries once (handles deleted measurements)
+
+Steps 2 to 7 live in `PointWriter`, which the engine calls; it uses no Ignition gateway classes, so unit tests can run it against a fake Factry client.
 
 **`isEngineUnavailable()`** — returns `true` when the gRPC connection is down. This is how S&F knows to buffer instead of attempting writes.
 
-**`doStoreMetadata()`** / **`doStoreSourceChange()`** — no-ops. Metadata is managed on the Factry platform, not pushed from Ignition.
+**`doStoreMetadata()`**: caches each tag's metadata in `MeasurementCache`; it sends nothing to Factry by itself. When the module creates a measurement for the tag, its data type, description, engineering units and limits (the `Config` attributes) and the `ignitionDataType` setting come from this cache. The cache keeps the metadata after the create, so a failed create or a measurement deleted in Factry is created again with it: Ignition may not send it again.
+
+**`applySourceChanges()`**: drops the cached metadata of retired and renamed tags. Measurements in Factry are left alone.
 
 ### `FactryQueryEngine.java`
 
@@ -282,10 +308,13 @@ Extends `AbstractStorageEngine`. Receives data points from Ignition's tag system
 Extends `AbstractQueryEngine`. Handles all data retrieval from Factry.
 
 **`doQueryRaw(options, processor)`**:
-1. Maps each `RawQueryKey` to stored tag path → measurement UUID (via `lookupUUID`)
-2. `lookupUUID` checks cache, then refreshes from Factry on miss
-3. Builds `QueryTimeseriesRequest` with measurement UUIDs and time range
-4. Iterates response `Series` → `SeriesPoint`, converts protobuf values to Java, creates `AtomicPoint` objects, feeds them to the `RawPointProcessor`
+1. Maps each `RawQueryKey` to the measurement UUID of the node `mapKeysToNodes` resolved (the cache; on a miss, one exact-name lookup in Factry, see "Resolving a tag" below)
+2. Several keys can read one measurement: the elements `Arr[0]`, `Arr[1]`, ... of an array tag, which Ignition historizes as paths of their own and `PointWriter` stores as one list per row in measurement `Arr`. Each element key gets its element of every stored row; an element a row does not hold is a Bad point without a value. Every element counts as a point for `returnSize` and `query.raw.max.points`, as separate tags would; a pen Factry refuses fails all its element columns. The base path `Arr` reads null with `Bad_Unsupported` on every row: Ignition historizes the elements, not the array, and a whole list has no place in one column (read as a value it was 0.0, Good). Ignition's wide writer starts a row for every point, also for two pens at the same time, so a stored array row gives one row per element read
+3. Builds `QueryTimeseriesRequest` with measurement UUIDs and time range, grouped by status
+4. Reads in pages of `limit`/`offset` (Factry applies both per series), halving the page when an answer is too large, and keeps only the first `returnSize` points across all pens when Ignition sets one. With `returnSize`, each page drops the points past the first `returnSize` and stops paging pens whose next points come after them, so a read holds about `returnSize` points plus one page per pen, and the cap counts only the points kept. When Factry refuses a pen (see item 7), the read starts again from the first page without that pen: its points may have decided where the first `returnSize` end and which pens stopped paging. Fails the read when the range holds more than `query.raw.max.points` points over all pens, or when a page starts before the previous one ended, as a Factry that ignores `offset` would answer. Part of a range is never returned: Ignition repeats a pen's last value with Good quality into every row after its data stops, so a pen cut short looks like a flat line. Ignition's own `HistoryWriter` fails the same way at its row limit
+5. Adds per pen the last sample before the start and the first sample at or after the end, at their own times and qualities, as Ignition's Core Historian adds its seed values. A tag stored on change then has a value at the start of a trend, also when it did not change inside the range. Two requests for all pens (`limit 1` grouped by status, `desc` for the one before; Factry applies the limit per measurement and status), none for pens Factry refused, and none after the end when the range ends after now. Left out when the query options carry `NO_BOUND_VALUES` (`queryTagHistory(..., includeBoundingValues=False)`), or `NO_SEED_VALUES` without `YES_BOUND_VALUES`. Ignition 8.3.6 (historian 1.3.6, `HistorianQueryInterface.createQuery`) sets `NO_SEED_VALUES` on every raw read through its legacy path, which `system.tag.queryTagHistory` uses: there the bounds come only with `includeBoundingValues=True` (`YES_BOUND_VALUES`, which wins, as in Ignition's legacy loaders). Ignition 8.3.0 to 8.3.5 (historian 1.3.3) set it only for raw columns in a read that also has aggregated ones, so there plain raw reads (`queryTagHistory` without `includeBoundingValues`, `queryRawPoints`, raw bindings) get the bounds by default, as from the Core Historian on those versions. The Core Historian ignores `YES_BOUND_VALUES` and returns no bounds on that path at all. `system.historian.queryRawPoints` takes the same path (`HistorianManagerImpl.queryDataPoints` turns its options into legacy query parameters), so in 8.3.6 it gets no bounds either, unless a `RawQueryOptions` passed as its first argument carries `YES_BOUND_VALUES`. Only a caller of the query engine itself that sets no option gets them by default. With `returnSize` the value before the start counts as the first point and the one after the end only fits if the cap is not reached. When Factry refuses these reads, the range is returned without them; when Factry itself cannot be read (unavailable, timed out, token refused) the read fails, as for the range. A sample exactly at the end is the value after the end (Factry's end is exclusive, checked live), and comes back once. The read before the start scans from epoch 0, so on a large database it can be the slowest request of the read (the Average path sends the same one). Ignition's wide writer keeps only the first row past the end
+6. Iterates response `Series` → `SeriesPoint`, converts protobuf values to Java, creates `AtomicPoint` objects, and feeds them to the `RawPointProcessor` in one time order across all pens. Ignition builds wide-format rows from that single stream; pen by pen gives rows out of order with values carried between pens
+7. A pen Factry refuses on its own (for example a measurement deleted after it was cached) reads null with `Bad_Failure` on every row, and the other pens still show their data. The engine reads Factry before it initializes Ignition's processor, and gives that pen a `Bad_Failure` quality in the `ProcessingContext`, the way `mapKeysToNodes` marks an unknown tag `Bad_NotFound`. Ignition then builds an errored column for it. This is safe because `HistorianPointQueryExecutor.startReading` runs the whole query before it waits for the columns. The other ways fall short: a point with no value reads 0.0 in a number column, and `onKeyFailure` after initialization shows as `Bad_NotFound`. Factry fails a raw request for all pens when one of them fails, so after such a failure each pen is asked again on its own to find the one to blame. When Factry itself cannot be read (`UNAVAILABLE`, `DEADLINE_EXCEEDED`, `UNAUTHENTICATED`, `CANCELLED`), or a raw request for all pens fails while each pen alone reads fine, or Factry refuses every pen of a raw read, the read fails as a whole: it calls `processor.onError` and then throws, in `doQueryAggregated` too. Ignition's history reader ignores `onError` and would show an empty, Good result; the exception ends the dataset with an error instead. The Power Chart answers that with an error, and the RPC to Vision and Designer clients carries it. Gateway-scope `system.tag.queryTagHistory` and Perspective history bindings drop that error in Ignition itself (8.3.6) and still return an empty dataset. An aggregated read whose pens all fail on their own (for example `UNKNOWN` on every call while Factry's database is down) still shows `Bad_Failure` columns on every interval row, not an error. Ignition splits one chart into several queries and runs them in one loop (`AggregateHistoryQueryExecutor.startReading`) that the first error ends: one query per historian (`HistorianManagerImpl`), and with `FillMode.DERIVED` one per aggregated pen. An error from one query would take the other queries' pens down with it. A raw read with every pen refused fails instead: raw rows come only from points, so it would otherwise be an empty, Good dataset that looks like no data. The trade-off: when Factry itself is down or refuses every raw pen, the read fails, so a chart that mixes historians loses the other historians' pens too. A tag Factry does not have stays a `Bad_NotFound` column, not an error, also when every tag in the read is unknown; the engine builds those columns itself then, because `mapKeysToNodes` builds none and Ignition would wait 5 s for them
 
 **`doQueryAggregated(options, processor)`**:
 - Same pattern but adds aggregation function and interval to the request
@@ -293,32 +322,54 @@ Extends `AbstractQueryEngine`. Handles all data retrieval from Factry.
 
 | Ignition | Factry |
 |----------|--------|
-| Average, SimpleAverage | `mean` |
+| Average | `twa` with fill `previous`, over Good time only (see below) |
+| SimpleAverage | `mean` |
 | Minimum | `min` |
 | Maximum | `max` |
 | Sum | `sum` |
 | Count | `count` |
 | LastValue | `last` |
 | Range | `spread` |
-| Variance | `variance` |
-| StdDev | `stddev` |
-| MinMax | queries `min` and `max` separately, emits pairs |
+| Variance | `stddev` and `count`: s² (n - 1) / n, 0 for one sample (see below) |
+| StdDev | `stddev` and `count`: s √((n - 1) / n), 0 for one sample (see below) |
+| MinMax | queries `min` and `max` separately, a pair per bucket |
 
-- Time window → Go duration conversion (e.g., `TimeWindow(2h30m)` → `"2h30m0s"`)
+**Other aggregates (`BucketFill`)**: every aggregate except Average and Count gives every bucket a point, like Average does. Ignition fills a bucket without a point with a neighbouring value marked Good, so a Bad stretch, the time before the first sample and the empty buckets of a tag stored on change read a value that was never there (Good 7 at 10:00:05 and 8 at 10:00:45, LastValue in 10 s buckets, read `7, 8, 8, 8, 8, 8` instead of `7, 7, 7, 7, 8, 8`).
+- Good samples in the bucket: Factry's aggregate over those samples, grouped by status with only the Good series kept. A bucket with Good and Bad samples gives the value of its Good samples (LastValue: the last Good value). Several Good statuses in one bucket (`Good`, `GoodLocalOverride`; only data from other collectors has them, the module writes plain `Good`) give one point: the smallest minimum, the largest maximum, the summed sum. LastValue reads the last sample of each status before the bucket end to find the latest Good one. SimpleAverage, Range, Variance and StdDev cannot be combined from per-status values, so such a bucket gives the value of one status, marked Uncertain (the Power Chart shows it as a gap).
+- No samples, and the status held from before is Good: the value held, as Ignition's own aggregates take the value at the block start. Range is 0 there; Sum, Variance and StdDev have no value (Bad), as in Ignition's own functions.
+- Otherwise (only Bad or Uncertain samples, a status held that is not Good, before the first sample, and from now on): a Bad point without a value. MinMax gives each bucket a minimum and a maximum point, Bad ones too.
+- Requests per pen: Factry's `last` per status (which is the LastValue itself) says which statuses each bucket holds and the value held after it, plus the aggregate per status (two for MinMax). The last sample before a bucket is read when the range starts with empty buckets (once), after a bucket holding several statuses when an empty bucket follows, and for LastValue at the end of a bucket with several Good statuses: up to 10 such reads per pen. Past that an empty bucket after a bucket holding several statuses is Bad (a gap is safer than a guess), and such a LastValue is Uncertain.
+- A String tag has only LastValue and Count: Factry 8.2.3 refuses every other aggregate of a string measurement, so those read null with `Bad_Unsupported` on every row, like Sum of a DateTime tag.
+- An array element (`Arr[i]`) has only LastValue and Count too: Factry 8.2.3 aggregates an array measurement only with `first`, `last` and `count` and refuses the rest, `twa` included (checked live). The others read `Bad_Unsupported` without asking Factry. LastValue takes element `i` of the last list; Count counts stored rows, and a row is written whenever any element of the array changes. The base path `Arr` reads `Bad_Unsupported` for every aggregate.
+- Count counts the Good samples in each bucket, summed over Good statuses. A bucket without Good samples counts 0 (Good), as Ignition's own Count does; Ignition would otherwise copy a neighbour's count into it. Buckets from now on are Bad. One request per pen.
+- Variance and StdDev: Ignition's are the population values (they divide by the number of samples, `VarianceAggregate`); Factry's `stddev` is the sample standard deviation (divides by one less) and has no value for a bucket with one sample, and Factry 8.2.3 has no `variance` at all (it refuses it, checked live). So a `count` of the Good samples per bucket is read too and the `stddev` scaled; one sample gives 0, as in Ignition. Samples 1, 2, 3 give Variance 0.667 and StdDev 0.816 (Factry's `stddev` alone says 1.0).
+- Count of a tag that is not numeric (String, DateTime) gets a number column: Ignition types a Count column after the tag, so it would otherwise return the text `"600"` or a Date in 1970
+- Time window → Go duration conversion (e.g., `TimeWindow(2h30m)` → `"2h30m"`, 600 ms → `"600ms"`). The bucket length in milliseconds and the period string come from the same number.
+
+**Average (time-weighted, `GoodTimeAverage`)**:
+- Factry's `twa` is only right with fill `previous`: it then holds each value until the next sample, also from before the range. Its buckets start at the query start.
+- `twa` refuses group by, so Bad and Uncertain time is masked in the module. A `last` aggregate grouped by status and the last sample before the range tell per bucket: Good throughout → Factry's `twa`; not Good throughout → a Bad point without a value (null); status changes inside → the bucket's raw samples are averaged over Good time.
+- Raw reads have a budget per pen: 50,000 samples per request, 200,000 and 10 requests per pen, spent from the range end backwards so the most recent buckets are exact. Neighbouring buckets share a request. A `count` aggregate (only when some bucket needs raw samples) sizes the requests. When the status at a bucket start is unknown (the bucket before held several statuses and was not read), the last sample before it is read: always at the start of a raw request, and up to 10 times per pen for buckets outside one.
+- A bucket beyond the budget gets `twa` over the samples with status exactly `Good`, returned as Good (the Power Chart drops values that are not Good). It leaves Bad values out but holds the last Good value through Bad time and misses Good sub-statuses.
+- Requests per pen: 3 for a healthy tag (`twa`, `last`, sample before); at most 35 (plus `count`, up to 10 raw, 20 one-sample reads, 1 fallback). Raw samples: at most 200,000.
+- The range stops at now: the current bucket is weighted up to now, and buckets after now are Bad.
+- Every bucket gets a point. Ignition fills a bucket without a point with a neighbouring value marked Good (checked through its own query path, and live on 8.3.6), so an outage, the time before the first sample and the time after now would read as a held Good value. They are Bad points instead, which the Power Chart draws as gaps and `queryTagHistory` returns with Bad quality (a null reads as 0.0 in a Float column, and as 1970-01-01 00:00 in a DateTime column, since Ignition turns it into `Date(0)`). Not NaN: the Power Chart streams history as strict JSON, which fails at a NaN.
+- Booleans: Factry's `twa` refuses them, so they are averaged from raw samples as the fraction of Good time true (true = 1). A `mean` per status replaces `twa`: a Good mean of exactly 0 or 1 means the bucket holds one value, so it needs no raw read when that is the value held. Beyond the budget: that `mean`, no extra request, returned as Uncertain because a sample mean can be far off for a Boolean stored on change (0.5 instead of 0.017 for a bit on 1 minute of the hour). The Power Chart draws Uncertain values as gaps; with neighbouring buckets sharing a request and on-change storage this should be rare. At most 34 requests. Factry 8.2.3 accepts `last`, `count`, `mean`, `min`, `max`, `sum`, `spread` and `stddev` on a Boolean (checked live), so every aggregate but Average goes to Factry as for a number. Average of a String tag is `Bad_Unsupported` (see below).
+- Difference with Ignition's internal historian: the module leaves all Bad and Uncertain time out (the owner's choice) and holds the previous value until the next sample (steps). Ignition's own time-weighted average uses trapezoids between values and bridges Bad time inside a block, leaving out only Bad time at the block's start and end. So the numbers differ on ramps and across short Bad stretches.
 
 **`doBrowse(browseContext, publisher)`**:
 - Root level: publishes two category folders — "Measurements" and "Assets"
 - Measurements: parses stored paths into hierarchical sys/prov/tag structure, publishes folders and leaf nodes
 - Assets: splits asset names on "/" to build folder hierarchy
 - Uses `BrowsePublisher` to emit folder and tag nodes
+- Reads the cache only; it never asks Factry. A measurement made by hand or by another collector shows up from the next full cache reload, at most 10 minutes later
 
 **`doQueryMetadata(options, processor)`**:
 - Returns measurement metadata: data type, status, name, engineering specs (UOM, hi/lo limits)
 
-**`lookupUUID(tagPath)`**:
-- Cache hit → return
-- Cache miss → `measurementCache.refresh()` → retry
-- Checks both measurements and assets
+**Resolving a tag** (`findNode` and `doQueryMetadata`, through `MeasurementCache.findForRead`):
+- Cache hit, or an asset with that name → return. An array element `Arr[i]` first checks the cache for `Arr[i]` and for its array `Arr`, and only then asks Factry for either
+- Cache miss → one exact-name lookup in Factry (`GetMeasurementsByFilter` with the name as keyword), so a measurement made since the last refresh reads at once. A name Factry does not have is remembered for `measurement.lookup.miss.seconds` (60 s), so a trend of a misspelt or deleted tag does not ask on every poll. Before, every miss downloaded every measurement of the organisation, twice per read
 
 ---
 
@@ -362,14 +413,17 @@ Extends `AbstractHistorian<FactryHistorianSettings>`. The orchestrator that ties
    - Register sink with S&F manager
    - Force-initialize sink via reflection (workaround for Ignition 8.3.x issue where late-registered sinks stay stuck in "Storage Only")
    - Create `TagHistoryStorageEngineBridge` (routes writes through S&F instead of direct)
-3. Start scheduled executor with 3 recurring tasks:
-   - Metrics logging (every 30s)
-   - Measurement cache refresh (every 30s)
+3. Start scheduled executor with recurring tasks:
+   - Health update to Factry (every 30s): `Collecting`, or `Unstable` while the status says Factry does not store writes
+   - Measurement cache sync (every 30s: this collector's changes; every 10 minutes: everything)
    - Quarantine retry (every 30s, S&F only)
+   - Connection check (every 30s, `GetCollector`): pauses the S&F sink while Factry is unreachable, resumes it when it is back
 
 **`getStorageEngine()`** — returns S&F bridge if configured, otherwise the direct storage engine
 
-**`getStatus()`** — cached gRPC health check (30s TTL)
+**`getStatus()`** — from `WriteHealth`, fed by the scheduled connection check and by what becomes of every write: Errored when the last check failed, with the reason (`UNAVAILABLE`/`DEADLINE_EXCEEDED`: "Factry Historian unreachable"; `UNAUTHENTICATED`/`PERMISSION_DENIED`: "Factry refused the collector token"; `NOT_FOUND` "collector is deleted": "Collector deleted in Factry") and Factry's own text in the details; one WARN per reason and one INFO when the check passes again, not repeated by a check that comes and goes (a reason is news again after 5 minutes of passing checks). Also Errored ("Factry does not store writes") when every write failed over at least 30 s while the check passes, refused (for example `INTERNAL` while Factry's InfluxDB is down) or timed out (InfluxDB hanging), until a write is stored again. A failed check restarts that count, so writes are judged afresh after an outage. Data handling does not change: store and forward keeps the data and the quarantine retry sends it again. The gateway's Historians page shows an Errored profile as a red "Error" badge with the status details as its tooltip. Logging, each line naming the profile (also after a rename): one WARN per answer from Factry until a write is stored (repeats at DEBUG), one WARN when the status turns Errored, a summary of failed flushes and points about every 5 minutes while it lasts, and one INFO with the totals when a write is stored again. A connection check that fails in between does not end this story, so a flapping check does not repeat it. While writes fail, the 30 s quarantine retry logs at DEBUG instead of INFO.
+
+With Factry as a History Splitter's primary, an Errored status also sends the splitter's queries to the secondary: Ignition's splitter uses a historian only while its status is Good.
 
 **`handleSettingsChange()`** — reconfigures gRPC client, refreshes cache, updates engines. No restart needed.
 
@@ -390,15 +444,11 @@ Thread-safe counters using `AtomicLong`. Tracks:
 | Metric | Description |
 |--------|-------------|
 | Store ops / points / errors / elapsed ms | Write performance |
+| Discarded / paused-dropped points | Points not written because their measurement refuses them |
 | Raw query ops / rows / elapsed ms | Raw read performance |
 | Agg query ops / rows / elapsed ms | Aggregated read performance |
 
-`logSummary()` — writes a single-line summary every 30 seconds:
-```
-Metrics | store: 5 ops, 120 pts (4.0 pts/s), 450 ms total, 0 errors | raw query: ...
-```
-
-`recordStore()`, `recordRawQuery()`, `recordAggQuery()` — called by the engines after each operation.
+`recordStore()`, `recordRawQuery()`, `recordAggregatedQuery()` and the others are called by the engines after each operation. No code reads the counters outside the tests: nothing logs them and they are not in the gateway's metric registry. Ignition already shows per profile what most of them count (storage and query throughput, success and failure, on the Historians page; the backlog and quarantine on the Store and Forward page).
 
 ---
 
@@ -410,7 +460,7 @@ Metrics | store: 5 ops, 120 pts (4.0 pts/s), 450 ms total, 0 errors | raw query:
 |------|-------|
 | `TagPathUtilTest.java` | Path conversion: stored ↔ display, QualifiedPath parsing, folder handling, edge cases |
 | `FactryHistorianSettingsTest.java` | JWT parsing, token defaults, validation |
-| `HistorianMetricsTest.java` | Counter increments, summary formatting |
+| `HistorianMetricsTest.java` | Counter increments |
 
 Run with `./gradlew test`.
 
@@ -468,11 +518,11 @@ FactryStorageEngine.doStoreAtomic(points)
 - **History renaming** — not supported by the Factry platform
 - **Extended scripting** (e.g. `system.factry.queryEvents`) — deferred until customer demand exists
 
-**Store metadata is a no-op:** `FactryStorageEngine.doStoreMetadata()` accepts the call and returns success, but does not forward metadata to Factry. Metadata (engineering units, limits, etc.) is managed on the Factry platform directly, not pushed from Ignition.
+**Metadata only seeds new measurements:** `FactryStorageEngine.doStoreMetadata()` caches the tag metadata, and it is applied only when the module creates a measurement (data type, description, engineering units and limits, `ignitionDataType` setting). Later changes to a tag's metadata in Ignition are not pushed to an existing measurement; edit those on the Factry platform.
 
-**Pagination:** The design document lists pagination as a provider requirement. In practice, there is no paginated use case — charts receive the full dataset and Jython scripts get a complete `DataSet` object. The gRPC proto does define `limit`/`offset` fields on `QueryTimeseriesRequest`, so pagination can be added if Factry ever imposes response size limits.
+**Pagination:** Raw reads page through `QueryTimeseries` with `limit`/`offset`. One answer for a day of 1-second data on a few pens is over grpc-java's default 4 MiB message limit, so the client also accepts answers up to 64 MiB, which is Factry's own send limit (`GRPC_MAX_MESSAGE_SIZE`). Charts and scripts still receive the full dataset, up to `query.raw.max.points` points per query; a query over it fails with an error that names the setting.
 
-**Browse filters and optional query parameters:** The design document's appendix lists optional parameters for `browse`, `queryRawPoints`, and `queryAggregatedPoints` (e.g. `returnSize`, `includeBounds`, `fillModes`, `nameFilters`). These are part of the Ignition scripting API — the framework parses them and passes relevant options to the query engine. Our implementation handles the core parameters (time range, aggregation type, time window). The optional parameters are either handled by the Ignition framework itself or are not relevant for the Factry backend.
+**Browse filters and optional query parameters:** The design document's appendix lists optional parameters for `browse`, `queryRawPoints`, and `queryAggregatedPoints` (e.g. `returnSize`, `includeBounds`, `fillModes`, `nameFilters`). The framework parses them and passes them to the query engine in the query options; the engine has to apply them itself. It applies the time range, aggregation type, time window and `returnSize`, and the bounding-value options of a raw read (`NO_SEED_VALUES`, `NO_BOUND_VALUES`, see `doQueryRaw`). `queryRawPoints(includeBounds=True)` does not ask for bounding values: it makes the time range inclusive (`TimeRange.includeBounds`), and Ignition 8.3.6 drops that before the engine sees it. `doBrowse` does not apply browse filters such as `nameFilters`.
 
 ### Known Limitation: String Data in Raw Queries
 
