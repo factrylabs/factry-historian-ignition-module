@@ -1,5 +1,7 @@
 package io.factry.historian.gateway;
 
+import com.google.protobuf.Timestamp;
+import com.google.protobuf.util.Timestamps;
 import io.factry.historian.proto.AssetProperties;
 import io.factry.historian.proto.Assets;
 import io.factry.historian.proto.Collectors;
@@ -10,6 +12,7 @@ import io.factry.historian.proto.CreatePointsReply;
 import io.factry.historian.proto.GetAssetPropertiesRequest;
 import io.factry.historian.proto.GetMeasurementsByFilterRequest;
 import io.factry.historian.proto.Measurement;
+import io.factry.historian.proto.MeasurementRequest;
 import io.factry.historian.proto.Measurements;
 import io.factry.historian.proto.Points;
 import io.factry.historian.proto.QueryTimeseriesRequest;
@@ -25,8 +28,9 @@ import java.util.List;
  * module makes are overridden. The module writes as collector {@link #OWN}. Like Factry, the
  * keyword filter matches substrings and pages its answer, and a create with a name that already
  * exists does not return the existing measurement: it adds a Discovered duplicate, or, when the
- * existing one is in another time-series database, an Active measurement. Call
- * {@link #shutdown()} after the test.
+ * existing one is in another time-series database, an Active measurement. Every change stamps the
+ * measurement's updatedAt, one second later each time. Deleted measurements are only listed by
+ * GetMeasurements, as in Factry. Call {@link #shutdown()} after the test.
  */
 class FakeFactry extends FactryGrpcClient {
     static final String OWN = "collector";
@@ -41,6 +45,10 @@ class FakeFactry extends FactryGrpcClient {
     int lookups = 0;
     /** Number of measurement list calls without a keyword (pages of a full cache refresh). */
     int fullLoads = 0;
+    /** Every GetMeasurements request. */
+    final List<MeasurementRequest> measurementRequests = new ArrayList<>();
+    /** Seconds of the last updatedAt given. */
+    long clock = 1_000;
     /** How many of the next single-name lookups fail, and with which gRPC status. */
     int lookupFailures = 0;
     Status lookupFailure = Status.INVALID_ARGUMENT;
@@ -77,11 +85,35 @@ class FakeFactry extends FactryGrpcClient {
 
     void add(String name, String uuid, String collectorUUID, String status) {
         measurements.add(Measurement.newBuilder().setName(name).setUuid(uuid)
-                .setCollectorUUID(collectorUUID).setStatus(status).build());
+                .setCollectorUUID(collectorUUID).setStatus(status).setUpdatedAt(tick()).build());
     }
 
     void setStatus(String uuid, String status) {
-        measurements.replaceAll(m -> m.getUuid().equals(uuid) ? m.toBuilder().setStatus(status).build() : m);
+        measurements.replaceAll(m -> m.getUuid().equals(uuid)
+                ? m.toBuilder().setStatus(status).setUpdatedAt(tick()).build() : m);
+    }
+
+    private Timestamp tick() {
+        return Timestamp.newBuilder().setSeconds(++clock).build();
+    }
+
+    private static boolean isDeleted(Measurement m) {
+        return "Deleted".equalsIgnoreCase(m.getStatus());
+    }
+
+    @Override
+    public Measurements getMeasurements(MeasurementRequest request) {
+        measurementRequests.add(request);
+        String collector = request.getCollectorUUID().isEmpty() ? OWN : request.getCollectorUUID();
+        List<Measurement> found = new ArrayList<>();
+        for (Measurement m : measurements) {
+            // Factry compares updatedAt strictly (checked live on 8.2.3).
+            if (m.getCollectorUUID().equals(collector) && (!request.hasSince()
+                    || Timestamps.compare(m.getUpdatedAt(), request.getSince()) > 0)) {
+                found.add(m);
+            }
+        }
+        return Measurements.newBuilder().addAllMeasurements(found).build();
     }
 
     @Override
@@ -101,7 +133,7 @@ class FakeFactry extends FactryGrpcClient {
         }
         List<Measurement> found = new ArrayList<>();
         for (Measurement m : measurements) {
-            if (!request.hasKeyword() || m.getName().contains(request.getKeyword())) {
+            if (!isDeleted(m) && (!request.hasKeyword() || m.getName().contains(request.getKeyword()))) {
                 found.add(m);
             }
         }
@@ -123,7 +155,7 @@ class FakeFactry extends FactryGrpcClient {
         for (CreateMeasurement m : request.getMeasurementsList()) {
             createdNames.add(m.getName());
             created.add(m);
-            if (measurements.stream().noneMatch(e -> e.getName().equals(m.getName()))) {
+            if (measurements.stream().noneMatch(e -> e.getName().equals(m.getName()) && !isDeleted(e))) {
                 add(m.getName(), "new-" + m.getName(), createdCollector, createdStatus);
             } else if (existingInOtherDatabase) {
                 add(m.getName(), "own-" + m.getName(), createdCollector, "Active");

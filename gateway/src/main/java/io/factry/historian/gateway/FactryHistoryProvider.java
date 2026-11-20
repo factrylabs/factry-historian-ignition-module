@@ -168,7 +168,8 @@ public class FactryHistoryProvider extends AbstractHistorian<FactryHistorianSett
         scheduledExecutor.scheduleWithFixedDelay(
                 () -> retryQuarantinedData(sfEngine), 30, 30, TimeUnit.SECONDS);
 
-        // Periodic measurement cache refresh to detect deleted measurements
+        // This collector's changed measurements (paused, deleted, ...) every 30 s, and a full
+        // reload every 10 minutes (MeasurementCache.sync)
         long refreshInterval = ModuleProperties.getMeasurementCacheRefreshSeconds();
         scheduledExecutor.scheduleWithFixedDelay(
                 this::refreshMeasurementCache, refreshInterval, refreshInterval, TimeUnit.SECONDS);
@@ -468,7 +469,7 @@ public class FactryHistoryProvider extends AbstractHistorian<FactryHistorianSett
     private void refreshMeasurementCache() {
         try {
             int before = measurementCache.size();
-            measurementCache.refresh(grpcClient);
+            measurementCache.sync(grpcClient);
             int after = measurementCache.size();
             if (before != after) {
                 logger.info("Measurement cache refreshed: {} -> {} entries", before, after);

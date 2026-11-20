@@ -154,13 +154,14 @@ In-memory cache of Factry measurements and assets. Both the storage engine and q
 - `tagPathToUUID` — maps stored tag path (e.g., `Ignition-abc:[default]Temperature`) to Factry UUID
 - `uuidToMeasurement` — maps UUID to full `Measurement` proto object
 - `refresh(grpcClient)` — fetches all measurements from Factry, replaces the maps. Only keeps measurements with `status=Active`
+- `sync(grpcClient)` — the scheduled update. Every 30 s it asks only for this collector's measurements changed since the newest `updatedAt` it has seen (`GetMeasurements` with `collectorUUID` and `since`; Factry compares strictly and also returns Paused and Deleted ones, checked live on 8.2.3), and applies them as a full refresh would: an Active one is cached, a Paused one refused, a Deleted one dropped so the next write creates it again. Every 10 minutes (`measurement.cache.full.refresh.seconds`), or while no full refresh has worked yet, it runs `refresh` instead. Measurements made by hand or by other collectors, and assets, show up in browse from that reload; a read by exact name finds them at once
 - `getOrCreateUUID(tagPath, grpcClient, value)` — cache lookup with auto-creation: on miss, creates the measurement in Factry, polls until visible, returns UUID. Includes concurrent creation prevention (`pendingCreations` set). The data type comes from the tag's Ignition `dataType` metadata when known (Store and Forward hands Boolean values over as Long 0/1), else from the value. Dates are stored as epoch milliseconds in a `number` measurement, and the tag's Ignition data type is written to the measurement settings (`ignitionDataType`, a Date value without metadata counts as `DateTime`) so queries can return Dates. NaN and Infinity are written as a Bad point without a value, and Longs above 2^53 as the nearest double, with a warning once per tag
 - `evictByUUID(uuid)` — removes a measurement so it gets re-created on next write (used when Factry rejects points for deleted measurements)
 - Before creating a measurement, the write path looks its exact name up in Factry and reuses an Active one. Measurements that are not Active (Discovered, ...) are kept in `inactiveByName`, for the write path only. Values for a tag whose measurement exists only in another status are discarded (`WriteRefusal.NOT_ACTIVE`): counted as handled, so store and forward does not retry them, with one warning per flush naming the newly refused tags and a count in `HistorianMetrics.getDiscardedPointCount()`. The measurement is not created again
 - `writeRefusal(measurement, collectorUUID)` — the one check of whether the module may write to a measurement. Factry answers OK to points written to another collector's measurement and drops them, so the write paths only use measurements of the module's own collector (or without a collector UUID). Browse and query keep every collector's measurements; when several have the same name (one per time-series database), the cache keeps the module's own under that name, so query by name prefers it too. When the measurement with a tag's name is another collector's (`WriteRefusal.OTHER_COLLECTOR`), the module asks Factry once per tag to create its own, since the other may be in another database, and polls until one of its own appears. If none Active appears, the tag's values are discarded like a `NOT_ACTIVE` tag's. A measurement of its own with that name in another status (the Discovered duplicate such a try leaves) counts as tried, so a restart does not try again
 - Paused measurements of the module's own collector (Factry's way to tell collectors to stop collecting) are refused as `WriteRefusal.PAUSED`: values for them are dropped and counted as handled (`HistorianMetrics.getPausedDroppedPointCount()`), with one warning per flush naming the newly paused tags and one info line when a tag is written again. The measurement is never created again. Array tags keep merging their element changes while paused, so the first value after the resume is the whole current array. From the first cache refresh after the measurement is Active again, new values are stored. Another collector's Paused measurement counts as `OTHER_COLLECTOR`
 
-**Refreshed every 30 seconds** by `FactryHistoryProvider`'s scheduled executor.
+**Synced every 30 seconds** by `FactryHistoryProvider`'s scheduled executor, with a full reload every 10 minutes. Measured against a live Factry with 84 measurements, 10 minutes of the timer went from 60 calls and 262 KB (a full reload every 30 s) to 22 calls and 13 KB. At 20,000 measurements (about 145 bytes each) the full reload is about 2.9 MB, so about 0.4 GB a day instead of 8 GB.
 
 ### `proto/historian/historian.proto`
 
@@ -246,7 +247,7 @@ Implements `HistoricalNode` — the Ignition SDK's representation of a browsable
 - `"boolean"` → `DataType.Boolean`
 - `"number"` → `DataType.Float8`
 - `"string"` → `DataType.String`
-- a measurement whose `ignitionDataType` setting is `DateTime` → `DataType.DateTime`. Factry keeps the dates as epoch milliseconds; the query engine returns them as `java.util.Date`. Aggregates of such a tag: LastValue, Minimum, Maximum, MinMax, Average and SimpleAverage are Dates, Count is a number, and Sum, Range, Variance and StdDev read null with `Bad_Unsupported` on every row (set in the processing context, like a refused pen's `Bad_Failure`). Measurements created before this setting existed read back as numbers. To have such a measurement read back as Dates and keep its history, add the setting in Factry instead of deleting the measurement: `GET /api/measurements/{uuid}`, then `PUT /api/measurements/{uuid}` with the same `Attributes`, `CollectorUUID`, `DatabaseUUID`, `Datatype`, `Description`, `Metadata`, `Name` and `Status`, and `Settings` plus `"ignitionDataType": "DateTime"`. The module reads Dates from its next cache refresh. The bulk `PATCH /api/measurements` refuses it ("Setting ignitionDataType is not common to all selected measurements"). Checked on Factry v8.2.3.
+- a measurement whose `ignitionDataType` setting is `DateTime` → `DataType.DateTime`. Factry keeps the dates as epoch milliseconds; the query engine returns them as `java.util.Date`. Aggregates of such a tag: LastValue, Minimum, Maximum, MinMax, Average and SimpleAverage are Dates, Count is a number, and Sum, Range, Variance and StdDev read null with `Bad_Unsupported` on every row (set in the processing context, like a refused pen's `Bad_Failure`). Measurements created before this setting existed read back as numbers. To have such a measurement read back as Dates and keep its history, add the setting in Factry instead of deleting the measurement: `GET /api/measurements/{uuid}`, then `PUT /api/measurements/{uuid}` with the same `Attributes`, `CollectorUUID`, `DatabaseUUID`, `Datatype`, `Description`, `Metadata`, `Name` and `Status`, and `Settings` plus `"ignitionDataType": "DateTime"`. The module reads Dates from its next cache sync (within 30 s for its own measurements, at most 10 minutes for another collector's). The bulk `PATCH /api/measurements` refuses it ("Setting ignitionDataType is not common to all selected measurements"). Checked on Factry v8.2.3.
 - Array tags get their Ignition type in the setting too (e.g. `DateTimeArray`); the elements of such a measurement read back as Dates.
 - An array element path `Arr[i]` gets a node of its own: the measurement `Arr` (data type `[]number`, `[]string`, `[]boolean`), element `i`, the element's type, and a node id that includes the index. A measurement whose own name is `Arr[i]` still wins. The base path `Arr` of an array measurement resolves too, but reads as unsupported (see the query engine).
 
@@ -268,7 +269,8 @@ Loads tuning values from `factry-historian.properties` (bundled in the .modl). T
 | `grpc.call.deadline.seconds` | 10 | Timeout on the small calls: collectors, health, collector state |
 | `grpc.shutdown.grace.seconds` | 3 | How long a settings save or shutdown waits for running calls before it cancels them |
 | `status.cache.ms` | 30000 | How often the connection check runs; it pauses S&F while Factry is unreachable and resumes it when it is back |
-| `measurement.cache.refresh.seconds` | 30 | How often to reload measurements from Factry |
+| `measurement.cache.refresh.seconds` | 30 | How often to ask Factry for this collector's changed measurements (new, Paused, Deleted) |
+| `measurement.cache.full.refresh.seconds` | 600 | How often to reload every measurement, collector and asset |
 | `measurement.lookup.miss.seconds` | 60 | How long a read remembers that Factry has no measurement with a name, before it looks the name up again |
 | `query.raw.max.points` | 500000 | Most raw points one query reads over all its pens; a range that holds more fails the read with an error. An aggregated read fails the same way, before it asks Factry, when pens x intervals (twice for MinMax) is more. About 200 bytes of heap per point while the query runs, so about 100 MB per query |
 
@@ -360,7 +362,7 @@ Extends `AbstractQueryEngine`. Handles all data retrieval from Factry.
 - Measurements: parses stored paths into hierarchical sys/prov/tag structure, publishes folders and leaf nodes
 - Assets: splits asset names on "/" to build folder hierarchy
 - Uses `BrowsePublisher` to emit folder and tag nodes
-- Reads the cache only; it never asks Factry. A measurement made by hand or by another collector shows up from the next cache refresh
+- Reads the cache only; it never asks Factry. A measurement made by hand or by another collector shows up from the next full cache reload, at most 10 minutes later
 
 **`doQueryMetadata(options, processor)`**:
 - Returns measurement metadata: data type, status, name, engineering specs (UOM, hi/lo limits)
@@ -413,7 +415,7 @@ Extends `AbstractHistorian<FactryHistorianSettings>`. The orchestrator that ties
    - Create `TagHistoryStorageEngineBridge` (routes writes through S&F instead of direct)
 3. Start scheduled executor with recurring tasks:
    - Health update to Factry (every 30s): `Collecting`, or `Unstable` while the status says Factry does not store writes
-   - Measurement cache refresh (every 30s)
+   - Measurement cache sync (every 30s: this collector's changes; every 10 minutes: everything)
    - Quarantine retry (every 30s, S&F only)
    - Connection check (every 30s, `GetCollector`): pauses the S&F sink while Factry is unreachable, resumes it when it is back
 

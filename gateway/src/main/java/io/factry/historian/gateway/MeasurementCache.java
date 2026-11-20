@@ -1,7 +1,9 @@
 package io.factry.historian.gateway;
 
 import com.google.protobuf.Struct;
+import com.google.protobuf.Timestamp;
 import com.google.protobuf.Value;
+import com.google.protobuf.util.Timestamps;
 import io.factry.historian.proto.Asset;
 import io.factry.historian.proto.AssetProperties;
 import io.factry.historian.proto.AssetProperty;
@@ -60,8 +62,8 @@ public class MeasurementCache {
     /** Asset UUID → list of properties belonging to that asset. */
     private volatile ConcurrentHashMap<String, List<AssetProperty>> assetProperties = new ConcurrentHashMap<>();
 
-    /** Measurement UUID → collector name, for grouping in the browse tree. */
-    private volatile ConcurrentHashMap<String, String> measurementToCollectorName = new ConcurrentHashMap<>();
+    /** Collector UUID → collector name, for grouping in the browse tree. */
+    private volatile ConcurrentHashMap<String, String> collectorNames = new ConcurrentHashMap<>();
 
     /**
      * Metadata properties cached from doStoreMetadata, applied when creating measurements. Creating a
@@ -75,6 +77,16 @@ public class MeasurementCache {
     /** The current time; tests replace it. */
     LongSupplier now = System::currentTimeMillis;
 
+    private final long fullRefreshMillis = ModuleProperties.getMeasurementCacheFullRefreshSeconds() * 1000;
+    /** Whether a full refresh has worked, and when the last one did, by {@link #now}. */
+    private volatile boolean loaded = false;
+    private volatile long lastFullRefresh;
+    /**
+     * The newest updatedAt of this collector's measurements the cache has seen, by Factry's clock;
+     * null before it has seen one. {@link #sync} asks for the changes after it.
+     */
+    private volatile Timestamp ownChangesSince;
+
     /** Sleeps between the polls for a just-created measurement: about 3 s in all. */
     private final long[] pollBackoffMs;
 
@@ -87,9 +99,75 @@ public class MeasurementCache {
         this.pollBackoffMs = pollBackoffMs.clone();
     }
 
-    public void refresh(FactryGrpcClient grpcClient) {
+    /**
+     * The scheduled update. Reloads everything when the last full refresh is
+     * {@code measurement.cache.full.refresh.seconds} old or none has worked yet. Otherwise it asks
+     * Factry only for this collector's measurements changed since the newest one the cache has
+     * seen (GetMeasurements with {@code since}, which also returns Paused and Deleted ones), so
+     * the write path still follows a measurement paused, resumed or deleted in Factry within one
+     * tick, without downloading every measurement of the organisation each time. Measurements of
+     * other collectors and assets change from the next full refresh.
+     */
+    public synchronized void sync(FactryGrpcClient grpcClient) {
+        if (!loaded || now.getAsLong() - lastFullRefresh >= fullRefreshMillis) {
+            refresh(grpcClient);
+            return;
+        }
+        String collectorUUID = grpcClient.getCollectorUUID();
+        MeasurementRequest.Builder request = MeasurementRequest.newBuilder().setCollectorUUID(collectorUUID);
+        Timestamp since = ownChangesSince;
+        if (since != null) {
+            request.setSince(since);
+        }
+        Measurements changes = grpcClient.getMeasurements(request.build());
+        for (Measurement m : changes.getMeasurementsList()) {
+            applyChange(m, collectorUUID);
+            since = later(since, m);
+        }
+        ownChangesSince = since;
+        if (changes.getMeasurementsCount() > 0) {
+            logger.debug("Measurement cache: applied {} changes of this collector's measurements",
+                    changes.getMeasurementsCount());
+        }
+    }
+
+    /** Put a changed measurement of this collector in the cache the way a full refresh would. */
+    private void applyChange(Measurement m, String collectorUUID) {
+        String uuid = m.getUuid();
+        Measurement old = uuidToMeasurement.get(uuid);
+        if (old != null && !old.getName().equals(m.getName())) {
+            tagPathToUUID.remove(old.getName(), uuid);
+        }
+        inactiveByName.computeIfPresent(m.getName(), (name, cached) -> cached.getUuid().equals(uuid) ? null : cached);
+        if (isActive(m)) {
+            cacheMeasurement(m, collectorUUID);
+        } else {
+            uuidToMeasurement.remove(uuid);
+            tagPathToUUID.remove(m.getName(), uuid);
+            // A full refresh does not list Deleted measurements either: the write path creates
+            // the tag's measurement again.
+            if (!"deleted".equalsIgnoreCase(m.getStatus())) {
+                putInactive(inactiveByName, m, collectorUUID);
+            }
+        }
+    }
+
+    private static Timestamp later(Timestamp since, Measurement m) {
+        if (!m.hasUpdatedAt()) {
+            return since;
+        }
+        return since == null || Timestamps.compare(m.getUpdatedAt(), since) > 0 ? m.getUpdatedAt() : since;
+    }
+
+    /**
+     * Reload every measurement of the organisation, the collectors and the assets. Runs at
+     * startup, on a settings change and every {@code measurement.cache.full.refresh.seconds}
+     * from {@link #sync}.
+     */
+    public synchronized void refresh(FactryGrpcClient grpcClient) {
         try {
             String ownCollectorUUID = grpcClient.getCollectorUUID();
+            Timestamp freshSince = null;
             // Fetch all measurements using pagination
             Map<String, Measurement> freshByName = new HashMap<>();
             Map<String, Measurement> freshMeasurements = new HashMap<>();
@@ -116,6 +194,9 @@ public class MeasurementCache {
                 }
 
                 for (Measurement m : response.getMeasurementsList()) {
+                    if (m.getCollectorUUID().equalsIgnoreCase(ownCollectorUUID)) {
+                        freshSince = later(freshSince, m);
+                    }
                     if ("active".equalsIgnoreCase(m.getStatus())) {
                         putPreferringOwn(freshByName, m, ownCollectorUUID);
                         freshMeasurements.put(m.getUuid(), m);
@@ -137,10 +218,13 @@ public class MeasurementCache {
             uuidToMeasurement = new ConcurrentHashMap<>(freshMeasurements);
             tagPathToUUID = new ConcurrentHashMap<>(freshPaths);
             inactiveByName = new ConcurrentHashMap<>(freshInactive);
+            ownChangesSince = freshSince;
+            lastFullRefresh = now.getAsLong();
+            loaded = true;
             logger.info("Measurement cache refreshed, {} active of {} total from Factry",
                     freshPaths.size(), serverTotal == Long.MAX_VALUE ? offset : serverTotal);
 
-            // Build measurement → collector name mapping
+            // Collector names, for the browse folders
             try {
                 var collectors = grpcClient.getCollectors();
                 Map<String, String> collectorUUIDToName = new HashMap<>();
@@ -148,18 +232,8 @@ public class MeasurementCache {
                     String collectorName = !c.getName().isEmpty() ? c.getName() : c.getUuid();
                     collectorUUIDToName.put(c.getUuid(), collectorName);
                 }
-
-                Map<String, String> freshCollectorMap = new HashMap<>();
-                for (Measurement m : freshMeasurements.values()) {
-                    String collectorUUID = m.getCollectorUUID();
-                    if (!collectorUUID.isEmpty()) {
-                        String collectorName = collectorUUIDToName.getOrDefault(collectorUUID, collectorUUID);
-                        freshCollectorMap.put(m.getUuid(), collectorName);
-                    }
-                }
-
-                measurementToCollectorName = new ConcurrentHashMap<>(freshCollectorMap);
-                logger.debug("Collector mapping refreshed: {} measurements mapped to collectors", freshCollectorMap.size());
+                collectorNames = new ConcurrentHashMap<>(collectorUUIDToName);
+                logger.debug("Collector mapping refreshed: {} collectors", collectorUUIDToName.size());
             } catch (Exception ce) {
                 logger.error("Failed to refresh collector mapping", ce);
             }
@@ -759,8 +833,16 @@ public class MeasurementCache {
         return uuidToAsset.values();
     }
 
+    /**
+     * The name of the collector of a cached measurement, its UUID when Factry did not list that
+     * collector, or null when the measurement has no collector.
+     */
     public String getCollectorName(String measurementUUID) {
-        return measurementToCollectorName.get(measurementUUID);
+        Measurement m = uuidToMeasurement.get(measurementUUID);
+        if (m == null || m.getCollectorUUID().isEmpty()) {
+            return null;
+        }
+        return collectorNames.getOrDefault(m.getCollectorUUID(), m.getCollectorUUID());
     }
 
     public List<AssetProperty> getPropertiesForAsset(String assetUUID) {

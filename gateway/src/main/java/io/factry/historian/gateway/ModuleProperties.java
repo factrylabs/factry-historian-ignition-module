@@ -80,8 +80,14 @@ public final class ModuleProperties {
         return getLong("status.cache.ms", 30_000);
     }
 
+    /** How often the cache asks Factry for this collector's changed measurements. */
     public static long getMeasurementCacheRefreshSeconds() {
         return getLong("measurement.cache.refresh.seconds", 30);
+    }
+
+    /** How often the cache reloads every measurement, collector and asset. */
+    public static long getMeasurementCacheFullRefreshSeconds() {
+        return getLong("measurement.cache.full.refresh.seconds", 600);
     }
 
     /** How long a read remembers that Factry has no measurement with a name. */
