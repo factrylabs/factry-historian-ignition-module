@@ -101,6 +101,22 @@ public final class JwtTokenParser {
         });
     }
 
+    /** Extract the REST port from the {@code rest-port} claim. */
+    public static Optional<Integer> getRestPort(JsonObject payload) {
+        return getStringField(payload, "rest-port").map(port -> {
+            try {
+                return Integer.parseInt(port);
+            } catch (NumberFormatException e) {
+                return null;
+            }
+        });
+    }
+
+    /** Extract the organisation UUID from the {@code organization-uuid} claim. */
+    public static Optional<String> getOrganizationUUID(JsonObject payload) {
+        return getStringField(payload, "organization-uuid");
+    }
+
     private static Optional<String> getStringField(JsonObject obj, String field) {
         if (obj != null && obj.has(field) && !obj.get(field).isJsonNull()) {
             String value = obj.get(field).getAsString();

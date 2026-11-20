@@ -125,6 +125,26 @@ final class IgnitionHistoryQuery {
     }
 
     /**
+     * A raw wide read of whole history paths, as a pen picked from the browse tree or a script
+     * names them (for example {@code histprov:Factry:/tag:default/Line/Flow}). Columns are
+     * named "c0", "c1", ...
+     */
+    static Dataset rawPaths(QueryEngine engine, long start, long end, String... paths) throws Exception {
+        List<QualifiedPath> qualified = new ArrayList<>();
+        List<ColumnQueryDefinition> defs = new ArrayList<>();
+        List<String> aliases = new ArrayList<>();
+        for (int i = 0; i < paths.length; i++) {
+            QualifiedPath path = QualifiedPath.parseSafe(paths[i]);
+            qualified.add(path);
+            aliases.add("c" + i);
+            defs.add(new ColumnQueryDefinition(path, "c" + i));
+        }
+        BasicTagHistoryQueryParams params = new BasicTagHistoryQueryParams(qualified, new Date(start), new Date(end),
+                -1, null, ReturnFormat.Wide, aliases, List.of());
+        return run(engine, params, defs);
+    }
+
+    /**
      * A read the way system.historian.queryRawPoints runs it in 8.3.6: its options are turned into
      * legacy query parameters (HistorianUtilities.toLegacyQueryParams, as
      * HistorianManagerImpl.queryDataPoints does) and run through the same legacy path as

@@ -10,6 +10,7 @@ import io.factry.historian.proto.CreatePointsReply;
 import io.factry.historian.proto.GetAssetPropertiesRequest;
 import io.factry.historian.proto.GetCollectorsRequest;
 import io.factry.historian.proto.GetMeasurementsByFilterRequest;
+import io.factry.historian.proto.GetTimeseriesDatabasesRequest;
 import io.factry.historian.proto.GetAssetsRequest;
 import io.factry.historian.proto.HealthUpdate;
 import io.factry.historian.proto.HealthUpdateReply;
@@ -23,6 +24,7 @@ import io.factry.historian.proto.Points;
 import io.factry.historian.proto.QueryTimeseriesRequest;
 import io.factry.historian.proto.QueryTimeseriesResponse;
 import io.factry.historian.proto.RegisterCollectorSchema;
+import io.factry.historian.proto.TimeseriesDatabases;
 import io.grpc.CallOptions;
 import io.grpc.Channel;
 import io.grpc.ClientCall;
@@ -290,6 +292,72 @@ public class FactryGrpcClient {
         }
     }
 
+    /**
+     * The UUID of this collector's default time-series database, from Factry's REST API (gRPC does
+     * not give it); null when Factry answers without one. Throws when Factry could not be asked
+     * (no REST port in the token, not reachable within {@link FactryRestClient#TIMEOUT}, refused).
+     */
+    public String getDefaultDatabaseUUID() {
+        RestTarget target = restTarget;
+        if (target == null) {
+            throw new IllegalStateException("no REST API settings");
+        }
+        try {
+            FactryRestClient rest = target.client();
+            if (rest == null) {
+                throw new IllegalStateException("the collector token names no REST port");
+            }
+            return rest.defaultDatabaseUUID();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("interrupted", e);
+        } catch (RuntimeException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new IllegalStateException(e.toString(), e);
+        }
+    }
+
+    /** Where {@link #getDefaultDatabaseUUID} asks, and its client, built once per channel settings. */
+    private static final class RestTarget {
+        private final String host;
+        private final String token;
+        private final boolean useTls;
+        /** The gRPC channel's own trust decision, so REST checks certificates exactly as gRPC does. */
+        private final TrustManagerFactory trust;
+        private FactryRestClient client;
+        private boolean built;
+
+        RestTarget(String host, String token, boolean useTls, TrustManagerFactory trust) {
+            this.host = host;
+            this.token = token;
+            this.useTls = useTls;
+            this.trust = trust;
+        }
+
+        synchronized FactryRestClient client() throws Exception {
+            if (!built) {
+                client = FactryRestClient.forToken(host, token, useTls, trust);
+                built = true;
+            }
+            return client;
+        }
+    }
+
+    private volatile RestTarget restTarget;
+
+    public TimeseriesDatabases getTimeseriesDatabases() {
+        logger.debug("Sending GetTimeseriesDatabases");
+        channelLock.readLock().lock();
+        try {
+            return blockingStub
+                    .withDeadlineAfter(CALL_DEADLINE_SECONDS, TimeUnit.SECONDS)
+                    .getTimeseriesDatabases(GetTimeseriesDatabasesRequest.getDefaultInstance());
+        } finally {
+            channelLock.readLock().unlock();
+        }
+    }
+
     public Collector registerCollector(RegisterCollectorSchema schema) {
         logger.debug("Sending RegisterCollector");
         channelLock.readLock().lock();
@@ -376,28 +444,12 @@ public class FactryGrpcClient {
     // enterIdle() in testConnection() deal with connections the network dropped.
     private void buildChannel(String host, int port, String collectorUUID, String token,
                               boolean useTls, boolean skipTlsVerification, String customCaCert) {
+        TrustManagerFactory trust = useTls ? trustManagerFactory(skipTlsVerification, customCaCert) : null;
         if (useTls) {
             try {
                 var sslBuilder = GrpcSslContexts.forClient();
-                if (skipTlsVerification) {
-                    sslBuilder.trustManager(InsecureTrustManagerFactory.INSTANCE);
-                } else {
-                    // Trust the system/public CAs AND the bundled Factry CA, plus any custom CA
-                    // the user supplied per-profile. This lets publicly-signed (e.g. Let's Encrypt),
-                    // Factry-signed, and internal/enterprise-CA or self-signed certificates all
-                    // verify without having to disable verification entirely.
-                    try (InputStream caCert = getClass().getClassLoader().getResourceAsStream(CA_CERT_RESOURCE)) {
-                        if (caCert == null) {
-                            logger.warn("Bundled CA certificate '{}' not found; using system CAs only", CA_CERT_RESOURCE);
-                        }
-                        boolean hasCustomCa = customCaCert != null && !customCaCert.isBlank();
-                        logger.info("TLS verification using system CAs plus bundled Factry CA{}",
-                                hasCustomCa ? " plus a custom CA certificate" : "");
-                        sslBuilder.trustManager(buildCombinedTrustManagerFactory(caCert, customCaCert));
-                    } catch (Exception e) {
-                        logger.warn("Failed to build combined trust store ({}), using the system default trust store",
-                                e.getMessage());
-                    }
+                if (trust != null) {
+                    sslBuilder.trustManager(trust);
                 }
                 this.channel = NettyChannelBuilder.forAddress(host, port)
                         .sslContext(sslBuilder.build())
@@ -414,6 +466,7 @@ public class FactryGrpcClient {
         }
 
         this.collectorUUID = collectorUUID;
+        this.restTarget = new RestTarget(host, token, useTls, trust);
         Metadata headers = new Metadata();
         headers.put(COLLECTOR_UUID_KEY, collectorUUID);
         headers.put(AUTHORIZATION_KEY, "Bearer " + token);
@@ -439,6 +492,35 @@ public class FactryGrpcClient {
      * Build a TrustManagerFactory that trusts the JVM's default (system/public) CAs plus the
      * bundled Factry CA. Convenience overload with no user-supplied custom CA.
      */
+    /**
+     * The one trust decision for a TLS connection to Factry, used by the gRPC channel and by the
+     * REST call ({@link FactryRestClient}): no checks at all with Skip TLS Verification; else the
+     * system CAs, the bundled Factry CA and the profile's custom CA. Null means the system default
+     * trust store (when the combined store cannot be built).
+     */
+    static TrustManagerFactory trustManagerFactory(boolean skipTlsVerification, String customCaCert) {
+        if (skipTlsVerification) {
+            return InsecureTrustManagerFactory.INSTANCE;
+        }
+        // Trust the system/public CAs AND the bundled Factry CA, plus any custom CA the user
+        // supplied per-profile. This lets publicly-signed (e.g. Let's Encrypt), Factry-signed,
+        // and internal/enterprise-CA or self-signed certificates all verify without having to
+        // disable verification entirely.
+        try (InputStream caCert = FactryGrpcClient.class.getClassLoader().getResourceAsStream(CA_CERT_RESOURCE)) {
+            if (caCert == null) {
+                logger.warn("Bundled CA certificate '{}' not found; using system CAs only", CA_CERT_RESOURCE);
+            }
+            boolean hasCustomCa = customCaCert != null && !customCaCert.isBlank();
+            logger.info("TLS verification using system CAs plus bundled Factry CA{}",
+                    hasCustomCa ? " plus a custom CA certificate" : "");
+            return buildCombinedTrustManagerFactory(caCert, customCaCert);
+        } catch (Exception e) {
+            logger.warn("Failed to build combined trust store ({}), using the system default trust store",
+                    e.getMessage());
+            return null;
+        }
+    }
+
     static TrustManagerFactory buildCombinedTrustManagerFactory(InputStream extraCaCerts) throws Exception {
         return buildCombinedTrustManagerFactory(extraCaCerts, null);
     }

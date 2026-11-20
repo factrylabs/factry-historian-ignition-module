@@ -170,7 +170,14 @@ public class FactryQueryEngine extends AbstractQueryEngine {
         // used as the tag node id). The browse name is the stored measurement name
         // transformed by the configured delimiter; toStoredTagPath reverses it.
         Map<String, String> displayToBrowse = new HashMap<>();
+        List<String[]> qualified = new ArrayList<>();
         for (Measurement m : measurementCache.getAllMeasurements()) {
+            // The node id is the measurement's read key, so it reads this measurement and no
+            // other Site's with the same name. Not listed while the cache does not know its Site.
+            String readKey = measurementCache.getReadKey(m.getUuid());
+            if (readKey == null) {
+                continue;
+            }
             // Prefix the display path with the collector name so measurements
             // are grouped under their collector in the browse tree.
             String collectorName = measurementCache.getCollectorName(m.getUuid());
@@ -178,7 +185,18 @@ public class FactryQueryEngine extends AbstractQueryEngine {
             String displayPath = collectorName != null
                     ? collectorName + "/" + browseName
                     : browseName;
-            displayToBrowse.put(displayPath, browseName);
+            String database = TagPathUtil.database(readKey);
+            if (database != null && !readKey.equals(m.getName())) {
+                qualified.add(new String[] {displayPath, TagPathUtil.toBrowseId(readKey, delimiter), database});
+            } else {
+                displayToBrowse.put(displayPath, TagPathUtil.toBrowseId(readKey, delimiter));
+            }
+        }
+        // A collector with the same name in two databases: every qualified one whose leaf is
+        // taken gets its database after its leaf name.
+        qualified.sort(java.util.Comparator.comparing((String[] q) -> q[1]));
+        for (String[] q : qualified) {
+            displayToBrowse.put(displayToBrowse.containsKey(q[0]) ? q[0] + " [" + q[2] + "]" : q[0], q[1]);
         }
         return displayToBrowse;
     }
@@ -245,7 +263,8 @@ public class FactryQueryEngine extends AbstractQueryEngine {
                 List<AssetProperty> props = measurementCache.getPropertiesForAsset(parentAsset.getUuid());
                 for (AssetProperty prop : props) {
                     Measurement m = measurementCache.getMeasurementByUUID(prop.getMeasurementUUID());
-                    String storedPath = m != null ? m.getName() : prop.getMeasurementUUID();
+                    String readKey = m != null ? measurementCache.getReadKey(m.getUuid()) : null;
+                    String storedPath = readKey != null ? readKey : m != null ? m.getName() : prop.getMeasurementUUID();
                     publisher.newNode("tag", storedPath)
                             .displayPath(StringPath.of(prop.getName()))
                             .hasChildren(false)
@@ -1823,12 +1842,17 @@ public class FactryQueryEngine extends AbstractQueryEngine {
     private String toStoredTagPath(QualifiedPath path) {
         String pathStr = path.toString();
         String stored = TagPathUtil.queryPathToStoredPath(pathStr);
+        // Another Site's node id names its database first; the delimiter applies to the name only.
+        String database = TagPathUtil.database(stored);
+        String name = TagPathUtil.withoutDatabase(stored);
         if (TagPathUtil.isAssetQueryPath(pathStr)) {
             // Asset property tags carry the measurement's real name (real '/');
             // never apply the tag-path delimiter reverse to them.
-            return TagPathUtil.restoreFractionSlash(stored);
+            name = TagPathUtil.restoreFractionSlash(name);
+        } else {
+            name = TagPathUtil.fromBrowseName(name, settings.getDelimiter());
         }
-        return TagPathUtil.fromBrowseName(stored, settings.getDelimiter());
+        return database != null ? TagPathUtil.qualify(database, name) : name;
     }
 
     static QualityCode statusToQuality(String status) {

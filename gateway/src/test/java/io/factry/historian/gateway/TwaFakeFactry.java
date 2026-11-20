@@ -113,6 +113,13 @@ class TwaFakeFactry extends FactryGrpcClient {
         return queries.stream().filter(q -> q.hasAggregation() && q.getAggregation().getName().equals(name)).toList();
     }
 
+    /** One time-series database, which every measurement is in. */
+    @Override
+    public io.factry.historian.proto.TimeseriesDatabases getTimeseriesDatabases() {
+        return io.factry.historian.proto.TimeseriesDatabases.newBuilder().addTimeseriesDatabases(
+                io.factry.historian.proto.TimeseriesDatabase.newBuilder().setUuid("db").setName("db")).build();
+    }
+
     /** The single-name lookup a read makes for a name the cache does not have: same list. */
     @Override
     public Measurements getMeasurementsByFilterWithDeadline(GetMeasurementsByFilterRequest request) {
