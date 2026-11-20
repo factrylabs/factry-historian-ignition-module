@@ -147,7 +147,7 @@ class FactryHistorianSettingsTest {
     @Test
     void toString_leavesTheTokenOut() {
         FactryHistorianSettings s = validSettings();
-        s.setToken("header.payload.signature");
+        s.setLegacyToken("header.payload.signature");
         assertFalse(s.toString().contains("signature"));
     }
 }

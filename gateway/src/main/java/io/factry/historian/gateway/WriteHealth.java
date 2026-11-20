@@ -218,6 +218,7 @@ final class WriteHealth {
         COLLECTOR_DELETED("Collector deleted in Factry",
                 "The collector of this token was deleted in Factry (%s). Create a collector in Factry"
                         + " and paste its token in the profile settings."),
+        TOKEN_UNREADABLE("Collector token cannot be read", null),
         OTHER("Factry Historian check failed", "The connection check to Factry Historian failed (%s).");
 
         final String message;
@@ -229,12 +230,19 @@ final class WriteHealth {
         }
 
         String details(Status status) {
-            return String.format(details, describe(status)) + " Store and forward keeps the data until it can"
+            return (details == null ? sentence(status.getDescription()) + " The module reads it again with every connection check." : String.format(details, describe(status))) + " Store and forward keeps the data until it can"
                     + " be stored.";
         }
     }
 
+    private static String sentence(String text) {
+        return text == null || text.endsWith(".") ? String.valueOf(text) : text + ".";
+    }
+
     static CheckFailure checkFailure(Status status) {
+        if (status.getCause() instanceof TokenUnreadable) {
+            return CheckFailure.TOKEN_UNREADABLE;
+        }
         switch (status.getCode()) {
             case UNAVAILABLE:
             case DEADLINE_EXCEEDED:
@@ -245,6 +253,18 @@ final class WriteHealth {
             default:
                 return FactryGrpcClient.isCollectorDeleted(status) ? CheckFailure.COLLECTOR_DELETED : CheckFailure.OTHER;
         }
+    }
+
+    /** Marks the check result of a token whose secret could not be read; Factry was not asked. */
+    private static final class TokenUnreadable extends Exception {
+        TokenUnreadable() {
+            super(null, null, false, false);
+        }
+    }
+
+    /** The connection check result while the token's secret cannot be read; {@code why} names no token. */
+    static Status tokenUnreadable(String why) {
+        return Status.FAILED_PRECONDITION.withDescription(why).withCause(new TokenUnreadable());
     }
 
     /** Code, Factry's text and the underlying cause (an SSL or socket error says most). */

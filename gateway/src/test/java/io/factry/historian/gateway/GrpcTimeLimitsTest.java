@@ -295,7 +295,7 @@ class GrpcTimeLimitsTest {
         String token = "e30." + Base64.getUrlEncoder().withoutPadding()
                 .encodeToString(payload.getBytes(StandardCharsets.UTF_8)) + ".sig";
         FactryHistorianSettings settings = new FactryHistorianSettings();
-        settings.setToken(token);
+        settings.setLegacyToken(token);
         settings.setUseTls(false);
         return settings;
     }

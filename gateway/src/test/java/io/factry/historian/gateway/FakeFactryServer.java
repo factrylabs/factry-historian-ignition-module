@@ -63,6 +63,8 @@ final class FakeFactryServer extends HistorianGrpc.HistorianImplBase implements 
     volatile boolean ignoreOffset = false;
     /** The authorization header of every call, in order. */
     final List<String> authorizations = new CopyOnWriteArrayList<>();
+    /** When set, calls with another token fail UNAUTHENTICATED, as Factry answers a revoked token. */
+    volatile String acceptedToken = null;
 
     private final Server server;
 
@@ -79,7 +81,13 @@ final class FakeFactryServer extends HistorianGrpc.HistorianImplBase implements 
             @Override
             public <Q, A> ServerCall.Listener<Q> interceptCall(ServerCall<Q, A> call, Metadata headers,
                                                                ServerCallHandler<Q, A> next) {
-                authorizations.add(String.valueOf(headers.get(key)));
+                String authorization = String.valueOf(headers.get(key));
+                authorizations.add(authorization);
+                String accepted = acceptedToken;
+                if (accepted != null && !authorization.equals("Bearer " + accepted)) {
+                    call.close(Status.UNAUTHENTICATED.withDescription("invalid auth token"), new Metadata());
+                    return new ServerCall.Listener<>() {};
+                }
                 return next.startCall(call, headers);
             }
         };
@@ -124,6 +132,48 @@ final class FakeFactryServer extends HistorianGrpc.HistorianImplBase implements 
     @Override
     public void getCollectors(GetCollectorsRequest request, StreamObserver<Collectors> observer) {
         observer.onNext(Collectors.getDefaultInstance());
+        observer.onCompleted();
+    }
+
+    /** RegisterCollector calls, then the "status" of every UpdateCollectorState, in order. */
+    final List<String> registrations = new CopyOnWriteArrayList<>();
+
+    @Override
+    public void registerCollector(io.factry.historian.proto.RegisterCollectorSchema request,
+                                  StreamObserver<io.factry.historian.proto.Collector> observer) {
+        registrations.add("register");
+        observer.onNext(io.factry.historian.proto.Collector.newBuilder().setUuid("collector").build());
+        observer.onCompleted();
+    }
+
+    @Override
+    public void updateCollectorState(Struct request, StreamObserver<com.google.protobuf.Empty> observer) {
+        registrations.add(request.getFieldsOrDefault("status", Value.getDefaultInstance()).getStringValue());
+        observer.onNext(com.google.protobuf.Empty.getDefaultInstance());
+        observer.onCompleted();
+    }
+
+    /** When set, GetTimeseriesDatabases lists this one database, so a cache reload also asks the REST API. */
+    volatile String database = null;
+
+    @Override
+    public void getTimeseriesDatabases(io.factry.historian.proto.GetTimeseriesDatabasesRequest request,
+                                       StreamObserver<io.factry.historian.proto.TimeseriesDatabases> observer) {
+        if (database == null) {
+            observer.onError(Status.UNIMPLEMENTED.asRuntimeException());
+            return;
+        }
+        observer.onNext(io.factry.historian.proto.TimeseriesDatabases.newBuilder()
+                .addTimeseriesDatabases(io.factry.historian.proto.TimeseriesDatabase.newBuilder()
+                        .setUuid(database).setName(database).setStatus("Active"))
+                .build());
+        observer.onCompleted();
+    }
+
+    /** The connection check. */
+    @Override
+    public void getCollector(com.google.protobuf.Empty request, StreamObserver<io.factry.historian.proto.Collector> observer) {
+        observer.onNext(io.factry.historian.proto.Collector.newBuilder().setUuid("collector").build());
         observer.onCompleted();
     }
 

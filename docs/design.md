@@ -191,7 +191,7 @@ A Java `record` that defines the **Gateway UI form** for creating/editing a hist
 
 | Field | Category | Type | Default |
 |-------|----------|------|---------|
-| `token` | Connection | textarea | *(empty)* |
+| `collectorToken` | Connection | secret (Embedded or Referenced) | *(none)* |
 | `useTls` | Connection | checkbox | `true` |
 | `skipTlsVerification` | Connection | checkbox | `false` |
 | `batchSize` | Advanced | number | `100` |
@@ -202,6 +202,8 @@ A Java `record` that defines the **Gateway UI form** for creating/editing a hist
 The `toSettings()` / `fromSettings()` methods convert between the UI record and the internal `FactryHistorianSettings` object.
 
 **Note:** The token is the only required connection field. Host, port, and collector UUID are extracted from the JWT automatically.
+
+**Collector token as a secret:** `collectorToken` is a `SecretConfig`: Embedded (the gateway encrypts it with its system key; config.json holds only ciphertext) or Referenced (read from a secret provider). `FactryHistoryProvider.resolveToken` reads it at start and on every settings change. Profiles saved before this field hold the token in plain text under `token`; it is still used when `collectorToken` is not set, with one WARN per start. `FactryHistorianExtensionPoint.encode` leaves `token` out once `collectorToken` is set, so the first save with the secret removes the plain copy. The extension point's `validate` refuses an Embedded value that is not a collector token. It checks nothing else: Ignition runs it on every decode, a refused decode does not load the profile at all, and a Referenced token would need a provider call; so an older profile with a blank or bad plain token still loads and shows Errored, and the form marks the field required. The legacy field is `@NonSecret`, so Ignition does not warn at every start that a field named like a secret is a plain string. Ignition fires no change when a profile is saved unchanged, so a token replaced in a secret provider is read again when Factry refuses the one in use (the scheduled connection check), when the profile restarts, or on a save that changes something. A value that is not a collector token is not taken (one WARN; the status keeps saying Factry refuses the token), and a new token starts from the stored host and port, so one naming another Factry is followed. A Referenced token that cannot be read when the profile starts (a provider of another module, or a remote one whose Gateway Network link is not up yet) does not fail the start: the profile shows Errored "Collector token cannot be read" with the provider and secret name, and every connection check reads it again until it can, then connects and registers the collector with Factry (Active, Collecting). A save whose token cannot be read points the client nowhere (an `.invalid` host), so nothing reads the previous Factry with the previous token. A value that is not a collector token is warned about once, not on every check. Shutdown waits up to 5 s for the scheduler, so no check builds a channel after the client is closed. The REST call for the default database gets the same cleaned token as the gRPC channel (both are rebuilt by `reconfigure`), so it follows a reload too. `handleSettingsChange` and these reconnects are synchronized, so a save and a reload never mix settings and token. Downgrading to a module without this field after a save loses the token.
 
 ### `FactryHistorianSettings.java`
 
