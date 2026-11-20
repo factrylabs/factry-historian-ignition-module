@@ -34,7 +34,7 @@ class TokenSecretTest {
 
     @BeforeEach
     void setUp() throws Exception {
-        factry = new FakeFactryServer();
+        factry = new FakeFactryServer(TestTls.LOOPBACK);
         String uuid = factry.addMeasurement("default/a", "number");
         factry.addPoint(uuid, START, 1.0);
         token = jwt(factry.port(), "sig-one");
@@ -146,7 +146,7 @@ class TokenSecretTest {
     /** A rotated token that names another Factry (host or port) is followed, not the first one's. */
     @Test
     void reloadedTokenForAnotherPortIsFollowed() throws Exception {
-        try (FakeFactryServer other = new FakeFactryServer()) {
+        try (FakeFactryServer other = new FakeFactryServer(TestTls.LOOPBACK)) {
             String uuid = other.addMeasurement("default/a", "number");
             other.addPoint(uuid, START, 1.0);
             provider = start(saved("collectorToken", secrets.referenced("vault", "factry", token).toJsonTree()));
@@ -237,8 +237,10 @@ class TokenSecretTest {
     @Test
     void restCallUsesTheCleanTokenAlsoAfterAReload() throws Exception {
         List<String> restAuth = new java.util.concurrent.CopyOnWriteArrayList<>();
-        com.sun.net.httpserver.HttpServer rest = com.sun.net.httpserver.HttpServer.create(
+        // HTTPS: the REST call uses TLS as gRPC does.
+        com.sun.net.httpserver.HttpsServer rest = com.sun.net.httpserver.HttpsServer.create(
                 new java.net.InetSocketAddress(java.net.InetAddress.getLoopbackAddress(), 0), 0);
+        rest.setHttpsConfigurator(new com.sun.net.httpserver.HttpsConfigurator(TestTls.jdkServer(TestTls.LOOPBACK)));
         rest.createContext("/", exchange -> {
             restAuth.add(String.valueOf(exchange.getRequestHeaders().getFirst("Authorization")));
             byte[] answer = "{\"DefaultDatabaseUUID\":\"db-a\"}".getBytes(StandardCharsets.UTF_8);
@@ -330,6 +332,7 @@ class TokenSecretTest {
         JsonObject config = new JsonObject();
         config.add(key, tokenValue);
         config.addProperty("delimiter", "/");
+        config.addProperty("customCaCert", TestTls.caPem());
         return new FactryHistorianExtensionPoint().decode(config);
     }
 

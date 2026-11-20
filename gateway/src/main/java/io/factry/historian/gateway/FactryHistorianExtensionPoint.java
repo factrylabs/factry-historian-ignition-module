@@ -5,6 +5,7 @@ import com.inductiveautomation.historian.gateway.api.HistorianExtensionPoint;
 import com.inductiveautomation.historian.gateway.api.HistorianProvider;
 import com.inductiveautomation.historian.gateway.api.config.HistorianSettings;
 import com.inductiveautomation.ignition.gateway.config.DecodedResource;
+import com.inductiveautomation.ignition.gateway.config.DecodingException;
 import com.inductiveautomation.ignition.common.gson.JsonElement;
 import com.inductiveautomation.ignition.gateway.config.ExtensionPointConfig;
 import com.inductiveautomation.ignition.gateway.config.ValidationErrors;
@@ -67,6 +68,16 @@ public class FactryHistorianExtensionPoint extends HistorianExtensionPoint<Factr
         this.context = context;
     }
 
+    /** Shows the host and port of an older profile as overrides; see {@link FactryHistorianSettings#moveLegacyConnectionSettings()}. */
+    @Override
+    public FactryHistorianSettings decode(JsonElement json) throws DecodingException {
+        FactryHistorianSettings settings = super.decode(json);
+        if (settings != null) {
+            settings.moveLegacyConnectionSettings();
+        }
+        return settings;
+    }
+
     /**
      * Once the token is a secret, the plain copy an older profile holds under {@code token} is left
      * out, so the first save with the new field removes it from config.json.
@@ -90,6 +101,16 @@ public class FactryHistorianExtensionPoint extends HistorianExtensionPoint<Factr
      */
     @Override
     protected void validate(FactryHistorianSettings settings, ValidationErrors.Builder errors) {
+        Integer port = settings.getPortOverride();
+        if (port != null && (port < 0 || port > 65535)) {
+            errors.addFieldMessage("portOverride", "Port Override must be between 1 and 65535, or 0 to use the"
+                    + " token's port.");
+        }
+        try {
+            FactryGrpcClient.parseCaCertificates(settings.getCustomCaCert());
+        } catch (IllegalArgumentException e) {
+            errors.addFieldMessage("customCaCert", e.getMessage());
+        }
         SecretConfig secret = settings.getCollectorToken();
         if (secret == null || !secret.isEmbedded() || context == null) {
             return;
@@ -134,7 +155,6 @@ public class FactryHistorianExtensionPoint extends HistorianExtensionPoint<Factr
         // form will be broken with message: Extension Point Form Not Found
         // FactryHistorianSettings defaults = new FactryHistorianSettings();
         // defaults.setToken("");
-        // defaults.setUseTls(true);
         // defaults.setSkipTlsVerification(false);
         // defaults.setDebugLogging(false);
         // defaults.setDelimiter("/");

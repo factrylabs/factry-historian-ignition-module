@@ -49,7 +49,7 @@ public class FactryStorageEngine extends AbstractStorageEngine {
         this.metrics = metrics;
         this.pointWriter = new PointWriter(grpcClient, measurementCache, metrics, writeHealth);
         logger.debug("Factry Storage Engine initialized with gRPC target: " +
-                settings.getGrpcHost() + ":" + settings.getGrpcPort());
+                settings.getHost() + ":" + settings.getPort());
     }
 
     @Override

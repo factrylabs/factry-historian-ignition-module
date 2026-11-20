@@ -11,17 +11,23 @@ public class FactryHistorianSettings implements HistorianSettings {
 
     private String collectorUUID = "";
     private String collectorName = "";
-    private static final String DEFAULT_GRPC_HOST = "localhost";
-    private static final int DEFAULT_GRPC_PORT = 9876;
-    private String grpcHost = DEFAULT_GRPC_HOST;
-    private int grpcPort = DEFAULT_GRPC_PORT;
-    // grpcHost and grpcPort as stored, kept at the first applyTokenDefaults: that one replaces the
-    // defaults with the token's values, and a later token (from a secret provider) must start from
-    // the stored values again.
-    private transient String storedGrpcHost;
-    private transient Integer storedGrpcPort;
+    // Where the gateway reaches Factry when that is not what the token says (Docker, NAT, a DMZ
+    // name). Blank or 0: the token's host and grpc-port.
+    private String hostOverride = "";
+    private Integer portOverride;
+    // Host and port as profiles saved before the overrides existed hold them, then hidden. Moved
+    // to the overrides when the profile is decoded. "localhost" and 9876 were the class defaults,
+    // written with every save, so they mean "from the token".
+    private static final String LEGACY_DEFAULT_HOST = "localhost";
+    private static final int LEGACY_DEFAULT_PORT = 9876;
+    private String grpcHost;
+    private Integer grpcPort;
+    // Resolved from the token and the overrides by applyTokenDefaults; never stored, so a resolved
+    // value cannot turn into an override.
+    private transient String host = "";
+    private transient int port;
+    private transient boolean factryCertificate;
     private boolean debugLogging = false;
-    private boolean useTls = false;
     private boolean skipTlsVerification = false;
     // The collector token: encrypted with the gateway's key (Embedded) or read from a secret
     // provider (Referenced).
@@ -33,8 +39,8 @@ public class FactryHistorianSettings implements HistorianSettings {
     // field named like a secret is not a SecretConfig.
     @NonSecret
     private String token = "";
-    // Optional PEM-encoded CA certificate(s) to trust in addition to the system and bundled
-    // Factry CAs — for Historians fronted by an internal/enterprise CA or a self-signed cert.
+    // Optional PEM-encoded CA certificate(s) to trust in addition to the system CAs, for a
+    // Historian (or a proxy in front of it) with a certificate of its own.
     private String customCaCert = "";
     // Tag-path delimiter for tree-view splitting in the browser/Power Chart.
     // Default is empty (flat list). An Ignition 8.3 bug prevents defaultSettings()
@@ -61,20 +67,59 @@ public class FactryHistorianSettings implements HistorianSettings {
         this.collectorName = collectorName;
     }
 
-    public String getGrpcHost() {
-        return grpcHost;
+    public String getHostOverride() {
+        return hostOverride;
     }
 
-    public void setGrpcHost(String grpcHost) {
-        this.grpcHost = grpcHost;
+    public void setHostOverride(String hostOverride) {
+        this.hostOverride = hostOverride;
     }
 
-    public int getGrpcPort() {
-        return grpcPort;
+    public Integer getPortOverride() {
+        // 0, not empty, is "not set" in the form; a profile saved before the overrides holds null.
+        return isSet(portOverride) ? portOverride : 0;
     }
 
-    public void setGrpcPort(int grpcPort) {
-        this.grpcPort = grpcPort;
+    public void setPortOverride(Integer portOverride) {
+        this.portOverride = portOverride;
+    }
+
+    /** The host the client connects to; set by {@link #applyTokenDefaults(String)}. */
+    public String getHost() {
+        return host;
+    }
+
+    /** The port the client connects to; set by {@link #applyTokenDefaults(String)}. */
+    public int getPort() {
+        return port;
+    }
+
+    /** The token says Factry serves its built-in certificate; set by {@link #applyTokenDefaults(String)}. */
+    public boolean usesFactryCertificate() {
+        return factryCertificate;
+    }
+
+    /**
+     * Moves the host and port of a profile saved before the overrides existed into the overrides,
+     * so they show in the form and the next save stores them under the new names.
+     */
+    void moveLegacyConnectionSettings() {
+        if (isBlank(hostOverride) && !isBlank(grpcHost) && !LEGACY_DEFAULT_HOST.equals(grpcHost)) {
+            hostOverride = grpcHost;
+        }
+        if (!isSet(portOverride) && grpcPort != null && grpcPort != LEGACY_DEFAULT_PORT && grpcPort != 0) {
+            portOverride = grpcPort;
+        }
+        grpcHost = null;
+        grpcPort = null;
+    }
+
+    private static boolean isBlank(String value) {
+        return value == null || value.isBlank();
+    }
+
+    private static boolean isSet(Integer port) {
+        return port != null && port != 0;
     }
 
     public boolean isDebugLogging() {
@@ -83,14 +128,6 @@ public class FactryHistorianSettings implements HistorianSettings {
 
     public void setDebugLogging(boolean debugLogging) {
         this.debugLogging = debugLogging;
-    }
-
-    public boolean isUseTls() {
-        return useTls;
-    }
-
-    public void setUseTls(boolean useTls) {
-        this.useTls = useTls;
     }
 
     public boolean isSkipTlsVerification() {
@@ -135,9 +172,8 @@ public class FactryHistorianSettings implements HistorianSettings {
     }
 
     /**
-     * Extract collectorUUID, grpcHost, and grpcPort from the JWT token payload.
-     * These fields are no longer exposed in the UI — the token is the single
-     * source of truth for connection settings.
+     * Extract the collector, host, port and certificate from the JWT token payload. Host Override
+     * and Port Override, when set, win over the token's host and port.
      *
      * @param resolvedToken the plaintext JWT string, as pasted
      * @return the token to send to Factry, see {@link JwtTokenParser#normalize(String)}
@@ -148,26 +184,17 @@ public class FactryHistorianSettings implements HistorianSettings {
         this.collectorUUID = claims.collectorUUID();
         this.collectorName = claims.collectorName();
 
-        if (storedGrpcHost == null) {
-            storedGrpcHost = grpcHost;
-            storedGrpcPort = grpcPort;
-        }
-        // Only apply host/port from token if config still has defaults.
-        if (DEFAULT_GRPC_HOST.equals(storedGrpcHost)) {
-            this.grpcHost = claims.host();
-        } else {
-            this.grpcHost = storedGrpcHost;
-            logger.info("Config grpcHost '{}' overrides token host '{}'", storedGrpcHost, claims.host());
-        }
-        if (DEFAULT_GRPC_PORT == storedGrpcPort) {
-            this.grpcPort = claims.port();
-        } else {
-            this.grpcPort = storedGrpcPort;
-            logger.info("Config grpcPort '{}' overrides token port '{}'", storedGrpcPort, claims.port());
-        }
+        this.factryCertificate = claims.factryCertificate();
+        boolean hostOverridden = !isBlank(hostOverride);
+        boolean portOverridden = isSet(portOverride);
+        this.host = hostOverridden ? hostOverride.trim() : claims.host();
+        this.port = portOverridden ? portOverride : claims.port();
 
-        logger.info("Extracted from token: collectorName={}, collectorUUID={}, host={}, port={}",
-                collectorName, collectorUUID, grpcHost, grpcPort);
+        logger.info("Collector {} ({}): connecting to {}:{} (host {}, port {}), {}", collectorName, collectorUUID,
+                host, port,
+                hostOverridden ? "from Host Override, the token says " + claims.host() : "from the token",
+                portOverridden ? "from Port Override, the token says " + claims.port() : "from the token",
+                FactryGrpcClient.tlsLabel(true, skipTlsVerification, customCaCert, factryCertificate));
         return claims.token();
     }
 
@@ -181,7 +208,8 @@ public class FactryHistorianSettings implements HistorianSettings {
         parseClaims(token);
     }
 
-    private record Claims(String token, String collectorUUID, String collectorName, String host, int port) {}
+    private record Claims(String token, String collectorUUID, String collectorName, String host, int port,
+                          boolean factryCertificate) {}
 
     private static Claims parseClaims(String resolvedToken) {
         String token = JwtTokenParser.normalize(resolvedToken);
@@ -200,7 +228,7 @@ public class FactryHistorianSettings implements HistorianSettings {
         int port = JwtTokenParser.getGrpcPort(payload)
                 .orElseThrow(() -> new IllegalArgumentException(
                         "Invalid token: missing or invalid gRPC port. Ensure this is a Factry collector token."));
-        return new Claims(token, uuid, name, host, port);
+        return new Claims(token, uuid, name, host, port, JwtTokenParser.usesFactryCertificate(payload));
     }
 
     /**
@@ -214,10 +242,10 @@ public class FactryHistorianSettings implements HistorianSettings {
         if (collectorName == null || collectorName.trim().isEmpty()) {
             throw new IllegalArgumentException("Collector name is required (should be extracted from token)");
         }
-        if (grpcHost == null || grpcHost.trim().isEmpty()) {
+        if (host == null || host.trim().isEmpty()) {
             throw new IllegalArgumentException("Host is required (should be extracted from token)");
         }
-        if (grpcPort < 1 || grpcPort > 65535) {
+        if (port < 1 || port > 65535) {
             throw new IllegalArgumentException("Port must be between 1 and 65535");
         }
         // Surface a bad custom CA certificate at save time rather than as an opaque TLS
@@ -232,10 +260,9 @@ public class FactryHistorianSettings implements HistorianSettings {
                 ", collectorUUID='" + collectorUUID + '\'' +
                 ", collectorToken=" + (collectorToken == null ? (token == null || token.isBlank() ? "none" : "plain text")
                         : collectorToken.getType()) +
-                ", grpcHost='" + grpcHost + '\'' +
-                ", grpcPort=" + grpcPort +
+                ", hostOverride='" + hostOverride + '\'' +
+                ", portOverride=" + portOverride +
                 ", debugLogging=" + debugLogging +
-                ", useTls=" + useTls +
                 ", skipTlsVerification=" + skipTlsVerification +
                 ", delimiter='" + delimiter + '\'' +
                 ", customCaCert='" + (customCaCert == null || customCaCert.isBlank() ? "" : "<set>") + '\'' +

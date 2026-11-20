@@ -27,7 +27,7 @@ class TokenWhitespaceTest {
 
     @BeforeEach
     void setUp() throws Exception {
-        factry = new FakeFactryServer();
+        factry = new FakeFactryServer(TestTls.LOOPBACK);
         String uuid = factry.addMeasurement("default/a", "number");
         factry.addPoint(uuid, START, 1.0);
         token = jwt(factry.port());
@@ -82,6 +82,7 @@ class TokenWhitespaceTest {
         JsonObject config = new JsonObject();
         config.addProperty("token", pastedToken);
         config.addProperty("delimiter", "/");
+        config.addProperty("customCaCert", TestTls.caPem());
         return new FactryHistorianExtensionPoint().decode(config);
     }
 

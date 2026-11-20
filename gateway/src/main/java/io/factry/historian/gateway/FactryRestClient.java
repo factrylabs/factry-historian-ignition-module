@@ -5,7 +5,8 @@ import com.inductiveautomation.ignition.common.gson.JsonObject;
 import com.inductiveautomation.ignition.common.gson.JsonParser;
 
 import javax.net.ssl.SSLContext;
-import javax.net.ssl.TrustManagerFactory;
+import javax.net.ssl.TrustManager;
+import javax.net.ssl.X509TrustManager;
 import java.io.IOException;
 import java.net.URI;
 import java.net.http.HttpClient;
@@ -21,9 +22,11 @@ import java.util.concurrent.TimeoutException;
  * database, which Factry's gRPC {@code Collector} does not carry. Factry v8.2.3 answers
  * {@code GET /api/collectors/<uuid>} to the collector token itself, with the organisation from
  * the token in {@code x-organization-uuid}. The REST port is the token's {@code rest-port} claim,
- * on the gRPC host. HTTPS when the profile uses TLS, with the gRPC channel's own trust decision
- * ({@link FactryGrpcClient#trustManagerFactory}); never plain HTTP then, so the token is not sent
- * in the clear. One HTTP client per channel settings, and one deadline over the whole call, body
+ * on the gRPC host (Host Override or the token's host; Port Override is the gRPC port and does not
+ * apply). HTTPS, as gRPC always uses TLS, with the gRPC channel's own trust decision
+ * ({@link FactryGrpcClient#trustManager}); never plain HTTP, so the token is not sent in the
+ * clear. The JDK's TLS engine leaves the host name check to that trust manager, so Factry's
+ * built-in certificate (named historian.factry.local) passes at any host here as over gRPC. One HTTP client per channel settings, and one deadline over the whole call, body
  * included: a REST port that does not answer costs a full cache reload {@link #TIMEOUT}.
  */
 final class FactryRestClient {
@@ -42,7 +45,7 @@ final class FactryRestClient {
      * A client for the collector of {@code token}, or null when the token does not say where the
      * REST API is (no {@code rest-port}, organisation or collector claim).
      */
-    static FactryRestClient forToken(String host, String token, boolean useTls, TrustManagerFactory trust)
+    static FactryRestClient forToken(String host, String token, boolean useTls, X509TrustManager trust)
             throws Exception {
         JsonObject claims = JwtTokenParser.parsePayload(token).orElse(null);
         Integer port = claims != null ? JwtTokenParser.getRestPort(claims).orElse(null) : null;
@@ -57,7 +60,7 @@ final class FactryRestClient {
         HttpClient.Builder builder = HttpClient.newBuilder().connectTimeout(TIMEOUT);
         if (useTls) {
             SSLContext context = SSLContext.getInstance("TLS");
-            context.init(null, trust != null ? trust.getTrustManagers() : null, null);
+            context.init(null, trust != null ? new TrustManager[]{trust} : null, null);
             builder.sslContext(context);
         }
         HttpRequest request = HttpRequest.newBuilder(uri).timeout(TIMEOUT)

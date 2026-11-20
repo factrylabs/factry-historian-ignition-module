@@ -230,8 +230,9 @@ final class WriteHealth {
         }
 
         String details(Status status) {
-            return (details == null ? sentence(status.getDescription()) + " The module reads it again with every connection check." : String.format(details, describe(status))) + " Store and forward keeps the data until it can"
-                    + " be stored.";
+            return (details == null ? sentence(status.getDescription()) + " The module reads it again with every connection check."
+                    : String.format(details, describe(status)) + FactryGrpcClient.tlsHint(status))
+                    + " Store and forward keeps the data until it can be stored.";
         }
     }
 
@@ -270,16 +271,35 @@ final class WriteHealth {
     /** Code, Factry's text and the underlying cause (an SSL or socket error says most). */
     static String describe(Status status) {
         StringBuilder sb = new StringBuilder(status.getCode().toString());
-        String description = status.getDescription();
-        if (description != null && !description.isEmpty()) {
+        String description = shorten(status.getDescription());
+        if (!description.isEmpty()) {
             sb.append(": ").append(description);
         }
         Throwable cause = status.getCause();
-        if (cause != null && cause.getMessage() != null
-                && (description == null || !description.contains(cause.getMessage()))) {
-            sb.append(": ").append(cause.getMessage());
+        String causeText = cause == null ? "" : shorten(cause.getMessage());
+        if (!causeText.isEmpty() && !description.contains(causeText)) {
+            sb.append(": ").append(causeText);
         }
         return sb.toString();
+    }
+
+    static final int MAX_TEXT = 200;
+    private static final java.util.regex.Pattern NETTY_PIPELINE =
+            java.util.regex.Pattern.compile("Channel Pipeline: \\[[^\\]]*\\]:?");
+
+    /**
+     * Netty's messages can run to thousands of characters: NotSslRecordException names the channel
+     * pipeline and dumps the whole reply in hex. The status tooltip and the log line need the gist.
+     */
+    static String shorten(String text) {
+        if (text == null) {
+            return "";
+        }
+        if (text.contains("not an SSL/TLS record")) {
+            return "not an SSL/TLS record";
+        }
+        String s = NETTY_PIPELINE.matcher(text).replaceAll("").replaceAll("\\s+", " ").trim();
+        return s.length() <= MAX_TEXT ? s : s.substring(0, MAX_TEXT) + "...";
     }
 
     private static String duration(long millis) {

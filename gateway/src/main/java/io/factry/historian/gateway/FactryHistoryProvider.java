@@ -89,13 +89,14 @@ public class FactryHistoryProvider extends AbstractHistorian<FactryHistorianSett
 
         // Without a token the client points nowhere (".invalid" never resolves) until it is read.
         this.grpcClient = new FactryGrpcClient(
-                tokenUnreadable == null ? settings.getGrpcHost() : NO_TOKEN_HOST,
-                tokenUnreadable == null ? settings.getGrpcPort() : 1,
+                tokenUnreadable == null ? settings.getHost() : NO_TOKEN_HOST,
+                tokenUnreadable == null ? settings.getPort() : 1,
                 settings.getCollectorUUID(),
                 token,
-                settings.isUseTls(),
+                true, // Factry's gRPC port always uses TLS
                 settings.isSkipTlsVerification(),
-                settings.getCustomCaCert()
+                settings.getCustomCaCert(),
+                settings.usesFactryCertificate()
         );
         this.measurementCache = new MeasurementCache();
 
@@ -104,7 +105,7 @@ public class FactryHistoryProvider extends AbstractHistorian<FactryHistorianSett
                 writeHealth);
 
         logger.info("Factry Historian created: name={}, grpcTarget={}:{}, collectorUUID={}",
-                historianName, settings.getGrpcHost(), settings.getGrpcPort(), settings.getCollectorUUID());
+                historianName, settings.getHost(), settings.getPort(), settings.getCollectorUUID());
     }
 
     public FactryHistoryProvider(GatewayContext context, String historianName) {
@@ -307,13 +308,14 @@ public class FactryHistoryProvider extends AbstractHistorian<FactryHistorianSett
 
         // Reconfigure the gRPC client (shuts down old channel, creates new one)
         grpcClient.reconfigure(
-                newSettings.getGrpcHost(),
-                newSettings.getGrpcPort(),
+                newSettings.getHost(),
+                newSettings.getPort(),
                 newSettings.getCollectorUUID(),
                 token,
-                newSettings.isUseTls(),
+                true, // Factry's gRPC port always uses TLS
                 newSettings.isSkipTlsVerification(),
-                newSettings.getCustomCaCert()
+                newSettings.getCustomCaCert(),
+                newSettings.usesFactryCertificate()
         );
         this.activeToken = token;
         this.tokenUnreadable = null;

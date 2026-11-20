@@ -149,9 +149,10 @@ class GrpcTimeLimitsTest {
 
     @BeforeEach
     void startServer() throws Exception {
-        server = NettyServerBuilder.forAddress(new java.net.InetSocketAddress(java.net.InetAddress.getLoopbackAddress(), 0)).addService(factry).build().start();
+        server = NettyServerBuilder.forAddress(new java.net.InetSocketAddress(java.net.InetAddress.getLoopbackAddress(), 0))
+                .sslContext(TestTls.server(TestTls.LOOPBACK)).addService(factry).build().start();
         client = new FactryGrpcClient(java.net.InetAddress.getLoopbackAddress().getHostAddress(), server.getPort(), "collector-uuid", "token",
-                false, false, null);
+                true, false, TestTls.caPem());
     }
 
     @AfterEach
@@ -291,12 +292,12 @@ class GrpcTimeLimitsTest {
 
     private static FactryHistorianSettings settingsFor(int port) {
         String payload = "{\"uuid\":\"collector-uuid\",\"name\":\"Ignition\","
-                + "\"aud\":\"http://localhost\",\"grpc-port\":\"" + port + "\"}";
+                + "\"aud\":\"http://127.0.0.1\",\"grpc-port\":\"" + port + "\"}";
         String token = "e30." + Base64.getUrlEncoder().withoutPadding()
                 .encodeToString(payload.getBytes(StandardCharsets.UTF_8)) + ".sig";
         FactryHistorianSettings settings = new FactryHistorianSettings();
         settings.setLegacyToken(token);
-        settings.setUseTls(false);
+        settings.setCustomCaCert(TestTls.caPem());
         return settings;
     }
 
@@ -304,7 +305,7 @@ class GrpcTimeLimitsTest {
     void failedConnectionTestDropsADeadConnection() throws Exception {
         try (SilentDropProxy proxy = new SilentDropProxy(server.getPort())) {
             FactryGrpcClient viaProxy = new FactryGrpcClient(java.net.InetAddress.getLoopbackAddress().getHostAddress(), proxy.port(), "collector-uuid",
-                    "token", false, false, null);
+                    "token", true, false, TestTls.caPem());
             try {
                 assertTrue(viaProxy.testConnection());
 
