@@ -36,6 +36,46 @@ public final class ModuleProperties {
         return getLong("grpc.write.deadline.seconds", 3);
     }
 
+    public static long getWriteDeadlineMillisPerPoint() {
+        return getLong("grpc.write.deadline.ms.per.point", 1);
+    }
+
+    public static long getWriteDeadlineMaxSeconds() {
+        return getLong("grpc.write.deadline.max.seconds", 30);
+    }
+
+    /**
+     * Largest CreatePoints message the module sends; bigger flushes go in several calls. Well
+     * under Factry's 64 MiB limit. Values under 64 KiB are taken as 64 KiB.
+     */
+    public static long getWriteMaxMessageBytes() {
+        return getLong("grpc.write.max.message.bytes", 4L * 1024 * 1024);
+    }
+
+    /**
+     * The link speed a write deadline allows for, in bytes per second of the uncompressed
+     * message: a 4 MiB message gets 16 s on top of the base deadline. At least 1.
+     */
+    public static long getWriteMinBytesPerSecond() {
+        return Math.max(1, getLong("grpc.write.min.bytes.per.second", 256 * 1024));
+    }
+
+    public static boolean isWriteGzip() {
+        return Boolean.parseBoolean(props.getProperty("grpc.write.gzip", "true").trim());
+    }
+
+    public static long getReadDeadlineSeconds() {
+        return getLong("grpc.read.deadline.seconds", 30);
+    }
+
+    public static long getCallDeadlineSeconds() {
+        return getLong("grpc.call.deadline.seconds", 10);
+    }
+
+    public static long getShutdownGraceSeconds() {
+        return getLong("grpc.shutdown.grace.seconds", 3);
+    }
+
     public static long getStatusCacheMs() {
         return getLong("status.cache.ms", 30_000);
     }
@@ -44,8 +84,17 @@ public final class ModuleProperties {
         return getLong("measurement.cache.refresh.seconds", 30);
     }
 
+    /** How long a read remembers that Factry has no measurement with a name. */
+    public static long getMeasurementLookupMissSeconds() {
+        return getLong("measurement.lookup.miss.seconds", 60);
+    }
+
     public static int getMeasurementCachePageSize() {
         return (int) getLong("measurement.cache.page.size", 5000);
+    }
+
+    public static long getRawQueryMaxPoints() {
+        return getLong("query.raw.max.points", 500_000);
     }
 
     private static long getLong(String key, long defaultValue) {
