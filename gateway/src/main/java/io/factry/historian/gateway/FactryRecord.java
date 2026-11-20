@@ -15,9 +15,18 @@ public class FactryRecord implements HistoricalNode {
     private final Instant createdTime;
 
     public FactryRecord(String measurementUUID, QualifiedPath source, String factryDataType, Instant createdTime) {
+        this(measurementUUID, source, factryDataType, null, createdTime);
+    }
+
+    /**
+     * @param ignitionDataType the tag's Ignition data type as recorded on the measurement, or null.
+     *                         Only DateTime is used: Factry keeps dates as numbers.
+     */
+    public FactryRecord(String measurementUUID, QualifiedPath source, String factryDataType,
+                        String ignitionDataType, Instant createdTime) {
         this.nodeId = UUID.nameUUIDFromBytes(measurementUUID.getBytes());
         this.source = source;
-        this.dataType = toIgnitionDataType(factryDataType);
+        this.dataType = "DateTime".equals(ignitionDataType) ? DataType.DateTime : toIgnitionDataType(factryDataType);
         this.createdTime = createdTime != null ? createdTime : Instant.EPOCH;
     }
 
