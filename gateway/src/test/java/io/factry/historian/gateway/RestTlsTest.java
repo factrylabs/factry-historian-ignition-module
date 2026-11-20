@@ -100,7 +100,10 @@ class RestTlsTest {
             FactryHistoryProvider provider = new FactryHistoryProvider(new FakeSecrets().gatewayContext(), "Factry",
                     ep.decode(config));
             try {
-                assertTrue(provider.handleSettingsChange(ep.decode(config)));
+                // A save that changes something: one that changes nothing applies nothing.
+                FactryHistorianSettings saved = ep.decode(config);
+                saved.setDelimiter("/");
+                assertTrue(provider.handleSettingsChange(saved));
                 assertEquals(List.of("/api/collectors/collector"), requests.stream().distinct().toList());
             } finally {
                 provider.onShutdown();

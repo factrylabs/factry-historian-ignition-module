@@ -1,10 +1,14 @@
 package io.factry.historian.gateway;
 
 import com.inductiveautomation.historian.gateway.api.AbstractHistorian;
+import com.inductiveautomation.historian.gateway.api.HistorianExtensionPoint;
 import com.inductiveautomation.historian.gateway.api.query.QueryEngine;
 import com.inductiveautomation.historian.gateway.api.storage.StorageEngine;
 import com.inductiveautomation.historian.gateway.interop.TagHistoryDataSinkBridge;
 import com.inductiveautomation.historian.gateway.interop.TagHistoryStorageEngineBridge;
+import com.inductiveautomation.ignition.common.ImmutableBytes;
+import com.inductiveautomation.ignition.common.gson.JsonElement;
+import com.inductiveautomation.ignition.common.gson.JsonParser;
 import com.inductiveautomation.ignition.common.resourcecollection.ChangeOperation;
 import com.inductiveautomation.ignition.common.resourcecollection.Resource;
 import com.inductiveautomation.ignition.common.resourcecollection.ResourceBuilder;
@@ -66,6 +70,21 @@ public class FactryHistoryProvider extends AbstractHistorian<FactryHistorianSett
     /** Where the client points while it has no token: ".invalid" never resolves, nothing is sent. */
     private static final String NO_TOKEN_HOST = "collector-token-unread.invalid";
 
+    /** What the gRPC client was last set up with, to tell a save that changes nothing. */
+    record Connection(String host, int port, String collectorUUID, String token, boolean skipTlsVerification,
+                      String customCaCert, boolean factryCertificate) {
+        static Connection of(FactryHistorianSettings s, String token) {
+            return new Connection(s.getHost(), s.getPort(), s.getCollectorUUID(), token,
+                    s.isSkipTlsVerification(), s.getCustomCaCert(), s.usesFactryCertificate());
+        }
+    }
+
+    private volatile Connection connection;
+
+    Connection connection() {
+        return connection;
+    }
+
     /** The profile status, from the connection check (on the scheduler) and the writes. */
     private final WriteHealth writeHealth;
     private static final long STATUS_CHECK_MS = ModuleProperties.getStatusCacheMs();
@@ -98,6 +117,7 @@ public class FactryHistoryProvider extends AbstractHistorian<FactryHistorianSett
                 settings.getCustomCaCert(),
                 settings.usesFactryCertificate()
         );
+        this.connection = tokenUnreadable == null ? Connection.of(settings, token) : null;
         this.measurementCache = new MeasurementCache();
 
         this.queryEngine = new FactryQueryEngine(context, historianName, settings, grpcClient, measurementCache, metrics);
@@ -248,14 +268,80 @@ public class FactryHistoryProvider extends AbstractHistorian<FactryHistorianSett
         return Optional.of(storageBridge != null ? storageBridge : storageEngine);
     }
 
+    /**
+     * Measurement names in Factry do not contain the profile name, so Factry needs nothing. Store
+     * and forward does: this profile buffers in an engine named after it. This instance keeps
+     * running (true) and keeps forwarding from that engine, but from its next start the profile
+     * uses an engine with the new name, and what is still in the old one is not forwarded. Moving
+     * the data along would need a third-party engine, which Ignition stops whenever the profile
+     * stops (gateway boot, module update, profile disabled) and then drops the tag data sent to it;
+     * that loss for common operations is worse than this rare case. So say what is left behind.
+     */
     @Override
     public boolean handleNameChange(String newName) {
         logger.info("Historian name changed: {} -> {}", historianName, newName);
         writeHealth.rename(newName);
-        // Measurement names in Factry don't contain the historian profile name,
-        // so no data migration is needed.
-        // The framework updates the historianName field in AbstractHistorian.
+        reportEngineLeftBehind(context.getStoreAndForwardManager(),
+                sfEngineName != null ? sfEngineName : historianName, newName);
+        // Ignition 8.3.8 and newer call only this on a save that renames, so apply settings
+        // changed in the same save here. (8.3.3 to 8.3.6 have applied them already.)
+        Optional<FactryHistorianSettings> saved = storedSettings(newName);
+        if (saved.isPresent()) {
+            return handleSettingsChange(saved.get());
+        }
         return true;
+    }
+
+    /** The settings saved for the profile {@code name}, as Ignition decodes them. */
+    private Optional<FactryHistorianSettings> storedSettings(String name) {
+        try {
+            Optional<Resource> resource = context.getConfigurationManager()
+                    .getNamedResource(HistorianExtensionPoint.RESOURCE_TYPE, name);
+            Optional<ImmutableBytes> data = resource.flatMap(r -> r.getData("config.json"));
+            if (data.isEmpty()) {
+                return Optional.empty();
+            }
+            JsonElement saved = JsonParser.parseString(data.get().getBytesAsString()).getAsJsonObject().get("settings");
+            return saved == null ? Optional.empty() : Optional.of(new FactryHistorianExtensionPoint().decode(saved));
+        } catch (Exception e) {
+            logger.debug("Could not read the saved settings of profile '{}'", name, e);
+            return Optional.empty();
+        }
+    }
+
+    /**
+     * Engine names ignore case, so a rename in letter case only (or back to the engine's name)
+     * keeps the engine. Otherwise one line on what the old engine holds now, and what to do.
+     */
+    static void reportEngineLeftBehind(StoreAndForwardManager storeAndForwardManager, String engineName,
+                                       String newName) {
+        if (engineName.equalsIgnoreCase(newName)) {
+            logger.info("Profile renamed to '{}'; it keeps store and forward engine '{}' (engine names ignore case)",
+                    newName, engineName);
+            return;
+        }
+        Optional<EngineInformation> info = Optional.empty();
+        try {
+            info = storeAndForwardManager.getEngineInformation(engineName, false);
+        } catch (Exception e) {
+            logger.debug("No engine information for '{}'", engineName, e);
+        }
+        if (info.isPresent() && info.get().totalPending() == 0 && info.get().totalQuarantined() == 0) {
+            logger.info("Profile renamed to '{}'. Store and forward engine '{}' is empty; from the next start of "
+                    + "the profile it buffers in engine '{}'. The empty engine '{}' can then be deleted on the "
+                    + "Store and Forward page", newName, engineName, newName, engineName);
+            return;
+        }
+        logger.warn("Profile renamed to '{}'. Until the profile restarts (gateway restart, module update, a "
+                        + "settings save that restarts it) it keeps forwarding from store and forward engine '{}', "
+                        + "which holds {} pending and {} quarantined records now. From the next start it buffers in "
+                        + "engine '{}', and what is still in '{}' is not forwarded: let it reach 0 on the Store and "
+                        + "Forward page before a restart. Data left in '{}' is forwarded again once the profile is "
+                        + "renamed back to '{}'.",
+                newName, engineName,
+                info.map(i -> String.valueOf(i.totalPending())).orElse("an unknown number of"),
+                info.map(i -> String.valueOf(i.totalQuarantined())).orElse("an unknown number of"),
+                newName, engineName, engineName, engineName);
     }
 
     /**
@@ -275,19 +361,25 @@ public class FactryHistoryProvider extends AbstractHistorian<FactryHistorianSett
                 // Not the previous Factry with the previous token while the status says Errored.
                 grpcClient.reconfigure(NO_TOKEN_HOST, 1, newSettings.getCollectorUUID(), "", false, false, null);
                 activeToken = "";
+                connection = null;
                 queryEngine.updateSettings(newSettings);
                 storageEngine.updateSettings(newSettings);
                 this.settings = newSettings;
                 refreshConnectionStatus();
                 return true;
             }
-            connect(newSettings, rawToken);
+            Applied applied = connect(newSettings, rawToken);
+            if (applied == Applied.UNCHANGED) {
+                logger.info("Historian settings unchanged");
+                return true;
+            }
 
             // Re-test against the new endpoint so the gateway UI reflects the change on its
             // next poll, not up to STATUS_CHECK_MS later.
             refreshConnectionStatus();
 
-            logger.info("Settings change applied successfully");
+            logger.info(applied == Applied.APPLIED ? "Settings change applied successfully"
+                    : "Settings change applied; the measurement cache refresh will be retried");
             return true;
         } catch (Exception e) {
             logger.error("Failed to apply settings change", e);
@@ -297,14 +389,32 @@ public class FactryHistoryProvider extends AbstractHistorian<FactryHistorianSett
         }
     }
 
+    /** What {@link #connect} did. */
+    enum Applied { UNCHANGED, APPLIED, APPLIED_CACHE_PENDING }
+
     /**
-     * Points the client at Factry with these settings and token, and makes them current.
+     * Points the client at Factry with these settings and token, and makes them current. Nothing
+     * happens when they are what the client already uses: Ignition 8.3.3 to 8.3.6 call
+     * handleSettingsChange on every save, also before handleNameChange on a rename (8.3.8 and
+     * newer call only handleNameChange then, which applies the saved settings through here).
+     * <p>
+     * A cache refresh that fails (Factry down) for the same Factry and collector is only a WARN:
+     * the scheduled sync retries it, and the restart a failure would cause leaves a just-renamed
+     * profile's buffered data behind. For another Factry or collector it is thrown, so the cache
+     * does not keep the old one's measurements.
      *
      * @throws IllegalArgumentException when the token is not a collector token; nothing changed then
      */
-    private synchronized void connect(FactryHistorianSettings newSettings, String rawToken) {
+    private synchronized Applied connect(FactryHistorianSettings newSettings, String rawToken) {
         String token = newSettings.applyTokenDefaults(rawToken);
         newSettings.validate();
+        Connection previous = connection;
+        Connection next = Connection.of(newSettings, token);
+        if (newSettings.sameAs(settings) && next.equals(previous)) {
+            return Applied.UNCHANGED;
+        }
+        boolean sameFactry = previous != null && previous.host().equals(next.host())
+                && previous.port() == next.port() && previous.collectorUUID().equals(next.collectorUUID());
 
         // Reconfigure the gRPC client (shuts down old channel, creates new one)
         grpcClient.reconfigure(
@@ -317,6 +427,7 @@ public class FactryHistoryProvider extends AbstractHistorian<FactryHistorianSett
                 newSettings.getCustomCaCert(),
                 newSettings.usesFactryCertificate()
         );
+        this.connection = next;
         this.activeToken = token;
         this.tokenUnreadable = null;
         // Judge and log refusals of writes afresh; before the refresh, which can throw.
@@ -332,7 +443,17 @@ public class FactryHistoryProvider extends AbstractHistorian<FactryHistorianSett
             registerCollector();
         }
         // Refresh measurement cache from the new endpoint
-        measurementCache.refresh(grpcClient);
+        try {
+            measurementCache.refresh(grpcClient);
+            return Applied.APPLIED;
+        } catch (RuntimeException e) {
+            if (!sameFactry) {
+                throw e;
+            }
+            logger.warn("Measurement cache refresh failed after the settings change ({}); the scheduled "
+                    + "refresh retries", e.getMessage());
+            return Applied.APPLIED_CACHE_PENDING;
+        }
     }
 
     @Override
