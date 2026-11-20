@@ -408,8 +408,8 @@ Extends `AbstractHistorian<FactryHistorianSettings>`. The orchestrator that ties
    - Register sink with S&F manager
    - Force-initialize sink via reflection (workaround for Ignition 8.3.x issue where late-registered sinks stay stuck in "Storage Only")
    - Create `TagHistoryStorageEngineBridge` (routes writes through S&F instead of direct)
-3. Start scheduled executor with 3 recurring tasks:
-   - Metrics logging (every 30s)
+3. Start scheduled executor with recurring tasks:
+   - Health update to Factry (every 30s): `Collecting`, or `Unstable` while the status says Factry does not store writes
    - Measurement cache refresh (every 30s)
    - Quarantine retry (every 30s, S&F only)
    - Connection check (every 30s, `GetCollector`): pauses the S&F sink while Factry is unreachable, resumes it when it is back
@@ -439,15 +439,11 @@ Thread-safe counters using `AtomicLong`. Tracks:
 | Metric | Description |
 |--------|-------------|
 | Store ops / points / errors / elapsed ms | Write performance |
+| Discarded / paused-dropped points | Points not written because their measurement refuses them |
 | Raw query ops / rows / elapsed ms | Raw read performance |
 | Agg query ops / rows / elapsed ms | Aggregated read performance |
 
-`logSummary()` — writes a single-line summary every 30 seconds:
-```
-Metrics | store: 5 ops, 120 pts (4.0 pts/s), 450 ms total, 0 errors | raw query: ...
-```
-
-`recordStore()`, `recordRawQuery()`, `recordAggQuery()` — called by the engines after each operation.
+`recordStore()`, `recordRawQuery()`, `recordAggregatedQuery()` and the others are called by the engines after each operation. No code reads the counters outside the tests: nothing logs them and they are not in the gateway's metric registry. Ignition already shows per profile what most of them count (storage and query throughput, success and failure, on the Historians page; the backlog and quarantine on the Store and Forward page).
 
 ---
 
@@ -459,7 +455,7 @@ Metrics | store: 5 ops, 120 pts (4.0 pts/s), 450 ms total, 0 errors | raw query:
 |------|-------|
 | `TagPathUtilTest.java` | Path conversion: stored ↔ display, QualifiedPath parsing, folder handling, edge cases |
 | `FactryHistorianSettingsTest.java` | JWT parsing, token defaults, validation |
-| `HistorianMetricsTest.java` | Counter increments, summary formatting |
+| `HistorianMetricsTest.java` | Counter increments |
 
 Run with `./gradlew test`.
 

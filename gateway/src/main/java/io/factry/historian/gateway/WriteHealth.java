@@ -194,6 +194,11 @@ final class WriteHealth {
         return ProfileStatus.RUNNING;
     }
 
+    /** The collector health for Factry: Unstable while the status says Factry does not store writes. */
+    synchronized String health() {
+        return failing() ? "Unstable" : "Collecting";
+    }
+
     /** Failed writes spread over the interval, not one failure and then silence. */
     private boolean failing() {
         return failingSince != null && lastFailedAt - failingSince >= FAILING_AFTER_MS;

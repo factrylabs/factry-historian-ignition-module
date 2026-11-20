@@ -442,9 +442,18 @@ public class FactryHistoryProvider extends AbstractHistorian<FactryHistorianSett
     }
 
     private void sendHealthUpdate() {
+        sendHealthUpdate(grpcClient, writeHealth);
+    }
+
+    /**
+     * Tell Factry how collecting goes, in its own words so its collector list colours it:
+     * Collecting (green), or Unstable (orange) while Factry does not store our writes. Factry already
+     * sees an outage or a refused token, since this update cannot arrive then.
+     */
+    static void sendHealthUpdate(FactryGrpcClient grpcClient, WriteHealth writeHealth) {
         try {
             var update = io.factry.historian.proto.HealthUpdate.newBuilder()
-                    .setHealth("Collecting")
+                    .setHealth(writeHealth.health())
                     .setTimestamp(com.google.protobuf.util.Timestamps.fromMillis(System.currentTimeMillis()))
                     .build();
             var updates = io.factry.historian.proto.HealthUpdates.newBuilder()
