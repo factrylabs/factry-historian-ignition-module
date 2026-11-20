@@ -16,7 +16,7 @@ class FactryHistorianConfigTest {
     @Test
     void roundTrip_preservesAllFieldsIncludingCustomCaCert() {
         FactryHistorianConfig original = new FactryHistorianConfig(
-                "the-token", true, false, PEM, true, "/");
+                FakeSecrets.embedded("the-token"), true, false, PEM, true, "/");
 
         FactryHistorianSettings settings = original.toSettings();
         assertEquals(PEM, settings.getCustomCaCert());
@@ -28,7 +28,7 @@ class FactryHistorianConfigTest {
     @Test
     void toSettings_mapsCustomCaCert() {
         FactryHistorianConfig config = new FactryHistorianConfig(
-                "t", true, false, PEM, false, "");
+                FakeSecrets.embedded("t"), true, false, PEM, false, "");
         assertEquals(PEM, config.toSettings().getCustomCaCert());
     }
 }

@@ -5,9 +5,14 @@ import com.inductiveautomation.historian.gateway.api.HistorianExtensionPoint;
 import com.inductiveautomation.historian.gateway.api.HistorianProvider;
 import com.inductiveautomation.historian.gateway.api.config.HistorianSettings;
 import com.inductiveautomation.ignition.gateway.config.DecodedResource;
+import com.inductiveautomation.ignition.common.gson.JsonElement;
 import com.inductiveautomation.ignition.gateway.config.ExtensionPointConfig;
+import com.inductiveautomation.ignition.gateway.config.ValidationErrors;
 import com.inductiveautomation.ignition.gateway.dataroutes.openapi.SchemaUtil;
 import com.inductiveautomation.ignition.gateway.model.GatewayContext;
+import com.inductiveautomation.ignition.gateway.secrets.Plaintext;
+import com.inductiveautomation.ignition.gateway.secrets.Secret;
+import com.inductiveautomation.ignition.gateway.secrets.SecretConfig;
 import com.inductiveautomation.ignition.gateway.web.nav.ExtensionPointResourceForm;
 import com.inductiveautomation.ignition.gateway.web.nav.WebUiComponent;
 import org.slf4j.Logger;
@@ -43,6 +48,9 @@ public class FactryHistorianExtensionPoint extends HistorianExtensionPoint<Factr
      */
     public static final String DESCRIPTION = "FactryHistorianExtensionPoint.HistorianType.Description";
 
+    /** Set by the hook; decrypts an Embedded token for the check in {@link #validate}. */
+    private volatile GatewayContext context;
+
     /**
      * Creates a new Factry Historian extension point.
      * Passes literal display strings to the parent constructor.
@@ -54,6 +62,52 @@ public class FactryHistorianExtensionPoint extends HistorianExtensionPoint<Factr
         logger.debug("Type: {}, Name: {}", TYPE_ID, DISPLAY_NAME);
     }
 
+
+    void setGatewayContext(GatewayContext context) {
+        this.context = context;
+    }
+
+    /**
+     * Once the token is a secret, the plain copy an older profile holds under {@code token} is left
+     * out, so the first save with the new field removes it from config.json.
+     */
+    @Override
+    public JsonElement encode(FactryHistorianSettings settings) {
+        JsonElement json = super.encode(settings);
+        if (settings.getCollectorToken() != null && json.isJsonObject()) {
+            json.getAsJsonObject().remove("token");
+        }
+        return json;
+    }
+
+    /**
+     * Refuses an Embedded token that is not a Factry collector token, so the form says so instead
+     * of the profile going Errored. Ignition also runs this on every decode of the profile (start,
+     * listing), and a refused decode does not load the profile at all. So it checks only what the
+     * form can set: a Referenced token is checked when the profile starts (no provider call here),
+     * and an older profile's plain token, even blank or bad, still loads and shows Errored. The
+     * form marks the field required. Messages never contain the token.
+     */
+    @Override
+    protected void validate(FactryHistorianSettings settings, ValidationErrors.Builder errors) {
+        SecretConfig secret = settings.getCollectorToken();
+        if (secret == null || !secret.isEmbedded() || context == null) {
+            return;
+        }
+        String plain;
+        try (Plaintext plaintext = Secret.create(context, secret).getPlaintext()) {
+            plain = plaintext.getAsString();
+        } catch (Exception e) {
+            // Not this check's to judge: the profile's start reports it.
+            logger.debug("Could not decrypt the collector token to check it: {}", e.getMessage());
+            return;
+        }
+        try {
+            FactryHistorianSettings.checkToken(plain);
+        } catch (IllegalArgumentException e) {
+            errors.addFieldMessage("collectorToken", e.getMessage());
+        }
+    }
 
     /**
      * Provide the settings type explicitly so the framework can decode config JSON.

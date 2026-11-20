@@ -8,13 +8,19 @@ import com.inductiveautomation.historian.gateway.interop.TagHistoryStorageEngine
 import com.inductiveautomation.ignition.common.resourcecollection.ChangeOperation;
 import com.inductiveautomation.ignition.common.resourcecollection.Resource;
 import com.inductiveautomation.ignition.common.resourcecollection.ResourceBuilder;
+import com.inductiveautomation.ignition.gateway.config.ConfigurationManager;
 import com.inductiveautomation.ignition.gateway.model.GatewayContext;
 import com.inductiveautomation.ignition.gateway.model.ProfileStatus;
+import com.inductiveautomation.ignition.gateway.secrets.Plaintext;
+import com.inductiveautomation.ignition.gateway.secrets.Secret;
+import com.inductiveautomation.ignition.gateway.secrets.SecretConfig;
 import com.inductiveautomation.ignition.gateway.storeforward.StorageKey;
+import com.inductiveautomation.ignition.gateway.storeforward.StoreAndForwardManager;
 import com.inductiveautomation.ignition.gateway.storeforward.engine.EngineInformation;
 import com.inductiveautomation.ignition.gateway.storeforward.quarantine.QuarantineInterface;
 import com.inductiveautomation.ignition.gateway.storeforward.quarantine.QuarantinedDataInfo;
 import com.inductiveautomation.ignition.gateway.storeforward.resource.StoreAndForwardEngineSettings;
+import io.grpc.Status;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -24,6 +30,7 @@ import java.util.Optional;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.stream.Collectors;
 
 public class FactryHistoryProvider extends AbstractHistorian<FactryHistorianSettings> {
@@ -44,25 +51,48 @@ public class FactryHistoryProvider extends AbstractHistorian<FactryHistorianSett
     private TagHistoryDataSinkBridge dataSinkBridge;
     private ScheduledExecutorService scheduledExecutor;
     private volatile String sfEngineName;
+    /** The token the client sends, to see whether a secret provider now holds another one. */
+    private volatile String activeToken;
+    /**
+     * Why the token's secret could not be read, or null. Then the client has no token yet, and each
+     * connection check reads the secret again (a provider of another module, or a remote one, may
+     * start after this profile).
+     */
+    private volatile String tokenUnreadable;
+    /** Why a value a secret provider held is not a collector token; warned about once. */
+    private volatile String rejectedToken;
+    /** Whether Factry has this collector registered as Active; tried again on the next connect. */
+    private volatile boolean registered;
+    /** Where the client points while it has no token: ".invalid" never resolves, nothing is sent. */
+    private static final String NO_TOKEN_HOST = "collector-token-unread.invalid";
 
-    /** Cached status to avoid hitting gRPC on every gateway UI poll. */
-    private volatile ProfileStatus cachedStatus = ProfileStatus.UNKNOWN;
-    private volatile long statusCheckedAt = 0;
-    private static final long STATUS_CACHE_MS = ModuleProperties.getStatusCacheMs();
+    /** The profile status, from the connection check (on the scheduler) and the writes. */
+    private final WriteHealth writeHealth;
+    private static final long STATUS_CHECK_MS = ModuleProperties.getStatusCacheMs();
 
     public FactryHistoryProvider(GatewayContext context, String historianName, FactryHistorianSettings settings) {
         super(context, historianName);
         this.context = context;
         this.settings = settings;
-        settings.applyTokenDefaults(settings.getToken());
-        settings.validate();
+        String token;
+        try {
+            token = settings.applyTokenDefaults(resolveToken(context, historianName, settings));
+            settings.validate();
+        } catch (TokenUnreadableException e) {
+            // The first connection check reports it (status and one WARN).
+            tokenUnreadable = e.getMessage();
+            token = "";
+        }
+        this.activeToken = token;
         this.metrics = new HistorianMetrics();
+        this.writeHealth = new WriteHealth(historianName);
 
+        // Without a token the client points nowhere (".invalid" never resolves) until it is read.
         this.grpcClient = new FactryGrpcClient(
-                settings.getGrpcHost(),
-                settings.getGrpcPort(),
+                tokenUnreadable == null ? settings.getGrpcHost() : NO_TOKEN_HOST,
+                tokenUnreadable == null ? settings.getGrpcPort() : 1,
                 settings.getCollectorUUID(),
-                settings.getToken(),
+                token,
                 settings.isUseTls(),
                 settings.isSkipTlsVerification(),
                 settings.getCustomCaCert()
@@ -70,7 +100,8 @@ public class FactryHistoryProvider extends AbstractHistorian<FactryHistorianSett
         this.measurementCache = new MeasurementCache();
 
         this.queryEngine = new FactryQueryEngine(context, historianName, settings, grpcClient, measurementCache, metrics);
-        this.storageEngine = new FactryStorageEngine(context, historianName, settings, grpcClient, measurementCache, metrics);
+        this.storageEngine = new FactryStorageEngine(context, historianName, settings, grpcClient, measurementCache, metrics,
+                writeHealth);
 
         logger.info("Factry Historian created: name={}, grpcTarget={}:{}, collectorUUID={}",
                 historianName, settings.getGrpcHost(), settings.getGrpcPort(), settings.getCollectorUUID());
@@ -86,31 +117,11 @@ public class FactryHistoryProvider extends AbstractHistorian<FactryHistorianSett
         logger.debug("Name: {}", historianName);
         logger.debug("Settings: {}", settings);
 
-        // Register this collector with Factry so it shows as active
-        try {
-            var schema = io.factry.historian.proto.RegisterCollectorSchema.newBuilder()
-                    .setCollectorType("ignition")
-                    .setBuildVersion(FactryHistorianModule.MODULE_VERSION)
-                    .setBuildOs(System.getProperty("os.name", "unknown"))
-                    .setBuildArch(System.getProperty("os.arch", "unknown"))
-                    .build();
-            var collector = grpcClient.registerCollector(schema);
-            logger.info("Collector registered with Factry: uuid={}, type={}, status={}",
-                    collector.getUuid(), collector.getType(), collector.getStatus());
-
-            // Set collector state to active/collecting
-            var state = com.google.protobuf.Struct.newBuilder()
-                    .putFields("status", com.google.protobuf.Value.newBuilder()
-                            .setStringValue("Active").build())
-                    .putFields("health", com.google.protobuf.Value.newBuilder()
-                            .setStringValue("Collecting").build())
-                    .build();
-            grpcClient.updateCollectorState(state);
-        } catch (Exception e) {
-            logger.warn("Failed to register collector with Factry: " + e.getMessage());
+        if (tokenUnreadable == null) {
+            registerCollector();
         }
 
-        try {
+        if (tokenUnreadable == null) try {
             measurementCache.refresh(grpcClient);
             logger.info("Measurement cache pre-populated with {} entries", measurementCache.size());
         } catch (Exception e) {
@@ -163,7 +174,8 @@ public class FactryHistoryProvider extends AbstractHistorian<FactryHistorianSett
         scheduledExecutor.scheduleWithFixedDelay(
                 () -> retryQuarantinedData(sfEngine), 30, 30, TimeUnit.SECONDS);
 
-        // Periodic measurement cache refresh to detect deleted measurements
+        // This collector's changed measurements (paused, deleted, ...) every 30 s, and a full
+        // reload every 10 minutes (MeasurementCache.sync)
         long refreshInterval = ModuleProperties.getMeasurementCacheRefreshSeconds();
         scheduledExecutor.scheduleWithFixedDelay(
                 this::refreshMeasurementCache, refreshInterval, refreshInterval, TimeUnit.SECONDS);
@@ -176,6 +188,11 @@ public class FactryHistoryProvider extends AbstractHistorian<FactryHistorianSett
         // Send periodic health updates to Factry (heartbeat)
         scheduledExecutor.scheduleWithFixedDelay(
                 this::sendHealthUpdate, 0, 30, TimeUnit.SECONDS);
+
+        // Check the connection and pause or resume the S&F sink on a schedule. getStatus() is
+        // only called when someone opens the gateway UI, so it cannot be what resumes forwarding.
+        scheduledExecutor.scheduleWithFixedDelay(
+                this::checkConnection, STATUS_CHECK_MS, STATUS_CHECK_MS, TimeUnit.MILLISECONDS);
 
         // Prime the status cache now that the connection has just been exercised
         // (registerCollector + cache refresh above), so the gateway UI shows the
@@ -192,6 +209,14 @@ public class FactryHistoryProvider extends AbstractHistorian<FactryHistorianSett
 
         if (scheduledExecutor != null) {
             scheduledExecutor.shutdownNow();
+            // A check inside connect() could otherwise build a channel after the client's shutdown.
+            try {
+                if (!scheduledExecutor.awaitTermination(5, TimeUnit.SECONDS)) {
+                    logger.warn("Historian '{}': scheduler still running after 5 s", historianName);
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
             scheduledExecutor = null;
         }
 
@@ -225,87 +250,241 @@ public class FactryHistoryProvider extends AbstractHistorian<FactryHistorianSett
     @Override
     public boolean handleNameChange(String newName) {
         logger.info("Historian name changed: {} -> {}", historianName, newName);
+        writeHealth.rename(newName);
         // Measurement names in Factry don't contain the historian profile name,
         // so no data migration is needed.
         // The framework updates the historianName field in AbstractHistorian.
         return true;
     }
 
+    /**
+     * Synchronized: Ignition's save and the scheduler's token reload must not mix one's settings
+     * with the other's token.
+     */
     @Override
-    public boolean handleSettingsChange(FactryHistorianSettings newSettings) {
+    public synchronized boolean handleSettingsChange(FactryHistorianSettings newSettings) {
         logger.info("Historian settings change: {}", newSettings);
 
         try {
-            newSettings.applyTokenDefaults(newSettings.getToken());
-            newSettings.validate();
+            String rawToken;
+            try {
+                rawToken = resolveToken(context, historianName, newSettings);
+            } catch (TokenUnreadableException e) {
+                tokenUnreadable = e.getMessage();
+                // Not the previous Factry with the previous token while the status says Errored.
+                grpcClient.reconfigure(NO_TOKEN_HOST, 1, newSettings.getCollectorUUID(), "", false, false, null);
+                activeToken = "";
+                queryEngine.updateSettings(newSettings);
+                storageEngine.updateSettings(newSettings);
+                this.settings = newSettings;
+                refreshConnectionStatus();
+                return true;
+            }
+            connect(newSettings, rawToken);
 
-            // Reconfigure the gRPC client (shuts down old channel, creates new one)
-            grpcClient.reconfigure(
-                    newSettings.getGrpcHost(),
-                    newSettings.getGrpcPort(),
-                    newSettings.getCollectorUUID(),
-                    newSettings.getToken(),
-                    newSettings.isUseTls(),
-                    newSettings.isSkipTlsVerification(),
-                    newSettings.getCustomCaCert()
-            );
-
-            // Refresh measurement cache from the new endpoint
-            measurementCache.refresh(grpcClient);
-
-            // Update settings references in the engines
-            queryEngine.updateSettings(newSettings);
-            storageEngine.updateSettings(newSettings);
-            this.settings = newSettings;
-
-            // Re-test against the new endpoint and refresh the cached status so the
-            // gateway UI reflects the change on its next poll, not up to STATUS_CACHE_MS later.
+            // Re-test against the new endpoint so the gateway UI reflects the change on its
+            // next poll, not up to STATUS_CHECK_MS later.
             refreshConnectionStatus();
 
             logger.info("Settings change applied successfully");
             return true;
         } catch (Exception e) {
             logger.error("Failed to apply settings change", e);
-            // Reflect the failure immediately rather than serving a stale cached status.
-            cachedStatus = ProfileStatus.ERRORED;
-            statusCheckedAt = System.currentTimeMillis();
+            // No status to set: on false, Ignition removes this instance and starts a new one
+            // with the new settings, whose own connection check then says what is wrong.
             return false;
         }
     }
 
+    /**
+     * Points the client at Factry with these settings and token, and makes them current.
+     *
+     * @throws IllegalArgumentException when the token is not a collector token; nothing changed then
+     */
+    private synchronized void connect(FactryHistorianSettings newSettings, String rawToken) {
+        String token = newSettings.applyTokenDefaults(rawToken);
+        newSettings.validate();
+
+        // Reconfigure the gRPC client (shuts down old channel, creates new one)
+        grpcClient.reconfigure(
+                newSettings.getGrpcHost(),
+                newSettings.getGrpcPort(),
+                newSettings.getCollectorUUID(),
+                token,
+                newSettings.isUseTls(),
+                newSettings.isSkipTlsVerification(),
+                newSettings.getCustomCaCert()
+        );
+        this.activeToken = token;
+        this.tokenUnreadable = null;
+        // Judge and log refusals of writes afresh; before the refresh, which can throw.
+        storageEngine.clearRefusals();
+        writeHealth.clearWrites();
+
+        // Update settings references in the engines
+        queryEngine.updateSettings(newSettings);
+        storageEngine.updateSettings(newSettings);
+        this.settings = newSettings;
+
+        if (!registered) {
+            registerCollector();
+        }
+        // Refresh measurement cache from the new endpoint
+        measurementCache.refresh(grpcClient);
+    }
+
     @Override
     public ProfileStatus getStatus() {
-        if (!started) {
-            return ProfileStatus.UNKNOWN;
-        }
+        return started ? writeHealth.status() : ProfileStatus.UNKNOWN;
+    }
 
-        long now = System.currentTimeMillis();
-        if (now - statusCheckedAt < STATUS_CACHE_MS) {
-            return cachedStatus;
-        }
-
-        return refreshConnectionStatus();
+    /** What {@link #getStatus()} says once the profile is started. */
+    ProfileStatus statusOnceStarted() {
+        return writeHealth.status();
     }
 
     /**
-     * Actively test the Factry connection, update the cached status and its
-     * timestamp, and toggle the S&F sink to match the connection state.
-     * <p>
-     * Called lazily from {@link #getStatus()} when the cache expires, and
-     * eagerly right after startup and settings changes so the gateway UI
-     * reflects the new state on its very next poll instead of waiting out the
-     * {@link #STATUS_CACHE_MS} window (or showing a stale value for up to that long).
+     * The collector token in plain text: from the secret, or from a profile saved before the token
+     * was a secret, with a warning that it is stored in clear.
+     *
+     * @throws IllegalArgumentException when there is none; the message never contains the token
+     * @throws TokenUnreadableException when the secret cannot be read (yet); the message names the
+     *                                  provider and secret, never the token
      */
-    private ProfileStatus refreshConnectionStatus() {
-        statusCheckedAt = System.currentTimeMillis();
-        boolean connected = grpcClient.testConnection();
-        cachedStatus = connected ? ProfileStatus.RUNNING : ProfileStatus.ERRORED;
+    static String resolveToken(GatewayContext context, String historianName, FactryHistorianSettings settings)
+            throws TokenUnreadableException {
+        SecretConfig secret = settings.getCollectorToken();
+        if (secret == null) {
+            String legacy = settings.getLegacyToken();
+            if (legacy == null || legacy.isBlank()) {
+                throw new IllegalArgumentException("No collector token. Enter the collector token generated by"
+                        + " Factry Historian in the profile settings.");
+            }
+            logger.warn("Historian '{}': the collector token is stored in plain text in the profile's config.json."
+                    + " Open the profile, enter the token under Collector Token and save: the gateway then stores"
+                    + " it encrypted (or reads it from a secret provider) and removes the plain copy.", historianName);
+            return legacy;
+        }
+        try (Plaintext plaintext = Secret.create(context, secret).getPlaintext()) {
+            return plaintext.getAsString();
+        } catch (Exception e) {
+            throw new TokenUnreadableException("Could not read the collector token "
+                    + (secret.isReferenced() ? "from secret provider '" + secret.getAsReferenced().getProviderName()
+                    + "' (secret '" + secret.getAsReferenced().getSecretName() + "')" : "(embedded secret)")
+                    + ": " + e.getMessage(), e);
+        }
+    }
+
+    /** The token's secret could not be read: a provider missing, not started yet, or failing. */
+    static final class TokenUnreadableException extends Exception {
+        TokenUnreadableException(String message, Throwable cause) {
+            super(message, cause);
+        }
+    }
+
+    /**
+     * A token kept in a secret provider can be replaced there. Saving the profile unchanged does not
+     * reach the module (Ignition fires no change for identical content), so when Factry refuses the
+     * token in use, read the secret again and switch to the new one if it changed.
+     */
+    private String rotatedToken(Status check, FactryHistorianSettings current) {
+        SecretConfig secret = current.getCollectorToken();
+        if (check.isOk() || secret == null || !secret.isReferenced()
+                || WriteHealth.checkFailure(check) != WriteHealth.CheckFailure.TOKEN_REFUSED) {
+            return null;
+        }
+        String token;
+        try {
+            token = JwtTokenParser.normalize(resolveToken(context, historianName, current));
+            FactryHistorianSettings.checkToken(token);
+        } catch (TokenUnreadableException | IllegalArgumentException e) {
+            if (!e.getMessage().equals(rejectedToken)) {
+                rejectedToken = e.getMessage();
+                logger.warn("Historian '{}': Factry refused the collector token, and secret provider '{}' does not"
+                        + " hold a usable one: {}", historianName, secret.getAsReferenced().getProviderName(),
+                        e.getMessage());
+            }
+            return null;
+        }
+        if (token.equals(activeToken)) {
+            return null;
+        }
+        logger.info("Historian '{}': Factry refused the collector token and secret provider '{}' now holds another"
+                + " one; using that.", historianName, secret.getAsReferenced().getProviderName());
+        return token;
+    }
+
+    /** Register this collector with Factry so it shows as Active and Collecting. */
+    private void registerCollector() {
+        try {
+            var schema = io.factry.historian.proto.RegisterCollectorSchema.newBuilder()
+                    .setCollectorType("ignition")
+                    .setBuildVersion(FactryHistorianModule.MODULE_VERSION)
+                    .setBuildOs(System.getProperty("os.name", "unknown"))
+                    .setBuildArch(System.getProperty("os.arch", "unknown"))
+                    .build();
+            var collector = grpcClient.registerCollector(schema);
+            logger.info("Collector registered with Factry: uuid={}, type={}, status={}",
+                    collector.getUuid(), collector.getType(), collector.getStatus());
+
+            // Set collector state to active/collecting
+            var state = com.google.protobuf.Struct.newBuilder()
+                    .putFields("status", com.google.protobuf.Value.newBuilder()
+                            .setStringValue("Active").build())
+                    .putFields("health", com.google.protobuf.Value.newBuilder()
+                            .setStringValue("Collecting").build())
+                    .build();
+            grpcClient.updateCollectorState(state);
+            registered = true;
+        } catch (Exception e) {
+            logger.warn("Failed to register collector with Factry: " + e.getMessage());
+        }
+    }
+
+    void checkConnection() {
+        try {
+            refreshConnectionStatus();
+        } catch (Exception e) {
+            // An exception would cancel the scheduled task, and forwarding would never resume.
+            logger.warn("Connection check failed: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Actively test the Factry connection, record it for the status, and toggle the S&F
+     * sink to match the connection state.
+     * <p>
+     * Runs every {@link #STATUS_CHECK_MS} on the scheduler, and right after startup and
+     * settings changes so the gateway UI reflects the new state on its next poll.
+     */
+    private void refreshConnectionStatus() {
+        FactryHistorianSettings current = settings;
+        Status check;
+        if (tokenUnreadable != null) {
+            check = readTokenAgain(current);
+        } else {
+            check = grpcClient.checkConnection();
+            String rotated = rotatedToken(check, current);
+            Reconnect r = rotated == null ? Reconnect.FAILED : reconnect(current, rotated);
+            if (r == Reconnect.STALE) {
+                return;
+            }
+            if (r == Reconnect.CONNECTED) {
+                check = grpcClient.checkConnection();
+            }
+        }
+        if (check == null) {
+            // A save replaced the settings meanwhile; its own check records the status.
+            return;
+        }
+        writeHealth.connectionChecked(check);
+        boolean connected = check.isOk();
 
         // Toggle S&F sink: when Factry is down, stop accepting so points stay in pending.
         // When Factry is back, re-initialize so forwarding resumes.
         if (dataSinkBridge != null) {
             if (connected && !dataSinkBridge.isAccepting()) {
-                logger.info("Factry connection restored, re-enabling S&F sink");
+                logger.info("Factry check passes, re-enabling S&F sink");
                 try {
                     java.lang.reflect.Method initMethod = dataSinkBridge.getClass().getSuperclass()
                             .getDeclaredMethod("initialize");
@@ -315,7 +494,7 @@ public class FactryHistoryProvider extends AbstractHistorian<FactryHistorianSett
                     logger.error("Failed to re-initialize S&F sink", e);
                 }
             } else if (!connected && dataSinkBridge.isAccepting()) {
-                logger.info("Factry connection lost, pausing S&F sink to buffer points");
+                logger.info("Factry check fails, pausing S&F sink to buffer points");
                 try {
                     java.lang.reflect.Method uninitMethod = dataSinkBridge.getClass().getSuperclass()
                             .getDeclaredMethod("uninitialize");
@@ -326,8 +505,59 @@ public class FactryHistoryProvider extends AbstractHistorian<FactryHistorianSett
                 }
             }
         }
+    }
 
-        return cachedStatus;
+    /**
+     * The check while the token's secret could not be read: read it again, and connect once it can.
+     * Null when a save replaced the settings meanwhile.
+     */
+    private Status readTokenAgain(FactryHistorianSettings current) {
+        String rawToken;
+        try {
+            rawToken = resolveToken(context, historianName, current);
+        } catch (TokenUnreadableException | IllegalArgumentException e) {
+            tokenUnreadable = e.getMessage();
+            return WriteHealth.tokenUnreadable(e.getMessage());
+        }
+        Reconnect r = reconnect(current, rawToken);
+        if (r == Reconnect.STALE) {
+            return null;
+        }
+        if (r == Reconnect.FAILED) {
+            return WriteHealth.tokenUnreadable(tokenUnreadable);
+        }
+        logger.info("Historian '{}': read the collector token; connecting to Factry", historianName);
+        return grpcClient.checkConnection();
+    }
+
+    private enum Reconnect { CONNECTED, FAILED, STALE }
+
+    /** {@link #connect}, unless a save replaced the settings meanwhile (STALE). */
+    private Reconnect reconnect(FactryHistorianSettings current, String rawToken) {
+        synchronized (this) {
+            if (current != settings) {
+                return Reconnect.STALE;
+            }
+            try {
+                connect(current, rawToken);
+                return Reconnect.CONNECTED;
+            } catch (IllegalArgumentException e) {
+                String why = "The collector token from the secret provider is not usable: " + e.getMessage();
+                if (tokenUnreadable != null) {
+                    tokenUnreadable = why;
+                }
+                if (!why.equals(rejectedToken)) {
+                    rejectedToken = why;
+                    logger.warn("Historian '{}': {}", historianName, why);
+                }
+                return Reconnect.FAILED;
+            } catch (Exception e) {
+                // Connected; only the cache refresh failed. Its scheduled refresh tries again.
+                logger.warn("Historian '{}': measurement cache refresh failed after connecting: {}", historianName,
+                        e.getMessage());
+                return Reconnect.CONNECTED;
+            }
+        }
     }
 
     /**
@@ -336,22 +566,27 @@ public class FactryHistoryProvider extends AbstractHistorian<FactryHistorianSett
      * Ignition's default engine settings).
      */
     private void ensureStoreAndForwardEngine(String engineName) {
-        Optional<EngineInformation> existing =
-                context.getStoreAndForwardManager().getEngineInformation(engineName, true);
+        ensureStoreAndForwardEngine(context.getConfigurationManager(), context.getStoreAndForwardManager(),
+                engineName, ENGINE_CREATE_TIMEOUT_MS);
+    }
+
+    private static final long ENGINE_CREATE_TIMEOUT_MS = 10_000;
+
+    enum EngineCreation { EXISTS, CREATED, CREATED_PENDING, FAILED }
+
+    static EngineCreation ensureStoreAndForwardEngine(ConfigurationManager configurationManager,
+                                                      StoreAndForwardManager storeAndForwardManager,
+                                                      String engineName, long timeoutMs) {
+        Optional<EngineInformation> existing = storeAndForwardManager.getEngineInformation(engineName, true);
         if (existing.isPresent()) {
             logger.debug("S&F engine '{}' already exists", engineName);
-            return;
+            return EngineCreation.EXISTS;
         }
 
         // Also check if a resource already exists (covers engines not yet started)
-        List<Resource> sfResources = context.getConfigurationManager()
-                .getResources(StoreAndForwardEngineSettings.getType());
-        for (Resource r : sfResources) {
-            if (r.getResourceName().equalsIgnoreCase(engineName)) {
-                logger.debug("S&F engine resource '{}' already exists (as '{}')",
-                        engineName, r.getResourceName());
-                return;
-            }
+        if (engineResourceExists(configurationManager, engineName)) {
+            logger.debug("S&F engine resource '{}' already exists", engineName);
+            return EngineCreation.EXISTS;
         }
 
         logger.info("S&F engine '{}' does not exist — creating it automatically", engineName);
@@ -366,28 +601,46 @@ public class FactryHistoryProvider extends AbstractHistorian<FactryHistorianSett
             Resource resource = builder.build();
 
             ChangeOperation createOp = ChangeOperation.newCreateOp(resource);
-            context.getConfigurationManager().push(List.of(createOp)).get(10, TimeUnit.SECONDS);
+            configurationManager.push(List.of(createOp)).get(timeoutMs, TimeUnit.MILLISECONDS);
 
             logger.info("S&F engine '{}' created successfully", engineName);
+            return EngineCreation.CREATED;
+        } catch (TimeoutException e) {
+            // push() writes the resource before it returns; its future only waits for the change
+            // listeners. When this profile is itself being started from a config change, those
+            // listeners queue behind us, so the wait times out although the engine is there.
+            if (engineResourceExists(configurationManager, engineName)) {
+                logger.info("S&F engine '{}' created; Ignition is still applying it", engineName);
+                return EngineCreation.CREATED_PENDING;
+            }
+            logger.error("Failed to create S&F engine '{}' — store-and-forward may not work", engineName, e);
+            return EngineCreation.FAILED;
         } catch (Exception e) {
             logger.error("Failed to create S&F engine '{}' — store-and-forward may not work", engineName, e);
+            return EngineCreation.FAILED;
         }
     }
 
+    private static boolean engineResourceExists(ConfigurationManager configurationManager, String engineName) {
+        return configurationManager.getResources(StoreAndForwardEngineSettings.getType()).stream()
+                .anyMatch(r -> r.getResourceName().equalsIgnoreCase(engineName));
+    }
+
     private void retryQuarantinedData(String engineName) {
+        retryQuarantinedData(context.getStoreAndForwardManager(), grpcClient.isConnected(), writeHealth, engineName);
+    }
+
+    static void retryQuarantinedData(StoreAndForwardManager storeAndForwardManager, boolean connected,
+                                     WriteHealth writeHealth, String engineName) {
         try {
-            // Test connection and re-enable forwarding if the server is back
-            if (!grpcClient.isConnected()) {
-                if (grpcClient.testConnection()) {
-                    logger.info("Factry server is reachable again, re-enabling S&F forwarding");
-                } else {
-                    logger.debug("Factry server still unreachable, S&F will keep buffering");
-                    return;
-                }
+            // checkConnection() re-enables forwarding once Factry is back; until then a retry
+            // would only fail again.
+            if (!connected) {
+                logger.debug("Factry server unreachable, not retrying quarantined data yet");
+                return;
             }
 
-            Optional<QuarantineInterface<?>> qi =
-                    context.getStoreAndForwardManager().getQuarantineInterface(engineName);
+            Optional<QuarantineInterface<?>> qi = storeAndForwardManager.getQuarantineInterface(engineName);
             if (qi.isPresent()) {
                 int count = qi.get().getQuarantinedCount();
                 if (count > 0) {
@@ -395,8 +648,13 @@ public class FactryHistoryProvider extends AbstractHistorian<FactryHistorianSett
                             .map(QuarantinedDataInfo::id)
                             .collect(Collectors.toList());
                     qi.get().retryQuarantined(ids);
-                    logger.info("Retrying {} quarantined data entries for S&F engine '{}'",
-                            ids.size(), engineName);
+                    // Every 30 s while Factry does not store writes: WriteHealth logs that story.
+                    String line = "Retrying {} quarantined data entries for S&F engine '{}'";
+                    if (writeHealth.writesFailing()) {
+                        logger.debug(line, ids.size(), engineName);
+                    } else {
+                        logger.info(line, ids.size(), engineName);
+                    }
                 }
             }
         } catch (Exception e) {
@@ -405,9 +663,18 @@ public class FactryHistoryProvider extends AbstractHistorian<FactryHistorianSett
     }
 
     private void sendHealthUpdate() {
+        sendHealthUpdate(grpcClient, writeHealth);
+    }
+
+    /**
+     * Tell Factry how collecting goes, in its own words so its collector list colours it:
+     * Collecting (green), or Unstable (orange) while Factry does not store our writes. Factry already
+     * sees an outage or a refused token, since this update cannot arrive then.
+     */
+    static void sendHealthUpdate(FactryGrpcClient grpcClient, WriteHealth writeHealth) {
         try {
             var update = io.factry.historian.proto.HealthUpdate.newBuilder()
-                    .setHealth("Collecting")
+                    .setHealth(writeHealth.health())
                     .setTimestamp(com.google.protobuf.util.Timestamps.fromMillis(System.currentTimeMillis()))
                     .build();
             var updates = io.factry.historian.proto.HealthUpdates.newBuilder()
@@ -422,7 +689,7 @@ public class FactryHistoryProvider extends AbstractHistorian<FactryHistorianSett
     private void refreshMeasurementCache() {
         try {
             int before = measurementCache.size();
-            measurementCache.refresh(grpcClient);
+            measurementCache.sync(grpcClient);
             int after = measurementCache.size();
             if (before != after) {
                 logger.info("Measurement cache refreshed: {} -> {} entries", before, after);
