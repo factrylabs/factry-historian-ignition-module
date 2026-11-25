@@ -43,6 +43,16 @@ public record FactryHistorianConfig(
         Integer portOverride,
 
         @FormCategory("Connection")
+        @Label("Use TLS")
+        @FormField(FormFieldType.CHECKBOX)
+        @DefaultValue("true")
+        @Description("Encrypt the gRPC connection. Leave on, unless Factry Historian runs with its gRPC TLS turned "
+                + "off (USE_SELF_SIGNED_CERTIFICATE=false) and nothing in between ends TLS: the collector token is "
+                + "then sent unencrypted. The module uses TLS whatever this says when the token says Factry serves "
+                + "its built-in certificate, or when Skip TLS Verification or a Custom CA Certificate is set.")
+        boolean useTls,
+
+        @FormCategory("Connection")
         @Label("Skip TLS Verification")
         @FormField(FormFieldType.CHECKBOX)
         @DefaultValue("false")
@@ -84,6 +94,7 @@ public record FactryHistorianConfig(
         settings.setCollectorToken(collectorToken);
         settings.setHostOverride(hostOverride);
         settings.setPortOverride(portOverride);
+        settings.setUseTls(useTls);
         settings.setSkipTlsVerification(skipTlsVerification);
         settings.setCustomCaCert(customCaCert);
         settings.setDebugLogging(debugLogging);
@@ -96,6 +107,7 @@ public record FactryHistorianConfig(
                 settings.getCollectorToken(),
                 settings.getHostOverride(),
                 settings.getPortOverride(),
+                settings.isUseTls(),
                 settings.isSkipTlsVerification(),
                 settings.getCustomCaCert(),
                 settings.isDebugLogging(),

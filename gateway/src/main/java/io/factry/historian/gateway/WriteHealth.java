@@ -34,6 +34,9 @@ final class WriteHealth {
 
     /** Factry's answer to the last connection check; null until the first one. */
     private Status check;
+    /** How the client connects, for the hints in failure details; set by the provider. */
+    private volatile boolean tls = true;
+    private volatile boolean factryCertificate;
     /**
      * The check failures logged at WARN (kind and code), and whether the current failure was
      * one of them. Forgotten after the check passed for {@link #SUMMARY_EVERY_MS}, so a check
@@ -79,6 +82,12 @@ final class WriteHealth {
         prefix = "Historian '" + historianName + "': ";
     }
 
+    /** How the client connects now: TLS or plain text, and whether the token claims the built-in certificate. */
+    void connection(boolean tls, boolean factryCertificate) {
+        this.tls = tls;
+        this.factryCertificate = factryCertificate;
+    }
+
     /**
      * Record the connection check. A failure is logged once with its reason, the recovery once
      * after it; a check that comes and goes repeats neither (see {@link #loggedCheckFailures}).
@@ -86,6 +95,7 @@ final class WriteHealth {
      * judged afresh. What was logged about writes stays, and the totals keep counting, until a
      * write is stored.
      */
+
     synchronized void connectionChecked(Status status) {
         long now = clock.getAsLong();
         boolean wasPassing = check == null || check.isOk();
@@ -93,7 +103,7 @@ final class WriteHealth {
         if (!status.isOk()) {
             CheckFailure failure = checkFailure(status);
             if (loggedCheckFailures.add(failure + ":" + status.getCode())) {
-                logger.warn(prefix + failure.details(status));
+                logger.warn(prefix + failure.details(status, tls, factryCertificate));
                 checkFailureLogged = true;
             } else if (wasPassing) {
                 checkFailureLogged = false;
@@ -183,7 +193,7 @@ final class WriteHealth {
         if (!check.isOk()) {
             CheckFailure failure = checkFailure(check);
             return new ProfileStatus(ProfileStatus.State.Errored, LocalizedString.createRaw(failure.message),
-                    failure.details(check));
+                    failure.details(check, tls, factryCertificate));
         }
         if (failing()) {
             // The gateway's historian page shows an Errored profile as "Error" with the details as
@@ -230,8 +240,12 @@ final class WriteHealth {
         }
 
         String details(Status status) {
+            return details(status, true, false);
+        }
+
+        String details(Status status, boolean tls, boolean factryCertificate) {
             return (details == null ? sentence(status.getDescription()) + " The module reads it again with every connection check."
-                    : String.format(details, describe(status)) + FactryGrpcClient.tlsHint(status))
+                    : String.format(details, describe(status)) + FactryGrpcClient.tlsHint(status, tls, factryCertificate))
                     + " Store and forward keeps the data until it can be stored.";
         }
     }

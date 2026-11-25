@@ -74,7 +74,7 @@ final class FakeFactryServer extends HistorianGrpc.HistorianImplBase implements 
 
     /**
      * @param certificate null for plain text, else the name of a server certificate in
-     *                    {@link TestTls}, as Factry's gRPC port always uses TLS
+     *                    {@link TestTls}
      */
     FakeFactryServer(String certificate) throws Exception {
         // Loopback only: forPort(0) binds the wildcard address, and macOS can hand out a port that

@@ -173,7 +173,7 @@ Key settings in `config.json`:
 | `token` | (from Factry) | The collector token |
 | `skipTlsVerification` | `true` | For dev environment |
 
-> **Note:** The module reads host and port from the JWT token's `aud` and `grpc-port` claims. `hostOverride` and `portOverride` (Host Override and Port Override in the form) win when set. The connection always uses TLS. The script writes the token in plain text (`token`); the module reads it with a warning until the profile is saved with the token as a secret.
+> **Note:** The module reads host and port from the JWT token's `aud` and `grpc-port` claims. `hostOverride` and `portOverride` (Host Override and Port Override in the form) win when set. Use TLS is on by default; it is off only for a Historian whose gRPC TLS is turned off. The script writes the token in plain text (`token`); the module reads it with a warning until the profile is saved with the token as a secret.
 
 After updating the config, restart Ignition:
 ```bash
