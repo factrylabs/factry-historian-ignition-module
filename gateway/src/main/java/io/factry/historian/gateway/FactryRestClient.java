@@ -24,7 +24,7 @@ import java.util.concurrent.TimeoutException;
  * the token in {@code x-organization-uuid}. The REST port is the token's {@code rest-port} claim,
  * on the gRPC host (Host Override or the token's host; Port Override is the gRPC port and does not
  * apply). HTTPS when the gRPC channel uses TLS, with the channel's own trust decision
- * ({@link FactryGrpcClient#trustManager}); plain HTTP only when it does not (Use TLS off, for a
+ * ({@link FactryGrpcClient#trustManager}); plain HTTP only when it does not (Plain Text, for a
  * Factry whose gRPC TLS is turned off), so the token is never sent in the clear while gRPC
  * encrypts it. The JDK's TLS engine leaves the host name check to that trust manager, so Factry's
  * built-in certificate (named historian.factry.local) passes at any host here as over gRPC. One HTTP client per channel settings, and one deadline over the whole call, body

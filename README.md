@@ -40,7 +40,7 @@ For a dev setup, `script/setup-factry.sh` does the same through Factry's REST AP
 3. Select **Factry Historian**, click **Next**
 4. Under **Collector Token**, choose **Embedded** and paste the token from step 1 (the gateway stores it encrypted), or **Referenced** to read it from a secret provider. The connection settings (host, port, collector ID) are extracted from it.
    Profiles from older versions keep working with the token they stored in plain text; open the profile, enter the token here and save to encrypt it.
-   If the gateway reaches Factry on another host or port than the token names (Docker, NAT), set **Host Override** and **Port Override**. **Use TLS** is on by default; with Factry's built-in certificate no other TLS setting is needed. Turn it off only for a Historian whose gRPC TLS is turned off (`USE_SELF_SIGNED_CERTIFICATE=false`) with nothing in between that ends TLS: the collector token is then sent unencrypted.
+   If the gateway reaches Factry on another host or port than the token names (Docker, NAT), set **Host Override** and **Port Override**. The connection uses TLS unless **Plain Text (No TLS)** is on; with Factry's built-in certificate no other TLS setting is needed. Turn Plain Text on only for a Historian whose gRPC TLS is turned off (`USE_SELF_SIGNED_CERTIFICATE=false`) with nothing in between that ends TLS: the collector token is then sent unencrypted.
 5. Click **Create Historian**
 6. Verify the status shows **Running**
 

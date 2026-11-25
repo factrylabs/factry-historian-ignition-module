@@ -72,7 +72,7 @@ class RestTlsTest {
         assertRefused(serve(TestTls.jdkServer(TestTls.FACTRY_BUILT_IN)), false, false, TestTls.caPem());
     }
 
-    /** Use TLS off, for a Factry whose gRPC TLS is turned off: the REST call goes plain HTTP too. */
+    /** Plain text, for a Factry whose gRPC TLS is turned off: the REST call goes plain HTTP too. */
     @Test
     void withoutTlsTheRestCallIsPlainHttp() throws Exception {
         com.sun.net.httpserver.HttpServer plain = com.sun.net.httpserver.HttpServer.create(
