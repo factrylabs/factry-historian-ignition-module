@@ -19,7 +19,7 @@ class FactryHistorianConfigTest {
     @Test
     void roundTrip_preservesAllFieldsIncludingCustomCaCert() {
         FactryHistorianConfig original = new FactryHistorianConfig(
-                FakeSecrets.embedded("the-token"), "historian", 8001, false, PEM, true, "/");
+                FakeSecrets.embedded("the-token"), "historian", 8001, false, false, PEM, true, "/");
 
         FactryHistorianSettings settings = original.toSettings();
         assertEquals(PEM, settings.getCustomCaCert());
@@ -31,14 +31,14 @@ class FactryHistorianConfigTest {
     @Test
     void toSettings_mapsCustomCaCert() {
         FactryHistorianConfig config = new FactryHistorianConfig(
-                FakeSecrets.embedded("t"), "", null, false, PEM, false, "");
+                FakeSecrets.embedded("t"), "", null, true, false, PEM, false, "");
         assertEquals(PEM, config.toSettings().getCustomCaCert());
     }
 
     /**
      * A host and port stored by an older version (the form had no field for them) show in the form
-     * as overrides, and the next save stores them under the new names (#37). "useTls" is gone:
-     * Factry's gRPC port always uses TLS (#55).
+     * as overrides, and the next save stores them under the new names (#37). Its Use TLS stays as it
+     * was: off is right for a Factry whose gRPC TLS is off.
      */
     @Test
     void olderProfileShowsItsHostAndPortAsOverrides() throws Exception {
@@ -49,11 +49,13 @@ class FactryHistorianConfigTest {
         FactryHistorianConfig form = FactryHistorianConfig.fromSettings(settings);
         assertEquals("historian", form.hostOverride());
         assertEquals(8001, form.portOverride());
+        assertFalse(form.useTls());
 
         JsonObject stored = ep.encode(settings).getAsJsonObject();
         assertEquals("historian", stored.get("hostOverride").getAsString());
         assertEquals(8001, stored.get("portOverride").getAsInt());
-        assertFalse(stored.has("grpcHost") || stored.has("grpcPort") || stored.has("useTls"), stored.toString());
+        assertFalse(stored.get("useTls").getAsBoolean(), stored.toString());
+        assertFalse(stored.has("grpcHost") || stored.has("grpcPort"), stored.toString());
     }
 
     /** "localhost" and 9876 were defaults written with every save, not choices: the token decides. */
@@ -70,11 +72,20 @@ class FactryHistorianConfigTest {
     }
 
     @Test
-    void formShowsTheOverridesAndNoTlsSwitch() {
+    void formShowsTheOverridesAndUseTlsOnByDefault() {
         JsonObject properties = SchemaUtil.fromType(FactryHistorianConfig.class).getAsJsonObject("properties");
         assertTrue(properties.has("hostOverride"));
         assertTrue(properties.has("portOverride"));
         assertTrue(properties.has("collectorToken"));
-        assertFalse(properties.has("useTls"));
+        assertTrue(properties.getAsJsonObject("useTls").get("default").getAsBoolean(), properties.toString());
+    }
+
+    /** A profile stored without the field (saved while it was gone) uses TLS. */
+    @Test
+    void profileWithoutUseTlsUsesTls() throws Exception {
+        FactryHistorianSettings settings = new FactryHistorianExtensionPoint().decode(JsonParser.parseString(
+                "{\"token\":\"a.b.c\",\"hostOverride\":\"historian\"}"));
+        assertTrue(settings.isUseTls());
+        assertTrue(FactryHistorianConfig.fromSettings(settings).useTls());
     }
 }

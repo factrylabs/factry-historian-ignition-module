@@ -217,7 +217,7 @@ All configuration has defaults for the local Docker setup. Override as needed:
 - Check that files exist at `ignition/data/projects/TestFactry/com.inductiveautomation.webdev/resources/test/`.
 
 ### gRPC "UNAVAILABLE: Network closed for unknown reason"
-- Factry requires TLS. The test uses TLS with insecure trust (matching module config). If Factry is configured differently, this may fail.
+- Factry serves TLS unless its gRPC TLS is turned off (`USE_SELF_SIGNED_CERTIFICATE=false`). The test uses TLS with insecure trust (matching module config). Against a Historian without TLS, this fails; a plain text client against a TLS port fails the same way.
 - Verify Factry is running: `docker ps | grep factry-historian`.
 - Check port is reachable: `nc -z localhost 8001`.
 

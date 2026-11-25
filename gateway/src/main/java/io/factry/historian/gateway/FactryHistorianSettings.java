@@ -27,6 +27,13 @@ public class FactryHistorianSettings implements HistorianSettings {
     private transient String host = "";
     private transient int port;
     private transient boolean factryCertificate;
+    // Off only for a Factry whose gRPC TLS is off (USE_SELF_SIGNED_CERTIFICATE=false) with nothing in
+    // between that ends TLS. Profiles saved before the switch came back hold it as they had it.
+    private boolean useTls = true;
+    // Resolved by applyTokenDefaults: TLS when Use TLS is on; also when the token says Factry serves
+    // its built-in certificate, which Factry's own collectors then always use TLS for, and when Skip
+    // TLS Verification or a Custom CA is set, which only make sense with TLS.
+    private transient boolean tls = true;
     private boolean debugLogging = false;
     private boolean skipTlsVerification = false;
     // The collector token: encrypted with the gateway's key (Embedded) or read from a secret
@@ -122,6 +129,19 @@ public class FactryHistorianSettings implements HistorianSettings {
         return port != null && port != 0;
     }
 
+    public boolean isUseTls() {
+        return useTls;
+    }
+
+    public void setUseTls(boolean useTls) {
+        this.useTls = useTls;
+    }
+
+    /** Whether the client uses TLS; set by {@link #applyTokenDefaults(String)}. */
+    public boolean usesTls() {
+        return tls;
+    }
+
     public boolean isDebugLogging() {
         return debugLogging;
     }
@@ -185,6 +205,7 @@ public class FactryHistorianSettings implements HistorianSettings {
         this.collectorName = claims.collectorName();
 
         this.factryCertificate = claims.factryCertificate();
+        this.tls = useTls || factryCertificate || skipTlsVerification || !isBlank(customCaCert);
         boolean hostOverridden = !isBlank(hostOverride);
         boolean portOverridden = isSet(portOverride);
         this.host = hostOverridden ? hostOverride.trim() : claims.host();
@@ -194,7 +215,16 @@ public class FactryHistorianSettings implements HistorianSettings {
                 host, port,
                 hostOverridden ? "from Host Override, the token says " + claims.host() : "from the token",
                 portOverridden ? "from Port Override, the token says " + claims.port() : "from the token",
-                FactryGrpcClient.tlsLabel(true, skipTlsVerification, customCaCert, factryCertificate));
+                FactryGrpcClient.tlsLabel(tls, skipTlsVerification, customCaCert, factryCertificate));
+        if (!useTls && tls) {
+            logger.info("Collector {}: Use TLS is off, but {}. Connecting with TLS.", collectorName,
+                    factryCertificate ? "the token says Factry serves its built-in certificate, which always uses TLS"
+                            : "Skip TLS Verification or a Custom CA Certificate is set, which need TLS");
+        } else if (!tls) {
+            logger.warn("Collector {}: Use TLS is off, so the collector token is sent unencrypted to {}:{} and to "
+                    + "Factry's REST port. Turn it on unless Factry's gRPC TLS is off and nothing in between can "
+                    + "read the traffic.", collectorName, host, port);
+        }
         return claims.token();
     }
 
@@ -280,6 +310,7 @@ public class FactryHistorianSettings implements HistorianSettings {
                         : collectorToken.getType()) +
                 ", hostOverride='" + hostOverride + '\'' +
                 ", portOverride=" + portOverride +
+                ", useTls=" + useTls +
                 ", debugLogging=" + debugLogging +
                 ", skipTlsVerification=" + skipTlsVerification +
                 ", delimiter='" + delimiter + '\'' +

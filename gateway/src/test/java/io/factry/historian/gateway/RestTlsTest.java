@@ -72,6 +72,32 @@ class RestTlsTest {
         assertRefused(serve(TestTls.jdkServer(TestTls.FACTRY_BUILT_IN)), false, false, TestTls.caPem());
     }
 
+    /** Use TLS off, for a Factry whose gRPC TLS is turned off: the REST call goes plain HTTP too. */
+    @Test
+    void withoutTlsTheRestCallIsPlainHttp() throws Exception {
+        com.sun.net.httpserver.HttpServer plain = com.sun.net.httpserver.HttpServer.create(
+                new InetSocketAddress(InetAddress.getLoopbackAddress(), 0), 0);
+        plain.createContext("/", exchange -> {
+            requests.add(exchange.getRequestURI().toString());
+            byte[] answer = "{\"DefaultDatabaseUUID\":\"db-a\"}".getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, answer.length);
+            exchange.getResponseBody().write(answer);
+            exchange.close();
+        });
+        plain.start();
+        try {
+            FactryGrpcClient client = new FactryGrpcClient(LOOPBACK, 1, "collector-a",
+                    token(plain.getAddress().getPort()), false, false, null, false, TestTls.ca());
+            try {
+                assertEquals("db-a", client.getDefaultDatabaseUUID());
+            } finally {
+                client.shutdown();
+            }
+        } finally {
+            plain.stop(0);
+        }
+    }
+
     @Test
     void skipTlsVerificationAcceptsAnyCertificate() throws Exception {
         assertEquals("db-a", ask(serve(selfSigned("other")), false, true, null));

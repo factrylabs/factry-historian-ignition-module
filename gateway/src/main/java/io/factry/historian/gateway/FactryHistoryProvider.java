@@ -105,6 +105,7 @@ public class FactryHistoryProvider extends AbstractHistorian<FactryHistorianSett
         this.activeToken = token;
         this.metrics = new HistorianMetrics();
         this.writeHealth = new WriteHealth(historianName);
+        writeHealth.connection(settings.usesTls(), settings.usesFactryCertificate());
 
         // Without a token the client points nowhere (".invalid" never resolves) until it is read.
         this.grpcClient = new FactryGrpcClient(
@@ -112,7 +113,7 @@ public class FactryHistoryProvider extends AbstractHistorian<FactryHistorianSett
                 tokenUnreadable == null ? settings.getPort() : 1,
                 settings.getCollectorUUID(),
                 token,
-                true, // Factry's gRPC port always uses TLS
+                settings.usesTls(),
                 settings.isSkipTlsVerification(),
                 settings.getCustomCaCert(),
                 settings.usesFactryCertificate()
@@ -359,7 +360,7 @@ public class FactryHistoryProvider extends AbstractHistorian<FactryHistorianSett
             } catch (TokenUnreadableException e) {
                 tokenUnreadable = e.getMessage();
                 // Not the previous Factry with the previous token while the status says Errored.
-                grpcClient.reconfigure(NO_TOKEN_HOST, 1, newSettings.getCollectorUUID(), "", false, false, null);
+                grpcClient.reconfigure(NO_TOKEN_HOST, 1, newSettings.getCollectorUUID(), "", true, false, null);
                 activeToken = "";
                 connection = null;
                 queryEngine.updateSettings(newSettings);
@@ -422,12 +423,13 @@ public class FactryHistoryProvider extends AbstractHistorian<FactryHistorianSett
                 newSettings.getPort(),
                 newSettings.getCollectorUUID(),
                 token,
-                true, // Factry's gRPC port always uses TLS
+                newSettings.usesTls(),
                 newSettings.isSkipTlsVerification(),
                 newSettings.getCustomCaCert(),
                 newSettings.usesFactryCertificate()
         );
         this.connection = next;
+        writeHealth.connection(newSettings.usesTls(), newSettings.usesFactryCertificate());
         this.activeToken = token;
         this.tokenUnreadable = null;
         // Judge and log refusals of writes afresh; before the refresh, which can throw.
