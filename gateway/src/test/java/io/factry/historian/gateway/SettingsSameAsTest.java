@@ -63,6 +63,10 @@ class SettingsSameAsTest {
         if (type == boolean.class) {
             return !(Boolean) value;
         }
+        if (type == Boolean.class) {
+            // Not set and false both mean off, so make a real change: not set becomes on.
+            return value == null ? Boolean.TRUE : !(Boolean) value;
+        }
         throw new AssertionError("no test value for a field of type " + type
                 + ": extend this test and FactryHistorianSettings.sameAs");
     }

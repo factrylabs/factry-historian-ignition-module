@@ -306,7 +306,8 @@ public class FactryHistorianSettings implements HistorianSettings {
                 && java.util.Objects.equals(collectorName, other.collectorName)
                 && java.util.Objects.equals(token, other.token)
                 && java.util.Objects.equals(grpcHost, other.grpcHost)
-                && java.util.Objects.equals(grpcPort, other.grpcPort);
+                && java.util.Objects.equals(grpcPort, other.grpcPort)
+                && java.util.Objects.equals(useTls, other.useTls);
     }
 
     @Override
