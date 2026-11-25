@@ -71,10 +71,10 @@ public class FactryHistoryProvider extends AbstractHistorian<FactryHistorianSett
     private static final String NO_TOKEN_HOST = "collector-token-unread.invalid";
 
     /** What the gRPC client was last set up with, to tell a save that changes nothing. */
-    record Connection(String host, int port, String collectorUUID, String token, boolean skipTlsVerification,
-                      String customCaCert, boolean factryCertificate) {
+    record Connection(String host, int port, String collectorUUID, String token, boolean tls,
+                      boolean skipTlsVerification, String customCaCert, boolean factryCertificate) {
         static Connection of(FactryHistorianSettings s, String token) {
-            return new Connection(s.getHost(), s.getPort(), s.getCollectorUUID(), token,
+            return new Connection(s.getHost(), s.getPort(), s.getCollectorUUID(), token, s.usesTls(),
                     s.isSkipTlsVerification(), s.getCustomCaCert(), s.usesFactryCertificate());
         }
     }
