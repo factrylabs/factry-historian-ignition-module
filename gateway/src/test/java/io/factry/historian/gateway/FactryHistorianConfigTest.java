@@ -37,8 +37,9 @@ class FactryHistorianConfigTest {
 
     /**
      * A host and port stored by an older version (the form had no field for them) show in the form
-     * as overrides, and the next save stores them under the new names (#37). Its Use TLS stays as it
-     * was: off is right for a Factry whose gRPC TLS is off.
+     * as overrides, and the next save stores them under the new names (#37). Its "Use TLS" off
+     * becomes Plain Text on: right for a Factry whose gRPC TLS is off, and the token's claim still
+     * means TLS against a default Factry.
      */
     @Test
     void olderProfileShowsItsHostAndPortAsOverrides() throws Exception {
@@ -49,13 +50,13 @@ class FactryHistorianConfigTest {
         FactryHistorianConfig form = FactryHistorianConfig.fromSettings(settings);
         assertEquals("historian", form.hostOverride());
         assertEquals(8001, form.portOverride());
-        assertFalse(form.useTls());
+        assertTrue(form.plainText());
 
         JsonObject stored = ep.encode(settings).getAsJsonObject();
         assertEquals("historian", stored.get("hostOverride").getAsString());
         assertEquals(8001, stored.get("portOverride").getAsInt());
-        assertFalse(stored.get("useTls").getAsBoolean(), stored.toString());
-        assertFalse(stored.has("grpcHost") || stored.has("grpcPort"), stored.toString());
+        assertTrue(stored.get("plainText").getAsBoolean(), stored.toString());
+        assertFalse(stored.has("grpcHost") || stored.has("grpcPort") || stored.has("useTls"), stored.toString());
     }
 
     /** "localhost" and 9876 were defaults written with every save, not choices: the token decides. */
@@ -67,25 +68,56 @@ class FactryHistorianConfigTest {
 
         assertEquals("", FactryHistorianConfig.fromSettings(settings).hostOverride());
         assertEquals(0, FactryHistorianConfig.fromSettings(settings).portOverride());
+        assertFalse(FactryHistorianConfig.fromSettings(settings).plainText());
         JsonObject stored = ep.encode(settings).getAsJsonObject();
-        assertFalse(stored.has("portOverride") || stored.has("grpcHost") || stored.has("grpcPort"), stored.toString());
+        assertFalse(stored.has("portOverride") || stored.has("grpcHost") || stored.has("grpcPort")
+                || stored.has("useTls"), stored.toString());
     }
 
+    /**
+     * Ignition's create form shows no defaults, so every checkbox must default to off: Plain Text,
+     * not a "Use TLS" that would look off while it saves on.
+     */
     @Test
-    void formShowsTheOverridesAndUseTlsOnByDefault() {
+    void formShowsTheOverridesAndPlainTextOffByDefault() {
         JsonObject properties = SchemaUtil.fromType(FactryHistorianConfig.class).getAsJsonObject("properties");
         assertTrue(properties.has("hostOverride"));
         assertTrue(properties.has("portOverride"));
         assertTrue(properties.has("collectorToken"));
-        assertTrue(properties.getAsJsonObject("useTls").get("default").getAsBoolean(), properties.toString());
+        assertTrue(properties.has("plainText"));
+        assertFalse(properties.has("useTls"));
+        // Every checkbox, and the settings a new profile gets when it is saved untouched.
+        FactryHistorianConfig untouched = FactryHistorianConfig.fromSettings(new FactryHistorianSettings());
+        int checkboxes = 0;
+        for (String name : properties.keySet()) {
+            JsonObject property = properties.getAsJsonObject(name);
+            if (property.has("type") && "boolean".equals(property.get("type").getAsString())) {
+                checkboxes++;
+                assertTrue(property.has("default") && !property.get("default").getAsBoolean(),
+                        name + " must default to false: " + property);
+            }
+        }
+        assertEquals(3, checkboxes, properties.toString());
+        assertFalse(untouched.plainText() || untouched.skipTlsVerification() || untouched.debugLogging());
     }
 
-    /** A profile stored without the field (saved while it was gone) uses TLS. */
+    /** A stored plainText wins over the legacy useTls, also when both are there (hand-edited config). */
     @Test
-    void profileWithoutUseTlsUsesTls() throws Exception {
+    void storedPlainTextWinsOverUseTls() throws Exception {
+        FactryHistorianSettings settings = new FactryHistorianExtensionPoint().decode(JsonParser.parseString(
+                "{\"token\":\"a.b.c\",\"useTls\":false,\"plainText\":false}"));
+        assertFalse(settings.isPlainText());
+        settings = new FactryHistorianExtensionPoint().decode(JsonParser.parseString(
+                "{\"token\":\"a.b.c\",\"useTls\":true,\"plainText\":true}"));
+        assertTrue(settings.isPlainText());
+    }
+
+    /** A profile stored without either field (a new one, or saved by #42's first version) uses TLS. */
+    @Test
+    void profileWithoutTlsFieldsIsNotPlainText() throws Exception {
         FactryHistorianSettings settings = new FactryHistorianExtensionPoint().decode(JsonParser.parseString(
                 "{\"token\":\"a.b.c\",\"hostOverride\":\"historian\"}"));
-        assertTrue(settings.isUseTls());
-        assertTrue(FactryHistorianConfig.fromSettings(settings).useTls());
+        assertFalse(settings.isPlainText());
+        assertFalse(FactryHistorianConfig.fromSettings(settings).plainText());
     }
 }

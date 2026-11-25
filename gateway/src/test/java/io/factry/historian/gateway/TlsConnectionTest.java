@@ -16,9 +16,9 @@ import static org.junit.jupiter.api.Assertions.*;
 
 /**
  * TLS by default (#55). A new profile connects with TLS without any TLS field; when the token says
- * Factry serves its built-in certificate, the module uses TLS even with Use TLS off, and that
+ * Factry serves its built-in certificate, the module uses TLS even with Plain Text on, and that
  * certificate is checked against Factry's CA as historian.factry.local, whatever host the gateway
- * connects to. Only Use TLS off with a token without that claim connects in plain text, for a
+ * connects to. Only Plain Text on with a token without that claim connects in plain text, for a
  * Factry whose gRPC TLS is turned off. A failed check says which setting to change.
  */
 class TlsConnectionTest {
@@ -56,12 +56,12 @@ class TlsConnectionTest {
 
     /** Factry with its gRPC TLS turned off (USE_SELF_SIGNED_CERTIFICATE=false): its tokens carry no claim. */
     @Test
-    void useTlsOffConnectsInPlainTextToAFactryWithoutTls() throws Exception {
+    void plainTextConnectsToAFactryWithoutTls() throws Exception {
         FakeFactryServer factry = server(null);
         String uuid = factry.addMeasurement("default/a", "number");
         factry.addPoint(uuid, START, 1.0);
 
-        FactryHistoryProvider provider = provider(factry, false, false, null);
+        FactryHistoryProvider provider = provider(factry, true, false, null);
 
         Dataset ds = IgnitionHistoryQuery.wide(provider.getQueryEngine().orElseThrow(), START, START + 1_000, -1, null,
                 "default/a");
@@ -70,18 +70,18 @@ class TlsConnectionTest {
     }
 
     /**
-     * Profiles saved with the old default (Use TLS off) against a Factry with its built-in
+     * Profiles saved with the old "Use TLS" off (now Plain Text on) against a Factry with its built-in
      * certificate: the token's claim wins, as it does for Factry's own collectors. A proxy whose
      * certificate the system trusts, so nothing but the claim turns TLS on.
      */
     @Test
-    void useTlsOffStillUsesTlsWhenTheTokenSaysBuiltInCertificate() throws Exception {
+    void plainTextStillUsesTlsWhenTheTokenSaysBuiltInCertificate() throws Exception {
         FakeFactryServer factry = server(TestTls.LOOPBACK);
         String uuid = factry.addMeasurement("default/a", "number");
         factry.addPoint(uuid, START, 1.0);
 
         TestTls.withTestCaAsSystemCa(() -> {
-            FactryHistoryProvider provider = provider(factry, false, true, null);
+            FactryHistoryProvider provider = provider(factry, true, true, null);
             Dataset ds = IgnitionHistoryQuery.wide(provider.getQueryEngine().orElseThrow(), START, START + 1_000, -1,
                     null, "default/a");
             assertNull(ds.error);
@@ -89,14 +89,60 @@ class TlsConnectionTest {
         });
     }
 
-    /** A Custom CA only makes sense with TLS, so it turns TLS on with Use TLS off. */
+    /**
+     * A profile from before #42 as it is stored: "useTls": false (its old default) becomes Plain
+     * Text on when decoded, and the token's claim still makes it use TLS against a default Factry.
+     */
     @Test
-    void aCustomCaMeansTlsWithUseTlsOff() throws Exception {
+    void profileFromBefore42WithUseTlsOffStillUsesTlsWithTheClaim() throws Exception {
+        FakeFactryServer factry = server(TestTls.LOOPBACK);
+        String uuid = factry.addMeasurement("default/a", "number");
+        factry.addPoint(uuid, START, 1.0);
+        JsonObject config = new JsonObject();
+        config.add("collectorToken", FakeSecrets.embedded(jwt(factry.port(), true)).toJsonTree());
+        config.addProperty("useTls", false);
+
+        TestTls.withTestCaAsSystemCa(() -> {
+            FactryHistorianSettings settings = new FactryHistorianExtensionPoint().decode(config);
+            assertTrue(settings.isPlainText());
+            FactryHistoryProvider provider = new FactryHistoryProvider(new FakeSecrets().gatewayContext(), "Factry",
+                    settings);
+            open.add(provider::onShutdown);
+            Dataset ds = IgnitionHistoryQuery.wide(provider.getQueryEngine().orElseThrow(), START, START + 1_000, -1,
+                    null, "default/a");
+            assertNull(ds.error);
+            assertEquals(1, ds.rows.size());
+        });
+    }
+
+    /** The same old profile against a Factry with its gRPC TLS off and no claim: plain text, as before #42. */
+    @Test
+    void profileFromBefore42WithUseTlsOffConnectsToAFactryWithoutTls() throws Exception {
+        FakeFactryServer factry = server(null);
+        String uuid = factry.addMeasurement("default/a", "number");
+        factry.addPoint(uuid, START, 1.0);
+        JsonObject config = new JsonObject();
+        config.add("collectorToken", FakeSecrets.embedded(jwt(factry.port(), false)).toJsonTree());
+        config.addProperty("useTls", false);
+
+        FactryHistoryProvider provider = new FactryHistoryProvider(new FakeSecrets().gatewayContext(), "Factry",
+                new FactryHistorianExtensionPoint().decode(config));
+        open.add(provider::onShutdown);
+
+        Dataset ds = IgnitionHistoryQuery.wide(provider.getQueryEngine().orElseThrow(), START, START + 1_000, -1, null,
+                "default/a");
+        assertNull(ds.error);
+        assertEquals(1, ds.rows.size());
+    }
+
+    /** A Custom CA only makes sense with TLS, so it means TLS with Plain Text on. */
+    @Test
+    void aCustomCaMeansTlsWithPlainTextOn() throws Exception {
         FakeFactryServer factry = server(TestTls.LOOPBACK);
         String uuid = factry.addMeasurement("default/a", "number");
         factry.addPoint(uuid, START, 1.0);
 
-        FactryHistoryProvider provider = provider(factry, false, false, TestTls.caPem());
+        FactryHistoryProvider provider = provider(factry, true, false, TestTls.caPem());
 
         Dataset ds = IgnitionHistoryQuery.wide(provider.getQueryEngine().orElseThrow(), START, START + 1_000, -1, null,
                 "default/a");
@@ -105,7 +151,7 @@ class TlsConnectionTest {
     }
 
     @Test
-    void plainTextAgainstAFactryWithTlsSaysToTurnUseTlsOn() throws Exception {
+    void plainTextAgainstAFactryWithTlsSaysToTurnPlainTextOff() throws Exception {
         FakeFactryServer factry = server(TestTls.LOOPBACK);
         FactryGrpcClient client = new FactryGrpcClient(LOOPBACK, factry.port(), "collector", "token", false, false,
                 null, false, TestTls.ca());
@@ -115,28 +161,28 @@ class TlsConnectionTest {
 
         assertEquals(Status.Code.UNAVAILABLE, check.getCode());
         String hint = FactryGrpcClient.tlsHint(check, false, false);
-        assertTrue(hint.contains("turn Use TLS on"), check + " / " + hint);
+        assertTrue(hint.contains("Plain Text (No TLS) is on") && hint.contains("turn it off"), check + " / " + hint);
         // The same answer to a TLS client is a dropped connection, not a TLS problem.
-        assertFalse(FactryGrpcClient.tlsHint(check, true, false).contains("Use TLS"),
+        assertFalse(FactryGrpcClient.tlsHint(check, true, false).contains("Plain Text"),
                 FactryGrpcClient.tlsHint(check, true, false));
     }
 
     /** The profile's status carries that hint: the provider tells the status how it connects. */
     @Test
-    void statusOfAPlainTextProfileAgainstTlsSaysToTurnUseTlsOn() throws Exception {
+    void statusOfAPlainTextProfileAgainstTlsSaysToTurnPlainTextOff() throws Exception {
         FakeFactryServer factry = server(TestTls.LOOPBACK);
-        FactryHistoryProvider provider = provider(factry, false, false, null);
+        FactryHistoryProvider provider = provider(factry, true, false, null);
 
         provider.checkConnection();
 
         String details = provider.statusOnceStarted().getErrorDetails();
         assertNotNull(details);
-        assertTrue(details.contains("turn Use TLS on"), details);
+        assertTrue(details.contains("Plain Text (No TLS) is on"), details);
     }
 
     /**
-     * A profile from before #42 with Use TLS off and Skip TLS Verification on, against a Factry
-     * with its gRPC TLS off: Skip now means TLS, so the hint must name it, not only Use TLS.
+     * A profile from before #42 with "Use TLS" off and Skip TLS Verification on, against a Factry
+     * with its gRPC TLS off: Skip now means TLS, so the hint must name it, not only Plain Text.
      */
     @Test
     void tlsForcedBySkipTlsVerificationAgainstAPlainServerNamesIt() throws Exception {
@@ -148,7 +194,7 @@ class TlsConnectionTest {
         Status check = client.checkConnection();
 
         String hint = FactryGrpcClient.tlsHint(check, true, false);
-        assertTrue(hint.contains("Skip TLS Verification and Custom CA Certificate"), hint);
+        assertTrue(hint.contains("turn off Skip TLS Verification and clear Custom CA Certificate"), hint);
     }
 
     /** Factry's gRPC TLS turned off after the token was made: the old token's claim still forces TLS. */
@@ -160,7 +206,7 @@ class TlsConnectionTest {
 
         String hint = FactryGrpcClient.tlsHint(check, true, true);
         assertTrue(hint.contains("make a new collector token"), hint);
-        assertFalse(hint.contains("turn off Use TLS"), hint);
+        assertFalse(hint.contains("turn on Plain Text"), hint);
     }
 
     @Test
@@ -212,7 +258,7 @@ class TlsConnectionTest {
 
         assertEquals(Status.Code.UNAVAILABLE, check.getCode());
         assertTrue(FactryGrpcClient.tlsHint(check).contains("does not answer with TLS"), FactryGrpcClient.tlsHint(check));
-        assertTrue(FactryGrpcClient.tlsHint(check).contains("turn off Use TLS"), FactryGrpcClient.tlsHint(check));
+        assertTrue(FactryGrpcClient.tlsHint(check).contains("turn on Plain Text (No TLS)"), FactryGrpcClient.tlsHint(check));
         assertFalse(FactryGrpcClient.tlsHint(check).contains("new collector token"), FactryGrpcClient.tlsHint(check));
     }
 
@@ -316,22 +362,22 @@ class TlsConnectionTest {
     }
 
     /** A provider for this server, through the stored settings. */
-    private FactryHistoryProvider provider(FakeFactryServer factry, boolean useTls, boolean factryCertificate,
+    private FactryHistoryProvider provider(FakeFactryServer factry, boolean plainText, boolean factryCertificate,
                                            String customCa) throws Exception {
         FactryHistoryProvider provider = new FactryHistoryProvider(new FakeSecrets().gatewayContext(), "Factry",
-                decode(factry, useTls, factryCertificate, customCa));
+                decode(factry, plainText, factryCertificate, customCa));
         open.add(provider::onShutdown);
         return provider;
     }
 
-    private static FactryHistorianSettings decode(FakeFactryServer factry, boolean useTls, boolean factryCertificate,
+    private static FactryHistorianSettings decode(FakeFactryServer factry, boolean plainText, boolean factryCertificate,
                                                   String customCa) throws Exception {
         JsonObject config = new JsonObject();
         config.add("collectorToken", FakeSecrets.embedded(jwt(factry.port(), factryCertificate)).toJsonTree());
         if (customCa != null) {
             config.addProperty("customCaCert", customCa);
         }
-        config.addProperty("useTls", useTls);
+        config.addProperty("plainText", plainText);
         return new FactryHistorianExtensionPoint().decode(config);
     }
 

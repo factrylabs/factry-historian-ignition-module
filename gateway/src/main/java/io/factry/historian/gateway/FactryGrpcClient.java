@@ -667,7 +667,7 @@ public class FactryGrpcClient {
      *
      * @param tls               whether the client used TLS
      * @param factryCertificate the token says Factry serves its built-in certificate, which makes
-     *                          the client use TLS whatever Use TLS says
+     *                          the client use TLS whatever Plain Text says
      */
     static String tlsHint(Status status, boolean tls, boolean factryCertificate) {
         String causes = causes(status);
@@ -680,13 +680,13 @@ public class FactryGrpcClient {
             }
             return " The server does not answer with TLS. Check Host Override and Port Override, or the grpc-port in"
                     + " the token. If Factry's gRPC TLS is turned off (USE_SELF_SIGNED_CERTIFICATE=false) and nothing in"
-                    + " between ends TLS, turn off Use TLS, and also Skip TLS Verification and Custom CA Certificate,"
-                    + " which use TLS too.";
+                    + " between ends TLS, turn on Plain Text (No TLS) if it is off, and turn off Skip TLS Verification"
+                    + " and clear Custom CA Certificate, which use TLS.";
         }
         // A plain text client against a TLS port gets only this; so does any dropped connection, so
         // it is a hint only when the client did not use TLS.
         if (!tls && causes.contains("Network closed for unknown reason")) {
-            return " Use TLS is off. If Factry, or a proxy in front of it, expects TLS, turn Use TLS on.";
+            return " Plain Text (No TLS) is on. If Factry, or a proxy in front of it, expects TLS, turn it off.";
         }
         if (causes.contains("signed by Factry's CA")) {
             return " The certificate is signed by Factry's CA but is not Factry's built-in certificate, which names"

@@ -129,23 +129,23 @@ class FactryHistorianSettingsTest {
         assertDoesNotThrow(withPortOverride(65535)::validate);
     }
 
-    /** Use TLS off means plain text only without the claim, Skip TLS Verification or a Custom CA. */
+    /** Plain Text on means plain text only without the claim, Skip TLS Verification or a Custom CA. */
     @Test
-    void tlsIsUsedUnlessUseTlsIsOffAndNothingElseNeedsIt() throws Exception {
-        assertTrue(tls(true, false, false, null));
-        assertFalse(tls(false, false, false, null));
-        assertTrue(tls(false, true, false, null));
-        assertTrue(tls(false, false, true, null));
-        assertTrue(tls(false, false, false, TestTls.caPem()));
-        assertFalse(tls(false, false, false, "  "));
+    void tlsIsUsedUnlessPlainTextIsOnAndNothingElseNeedsIt() throws Exception {
+        assertTrue(tls(false, false, false, null));
+        assertFalse(tls(true, false, false, null));
+        assertTrue(tls(true, true, false, null));
+        assertTrue(tls(true, false, true, null));
+        assertTrue(tls(true, false, false, TestTls.caPem()));
+        assertFalse(tls(true, false, false, "  "));
     }
 
-    private static boolean tls(boolean useTls, boolean claim, boolean skip, String customCa) {
+    private static boolean tls(boolean plainText, boolean claim, boolean skip, String customCa) {
         Base64.Encoder enc = Base64.getUrlEncoder().withoutPadding();
         String payload = "{\"uuid\":\"u\",\"name\":\"n\",\"aud\":\"http://localhost\",\"grpc-port\":\"8001\","
                 + "\"use-self-signed-certificate\":" + claim + "}";
         FactryHistorianSettings s = new FactryHistorianSettings();
-        s.setUseTls(useTls);
+        s.setPlainText(plainText);
         s.setSkipTlsVerification(skip);
         s.setCustomCaCert(customCa);
         s.applyTokenDefaults("e30." + enc.encodeToString(payload.getBytes(StandardCharsets.UTF_8)) + ".sig");
