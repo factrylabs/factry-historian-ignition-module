@@ -4,14 +4,49 @@
 #
 # Requires: Factry setup wizard completed, valid user credentials.
 # The token is saved to script/.collector-token for use by setup-historians.sh.
+# Checked against Factry Historian v8.2.3.
+#
+# Environment overrides: FACTRY_URL, COLLECTOR_NAME, FACTRY_ORG (organization name or UUID;
+# default: the first one that is not the root organization).
 
 set -e
 cd "$(dirname "$0")/.."
 
 TOKEN_FILE="./script/.collector-token"
 COOKIE_FILE="/tmp/factry-setup-cookies.txt"
-COLLECTOR_NAME="Ignition"
-FACTRY_URL="http://localhost:8000"
+COLLECTOR_NAME="${COLLECTOR_NAME:-Ignition}"
+FACTRY_URL="${FACTRY_URL:-http://localhost:8000}"
+
+WORK_DIR=$(mktemp -d)
+trap 'rm -rf "$WORK_DIR"' EXIT
+RESP_FILE="$WORK_DIR/response"
+
+# ── Helpers ───────────────────────────────────────────────────────
+# Prints an error with the HTTP status and stops.
+fail() {
+    echo "ERROR: $1 (HTTP $HTTP_CODE)"
+    exit 1
+}
+
+# Authenticated API call. Sets HTTP_CODE and writes the body to RESP_FILE. Never fails itself:
+# under set -e that would end the script without a message.
+factry_api() {
+    local method="$1"
+    local path="$2"
+    local data="$3"
+
+    local args=(-s -o "$RESP_FILE" -w "%{http_code}" -b "$COOKIE_FILE" -X "$method"
+        -H "x-xsrf-token: $XSRF")
+    if [ -n "$ORG_UUID" ]; then
+        args+=(-H "x-organization-uuid: $ORG_UUID")
+    fi
+    if [ -n "$data" ]; then
+        args+=(-H "Content-Type: application/json" -d "$data")
+    fi
+
+    : > "$RESP_FILE"
+    HTTP_CODE=$(curl "${args[@]}" "${FACTRY_URL}/api${path}") || HTTP_CODE="000"
+}
 
 # ── Factry credentials ────────────────────────────────────────────
 echo "Factry Historian login required."
@@ -36,39 +71,49 @@ fi
 XSRF=$(grep XSRF "$COOKIE_FILE" | awk '{print $NF}')
 echo "Logged in to Factry."
 
-# ── Helper: authenticated API call ────────────────────────────────
-factry_api() {
-    local method="$1"
-    local path="$2"
-    local data="$3"
+# ── Get organization UUID ─────────────────────────────────────────
+# Factry 8.2 refuses most API calls without an x-organization-uuid header.
+echo "Looking up organization..."
+factry_api GET "/current-user/organizations"
+[ "$HTTP_CODE" = "200" ] || fail "Could not list organizations"
+ORG_UUID=$(FACTRY_ORG="${FACTRY_ORG:-}" python3 -c "
+import json, os, sys
+try:
+    orgs = json.load(open(sys.argv[1]))
+except ValueError:
+    sys.exit('ERROR: Unexpected answer to the organization lookup.')
+wanted = os.environ['FACTRY_ORG']
+if wanted:
+    match = [o for o in orgs if wanted in (o.get('UUID'), o.get('Name'))]
+else:
+    match = sorted(orgs, key=lambda o: bool(o.get('IsRoot')))
+if match:
+    print(match[0]['UUID'])
+else:
+    sys.exit('ERROR: No organization matches ' + repr(wanted) + '. Available: '
+             + ', '.join(o.get('Name', '?') for o in orgs))
+" "$RESP_FILE") || true
 
-    local args=(-s -b "$COOKIE_FILE" -H "x-xsrf-token: $XSRF")
-    if [ -n "$data" ]; then
-        args+=(-H "Content-Type: application/json" -d "$data")
-    fi
-    if [ "$method" != "GET" ]; then
-        args+=(-X "$method")
-    fi
-
-    curl "${args[@]}" "${FACTRY_URL}/api${path}"
-}
+if [ -z "$ORG_UUID" ]; then
+    exit 1
+fi
+echo "  Using organization: $ORG_UUID"
 
 # ── Get time series database UUID ─────────────────────────────────
 echo "Looking up time series database..."
-TSDB_RESP=$(factry_api GET "/timeseries-databases")
-echo "  Available TSDBs: $TSDB_RESP"
-TSDB_UUID=$(echo "$TSDB_RESP" | python3 -c "
+factry_api GET "/timeseries-databases"
+[ "$HTTP_CODE" = "200" ] || fail "Could not list time series databases"
+TSDB_UUID=$(python3 -c "
 import json, sys
-dbs = json.load(sys.stdin)
+dbs = json.load(open(sys.argv[1]))
 # Pick the first non-internal database, or the first one
 for db in dbs:
-    name = db.get('Name', '') or db.get('name', '')
-    if not name.startswith('_internal'):
-        print(db.get('UUID', '') or db.get('uuid', ''))
+    if not db.get('Name', '').startswith('_internal'):
+        print(db['UUID'])
         sys.exit(0)
 if dbs:
-    print(dbs[0].get('UUID', '') or dbs[0].get('uuid', ''))
-" 2>/dev/null)
+    print(dbs[0]['UUID'])
+" "$RESP_FILE" 2>/dev/null) || true
 
 if [ -z "$TSDB_UUID" ]; then
     echo "ERROR: No time series database found. Create one in Factry first."
@@ -77,57 +122,46 @@ fi
 echo "  Using TSDB: $TSDB_UUID"
 
 # ── Create collector ──────────────────────────────────────────────
+# Without a default database Factry leaves new measurements Discovered and stores nothing.
 echo "Creating collector '$COLLECTOR_NAME'..."
-COLLECTOR_RESP=$(factry_api POST "/collectors" \
-    "{\"Name\":\"${COLLECTOR_NAME}\",\"Description\":\"Ignition historian module\",\"TimeseriesDatabaseUUID\":\"${TSDB_UUID}\",\"Status\":\"Active\"}")
-
-COLLECTOR_UUID=$(echo "$COLLECTOR_RESP" | python3 -c "
+factry_api POST "/collectors" \
+    "{\"Name\":\"${COLLECTOR_NAME}\",\"Description\":\"Ignition historian module\",\"DefaultDatabaseUUID\":\"${TSDB_UUID}\",\"Status\":\"Active\"}"
+COLLECTOR_UUID=$(python3 -c "
 import json, sys
-try:
-    d = json.load(sys.stdin)
-    print(d.get('UUID', ''))
-except:
-    pass
-" 2>/dev/null)
+print(json.load(open(sys.argv[1])).get('UUID', ''))
+" "$RESP_FILE" 2>/dev/null) || true
 
-if [ -z "$COLLECTOR_UUID" ]; then
-    echo "ERROR: Failed to create collector."
-    echo "$COLLECTOR_RESP"
-    exit 1
+if [ "$HTTP_CODE" != "200" ] || [ -z "$COLLECTOR_UUID" ]; then
+    fail "Failed to create collector '$COLLECTOR_NAME'"
 fi
 echo "  Collector UUID: $COLLECTOR_UUID"
 
-# ── Generate token ────────────────────────────────────────────────
-echo "Generating collector token..."
-TOKEN_RESP=$(factry_api POST "/collectors/${COLLECTOR_UUID}/token")
-
-COLLECTOR_TOKEN=$(echo "$TOKEN_RESP" | python3 -c "
-import json, sys
+# ── Get token ─────────────────────────────────────────────────────
+echo "Getting collector token..."
+factry_api GET "/collectors/${COLLECTOR_UUID}/token"
+# The answer is {"token": "..."}; a bare JSON string or plain text is accepted too.
+# Written next to the other temp files first, so a failure never leaves half a token behind.
+if [ "$HTTP_CODE" = "200" ] && python3 -c "
+import json, re, sys
+raw = open(sys.argv[1]).read()
 try:
-    d = json.load(sys.stdin)
-    # The response might be the token string directly or wrapped in an object
-    if isinstance(d, str):
-        print(d)
-    elif 'Token' in d:
-        print(d['Token'])
-    elif 'token' in d:
-        print(d['token'])
-    else:
-        print(d)
-except:
-    # Maybe it's a plain string response
-    print(sys.stdin.read().strip())
-" 2>/dev/null)
-
-if [ -z "$COLLECTOR_TOKEN" ] || ! echo "$COLLECTOR_TOKEN" | grep -qE '^eyJ'; then
-    echo "ERROR: Failed to generate token."
-    echo "$TOKEN_RESP"
+    d = json.loads(raw)
+except ValueError:
+    d = raw.strip()
+if isinstance(d, dict):
+    d = d.get('token') or d.get('Token') or ''
+if not isinstance(d, str) or not re.fullmatch(r'eyJ[\w-]*\.[\w-]*\.[\w-]*', d):
+    sys.exit(1)
+open(sys.argv[2], 'w').write(d)
+" "$RESP_FILE" "$WORK_DIR/token" 2>/dev/null; then
+    mv "$WORK_DIR/token" "$TOKEN_FILE"
+    echo "  Token saved to $TOKEN_FILE"
+else
+    echo "ERROR: Collector '$COLLECTOR_NAME' ($COLLECTOR_UUID) was created, but its token could not be read (HTTP $HTTP_CODE)."
+    echo "  Copy the token from the collector in the Factry UI, or delete the collector there"
+    echo "  before running this script again (the name is taken)."
     exit 1
 fi
-
-# Save token
-echo -n "$COLLECTOR_TOKEN" > "$TOKEN_FILE"
-echo "  Token saved to $TOKEN_FILE"
 
 # Cleanup
 rm -f "$COOKIE_FILE" /tmp/factry-login-resp.txt
