@@ -633,6 +633,24 @@ public class MeasurementCache {
         settingsPending.addAll(tagPaths);
     }
 
+    /**
+     * The tag property {@code property} of the tag {@code tagPath} that reads {@code m}: from the
+     * metadata Ignition sent this gateway when {@code m} is the measurement this collector writes
+     * that tag to, else from the measurement setting {@code setting}. Null when neither has it.
+     * Another collector's measurement with the same name may be another gateway's tag, configured
+     * differently.
+     */
+    String tagProperty(String tagPath, Measurement m, String collectorUUID, String property, String setting) {
+        Map<String, String> metadata = tagMetadata.get(tagPath);
+        if (metadata != null && metadata.get(property) != null) {
+            Measurement target = writeTarget(tagPath, collectorUUID);
+            if (target != null && target.getUuid().equals(m.getUuid())) {
+                return metadata.get(property);
+            }
+        }
+        return stringSetting(m, setting);
+    }
+
     /** The measurement this collector writes {@code tagPath} to, or null when the cache has none. */
     Measurement writeTarget(String tagPath, String collectorUUID) {
         Measurement m = getMeasurementByName(tagPath);
