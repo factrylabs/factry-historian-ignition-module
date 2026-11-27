@@ -26,6 +26,7 @@ import java.util.Optional;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.stream.Collectors;
 
 public class FactryHistoryProvider extends AbstractHistorian<FactryHistorianSettings> {
@@ -377,6 +378,16 @@ public class FactryHistoryProvider extends AbstractHistorian<FactryHistorianSett
 
             logger.info("S&F engine '{}' created successfully", engineName);
             return EngineCreation.CREATED;
+        } catch (TimeoutException e) {
+            // push() writes the resource before it returns; its future only waits for the change
+            // listeners. When this profile is itself being started from a config change, those
+            // listeners queue behind us, so the wait times out although the engine is there.
+            if (engineResourceExists(configurationManager, engineName)) {
+                logger.info("S&F engine '{}' created; Ignition is still applying it", engineName);
+                return EngineCreation.CREATED_PENDING;
+            }
+            logger.error("Failed to create S&F engine '{}' — store-and-forward may not work", engineName, e);
+            return EngineCreation.FAILED;
         } catch (Exception e) {
             logger.error("Failed to create S&F engine '{}' — store-and-forward may not work", engineName, e);
             return EngineCreation.FAILED;
