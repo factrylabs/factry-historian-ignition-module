@@ -251,6 +251,7 @@ public class FactryHistoryProvider extends AbstractHistorian<FactryHistorianSett
             );
 
             // Refresh measurement cache from the new endpoint
+            measurementCache.forgetFactryVersion();
             measurementCache.refresh(grpcClient);
 
             // Update settings references in the engines
@@ -300,6 +301,10 @@ public class FactryHistoryProvider extends AbstractHistorian<FactryHistorianSett
         statusCheckedAt = System.currentTimeMillis();
         boolean connected = grpcClient.testConnection();
         cachedStatus = connected ? ProfileStatus.RUNNING : ProfileStatus.ERRORED;
+        if (!connected) {
+            // Factry may come back upgraded: read its version again before MigrateSettings.
+            measurementCache.forgetFactryVersion();
+        }
 
         // Toggle S&F sink: when Factry is down, stop accepting so points stay in pending.
         // When Factry is back, re-initialize so forwarding resumes.
@@ -431,6 +436,11 @@ public class FactryHistoryProvider extends AbstractHistorian<FactryHistorianSett
             }
         } catch (Exception e) {
             logger.warn("Failed to refresh measurement cache: " + e.getMessage());
+        }
+        try {
+            measurementCache.syncTagSettings(grpcClient);
+        } catch (Exception e) {
+            logger.warn("Failed to store the settings derived from the tags: " + e.getMessage());
         }
     }
 

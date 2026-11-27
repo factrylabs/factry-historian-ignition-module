@@ -17,8 +17,11 @@ import io.factry.historian.proto.HealthUpdates;
 import com.google.protobuf.Empty;
 import com.google.protobuf.Struct;
 import io.factry.historian.proto.HistorianGrpc;
+import io.factry.historian.proto.HistorianInfo;
 import io.factry.historian.proto.MeasurementRequest;
 import io.factry.historian.proto.Measurements;
+import io.factry.historian.proto.MigrateMeasurementSettings;
+import io.factry.historian.proto.MigrationRequest;
 import io.factry.historian.proto.Points;
 import io.factry.historian.proto.QueryTimeseriesRequest;
 import io.factry.historian.proto.QueryTimeseriesResponse;
@@ -71,6 +74,7 @@ public class FactryGrpcClient {
     private volatile ManagedChannel channel;
     private volatile HistorianGrpc.HistorianBlockingStub blockingStub;
     private volatile boolean connected = true;
+    private volatile String collectorUUID;
 
     public FactryGrpcClient(String host, int port, String collectorUUID, String token,
                             boolean useTls, boolean skipTlsVerification, String customCaCert) {
@@ -193,6 +197,55 @@ public class FactryGrpcClient {
         }
     }
 
+    /** The UUID of the collector this client writes as. */
+    public String getCollectorUUID() {
+        return collectorUUID;
+    }
+
+    /**
+     * Replaces the settings of these measurements, each with the whole Struct given, with
+     * MigrateSettings. That call also replaces the collector's own settings with its field 1, and
+     * an unset field 1 wipes them (checked live on Factry v8.2.3 and v8.3.1), so the collector's
+     * current settings are read with GetCollector just before and sent along unchanged.
+     */
+    public void migrateMeasurementSettings(List<MigrateMeasurementSettings> settings) {
+        logger.debug("Sending MigrateSettings for {} measurements", settings.size());
+        channelLock.readLock().lock();
+        try {
+            Struct collectorSettings = blockingStub
+                    .withDeadlineAfter(WRITE_DEADLINE_SECONDS, TimeUnit.SECONDS)
+                    .getCollector(Empty.getDefaultInstance())
+                    .getSettings();
+            blockingStub
+                    .withDeadlineAfter(WRITE_DEADLINE_SECONDS, TimeUnit.SECONDS)
+                    .migrateSettings(MigrationRequest.newBuilder()
+                            .setSettings(collectorSettings)
+                            .addAllMeasurementSettings(settings)
+                            .build());
+        } catch (StatusRuntimeException e) {
+            Status.Code code = e.getStatus().getCode();
+            if (code == Status.Code.UNAVAILABLE || code == Status.Code.DEADLINE_EXCEEDED) {
+                connected = false;
+            }
+            throw e;
+        } finally {
+            channelLock.readLock().unlock();
+        }
+    }
+
+    /** Factry's version, among others. */
+    public HistorianInfo getInfo() {
+        logger.debug("Sending GetInfo");
+        channelLock.readLock().lock();
+        try {
+            return blockingStub
+                    .withDeadlineAfter(WRITE_DEADLINE_SECONDS, TimeUnit.SECONDS)
+                    .getInfo(Empty.getDefaultInstance());
+        } finally {
+            channelLock.readLock().unlock();
+        }
+    }
+
     public CreateMeasurementsReply createMeasurements(CreateMeasurementsRequest request) {
         logger.debug("Sending CreateMeasurements with {} measurements", request.getMeasurementsCount());
         channelLock.readLock().lock();
@@ -268,6 +321,7 @@ public class FactryGrpcClient {
                     .build();
         }
 
+        this.collectorUUID = collectorUUID;
         Metadata headers = new Metadata();
         headers.put(COLLECTOR_UUID_KEY, collectorUUID);
         headers.put(AUTHORIZATION_KEY, "Bearer " + token);
