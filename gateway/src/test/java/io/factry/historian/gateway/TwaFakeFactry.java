@@ -51,6 +51,10 @@ class TwaFakeFactry extends FactryGrpcClient {
     /** Requests that include one of these measurements fail, as Factry fails a whole request. */
     final java.util.Set<String> failingMeasurements = new java.util.HashSet<>();
 
+    /** Requests that match {@link #failWhen} fail with this status, when set. */
+    Status failWith = null;
+    java.util.function.Predicate<QueryTimeseriesRequest> failWhen = q -> true;
+
     TwaFakeFactry() {
         super("localhost", 1, "collector", "token", false, false, null);
     }
@@ -72,6 +76,20 @@ class TwaFakeFactry extends FactryGrpcClient {
         return addMeasurement(Measurement.newBuilder().setName(name).setDatatype(datatype)
                 .setSettings(Struct.newBuilder().putFields(MeasurementCache.IGNITION_DATA_TYPE_SETTING,
                         Value.newBuilder().setStringValue(ignitionDataType).build())));
+    }
+
+    /** Sets a string setting of a measurement, keeping its other settings. */
+    void setSetting(String uuid, String name, String value) {
+        Measurement m = measurements.get(uuid);
+        measurements.put(uuid, m.toBuilder().setSettings(m.getSettings().toBuilder()
+                .putFields(name, Value.newBuilder().setStringValue(value).build())).build());
+    }
+
+    /** Adds a measurement of another collector, without settings. */
+    String addMeasurementOf(String collector, String name, String datatype) {
+        String uuid = addMeasurement(name, datatype);
+        measurements.put(uuid, measurements.get(uuid).toBuilder().setCollectorUUID(collector).build());
+        return uuid;
     }
 
     private String addMeasurement(Measurement.Builder m) {
@@ -145,6 +163,9 @@ class TwaFakeFactry extends FactryGrpcClient {
     @Override
     public QueryTimeseriesResponse queryTimeseries(QueryTimeseriesRequest request) {
         queries.add(request);
+        if (failWith != null && failWhen.test(request)) {
+            throw failWith.asRuntimeException();
+        }
         if (request.getMeasurementUUIDsList().stream().anyMatch(failingMeasurements::contains)) {
             throw Status.UNKNOWN.withDescription("measurement not found").asRuntimeException();
         }

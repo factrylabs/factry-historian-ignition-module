@@ -122,6 +122,125 @@ final class FakeFactryServer extends HistorianGrpc.HistorianImplBase implements 
         return uuid;
     }
 
+    /** Adds an Active measurement of {@code collector} with these settings and returns its UUID. */
+    String addMeasurement(String name, String datatype, String collector, Struct settings) {
+        String uuid = "uuid-" + (measurements.size() + 1);
+        measurements.put(uuid, Measurement.newBuilder().setUuid(uuid).setName(name).setStatus("active")
+                .setDatatype(datatype).setCollectorUUID(collector).setSettings(settings).build());
+        points.put(uuid, new ArrayList<>());
+        return uuid;
+    }
+
+    Measurement measurement(String uuid) {
+        return measurements.get(uuid);
+    }
+
+    /** Sets a measurement's status and updatedAt, as a change in Factry does. */
+    void change(String uuid, String status, long updatedAtMs) {
+        Measurement m = measurements.get(uuid);
+        measurements.put(uuid, m.toBuilder().setStatus(status)
+                .setUpdatedAt(com.google.protobuf.util.Timestamps.fromMillis(updatedAtMs)).build());
+    }
+
+    /** Runs inside every MigrateSettings call, before it answers; tests race the cache with it. */
+    volatile Runnable onMigrate = null;
+
+    /** Changes a measurement's settings as an operator in Factry would: its updatedAt moves. */
+    void editSettings(String uuid, Struct settings) {
+        servedByGetMeasurements.remove(uuid);
+        Measurement m = measurements.get(uuid);
+        measurements.put(uuid, m.toBuilder().setSettings(settings)
+                .setUpdatedAt(com.google.protobuf.util.Timestamps.fromMillis(System.currentTimeMillis())).build());
+    }
+
+    /** Measurements GetMeasurementsByFilter leaves out, though they exist. */
+    final java.util.Set<String> hiddenFromListing = java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    /** When set, GetMeasurementsByFilter fails with this status. */
+    volatile Status filterFailure = null;
+
+    /** Every GetMeasurementsByFilter call, in order. */
+    final List<GetMeasurementsByFilterRequest> filterRequests = new CopyOnWriteArrayList<>();
+
+    /**
+     * Per measurement, the settings GetMeasurements serves: those from before the first
+     * MigrateSettings, as Factry v8.3.1 does (checked live); an operator's edit replaces them.
+     */
+    private final Map<String, Struct> servedByGetMeasurements = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** Every GetMeasurements call, in order. */
+    final List<io.factry.historian.proto.MeasurementRequest> measurementRequests = new CopyOnWriteArrayList<>();
+    /** When set, GetMeasurements fails with this status. */
+    volatile Status getMeasurementsFailure = null;
+
+    /** This collector's measurements changed after {@code since} (all without it), as Factry answers. */
+    @Override
+    public void getMeasurements(io.factry.historian.proto.MeasurementRequest request,
+                                StreamObserver<Measurements> observer) {
+        measurementRequests.add(request);
+        if (getMeasurementsFailure != null) {
+            observer.onError(getMeasurementsFailure.asRuntimeException());
+            return;
+        }
+        Measurements.Builder out = Measurements.newBuilder();
+        for (Measurement m : measurements.values()) {
+            boolean changed = !request.hasSince() || (m.hasUpdatedAt()
+                    && com.google.protobuf.util.Timestamps.compare(m.getUpdatedAt(), request.getSince()) > 0);
+            if (m.getCollectorUUID().equals(request.getCollectorUUID()) && changed) {
+                Struct served = servedByGetMeasurements.get(m.getUuid());
+                out.addMeasurements(served == null ? m : m.toBuilder().setSettings(served).build());
+            }
+        }
+        observer.onNext(out.setTotal(out.getMeasurementsCount()).build());
+        observer.onCompleted();
+    }
+
+    /** When set, GetInfo fails with this status. */
+    volatile Status getInfoFailure = null;
+
+    /** The version GetInfo reports. */
+    volatile String version = "v8.3.1";
+
+    @Override
+    public void getInfo(com.google.protobuf.Empty request, StreamObserver<io.factry.historian.proto.HistorianInfo> observer) {
+        if (getInfoFailure != null) {
+            observer.onError(getInfoFailure.asRuntimeException());
+            return;
+        }
+        observer.onNext(io.factry.historian.proto.HistorianInfo.newBuilder().setVersion(version).setApiVersion("1.1.0").build());
+        observer.onCompleted();
+    }
+
+    /** Every MigrateSettings call, in order. */
+    final List<io.factry.historian.proto.MigrationRequest> migrations = new CopyOnWriteArrayList<>();
+    /** When set, MigrateSettings fails with this status, as a proxy that refuses it does. */
+    volatile Status migrateFailure = null;
+
+    @Override
+    public void migrateSettings(io.factry.historian.proto.MigrationRequest request,
+                                StreamObserver<com.google.protobuf.Empty> observer) {
+        migrations.add(request);
+        if (onMigrate != null) {
+            onMigrate.run();
+        }
+        if (migrateFailure != null) {
+            observer.onError(migrateFailure.asRuntimeException());
+            return;
+        }
+        // Factry replaces the collector's settings with field 1, unset or not, and each
+        // measurement's whole settings Struct (checked live on v8.2.3 and v8.3.1).
+        collectorSettings = request.getSettings();
+        for (var change : request.getMeasurementSettingsList()) {
+            Measurement m = measurements.get(change.getMeasurementUUID());
+            if (m != null) {
+                servedByGetMeasurements.putIfAbsent(m.getUuid(), m.getSettings());
+                measurements.put(m.getUuid(), m.toBuilder().setSettings(change.getSettings()).build());
+            }
+        }
+        observer.onNext(com.google.protobuf.Empty.getDefaultInstance());
+        observer.onCompleted();
+    }
+
     void addPoint(String uuid, long ts, Value value, String status) {
         points.get(uuid).add(new Pt(ts, value, status));
     }
@@ -133,7 +252,20 @@ final class FakeFactryServer extends HistorianGrpc.HistorianImplBase implements 
     @Override
     public void getMeasurementsByFilter(GetMeasurementsByFilterRequest request,
                                         StreamObserver<Measurements> observer) {
-        List<Measurement> all = new ArrayList<>(measurements.values());
+        filterRequests.add(request);
+        if (filterFailure != null) {
+            observer.onError(filterFailure.asRuntimeException());
+            return;
+        }
+        // As Factry 8.3.1 matches it (checked live): a full UUID exactly, else a name ignoring case.
+        String keyword = request.hasKeyword() ? request.getKeyword().toLowerCase(java.util.Locale.ROOT) : null;
+        List<Measurement> all = new ArrayList<>(measurements.values().stream()
+                .filter(m -> keyword == null || m.getUuid().equalsIgnoreCase(keyword)
+                        || m.getName().toLowerCase(java.util.Locale.ROOT).contains(keyword))
+                .filter(m -> !hiddenFromListing.contains(m.getUuid()))
+                .filter(m -> request.getCollectorUUIDsCount() == 0
+                        || request.getCollectorUUIDsList().contains(m.getCollectorUUID()))
+                .toList());
         int from = (int) Math.min(all.size(), request.getPagination().getOffset());
         int to = (int) Math.min(all.size(), from + request.getPagination().getLimit());
         observer.onNext(Measurements.newBuilder().addAllMeasurements(all.subList(from, to))
@@ -185,9 +317,13 @@ final class FakeFactryServer extends HistorianGrpc.HistorianImplBase implements 
     /** The connection check. */
     @Override
     public void getCollector(com.google.protobuf.Empty request, StreamObserver<io.factry.historian.proto.Collector> observer) {
-        observer.onNext(io.factry.historian.proto.Collector.newBuilder().setUuid("collector").build());
+        observer.onNext(io.factry.historian.proto.Collector.newBuilder().setUuid("collector")
+                .setSettings(collectorSettings).build());
         observer.onCompleted();
     }
+
+    /** The collector's own settings; MigrateSettings replaces them with its field 1, as Factry does. */
+    volatile Struct collectorSettings = Struct.getDefaultInstance();
 
     @Override
     public void getAssets(GetAssetsRequest request, StreamObserver<Assets> observer) {

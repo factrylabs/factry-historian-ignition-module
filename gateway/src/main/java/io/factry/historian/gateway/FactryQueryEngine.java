@@ -28,6 +28,7 @@ import com.inductiveautomation.historian.gateway.api.query.processor.DefaultProc
 import com.inductiveautomation.historian.gateway.api.query.processor.MetadataPointProcessor;
 import com.inductiveautomation.historian.gateway.api.query.processor.ProcessingContext;
 import com.inductiveautomation.historian.gateway.api.query.processor.RawPointProcessor;
+import com.inductiveautomation.ignition.common.FillMode;
 import com.inductiveautomation.ignition.common.QualifiedPath;
 import com.inductiveautomation.ignition.common.StringPath;
 import com.inductiveautomation.ignition.common.browsing.BrowseFilter;
@@ -39,6 +40,7 @@ import com.inductiveautomation.ignition.common.model.values.QualityCode;
 import com.inductiveautomation.ignition.common.sqltags.history.AggregationMode;
 import com.inductiveautomation.ignition.common.sqltags.model.types.DataType;
 import com.inductiveautomation.ignition.common.sqltags.model.types.DataTypeClass;
+import com.inductiveautomation.ignition.common.tags.config.properties.TagHistoryProps;
 import com.inductiveautomation.ignition.common.util.LoggerEx;
 import com.inductiveautomation.ignition.gateway.model.GatewayContext;
 
@@ -984,11 +986,12 @@ public class FactryQueryEngine extends AbstractQueryEngine {
                     }
                     // Count stays a number; every other aggregate of a date is itself a date.
                     boolean asDate = dateTime && !"Count".equals(aggName);
+                    boolean linear = fillMode(key, node) == FillMode.LINEAR;
 
                     String factryFunction = "MinMax".equals(aggName) ? null : toFactryAggregateFunction(aggName);
                     if (TIME_WEIGHTED_AVERAGE.equals(factryFunction) && options.getTimeRange().isPresent()) {
                         pointCount += queryTimeWeightedAverage(uuid, source, key, period,
-                                periodMs, dataType == DataType.Boolean, asDate, options, pts);
+                                periodMs, dataType == DataType.Boolean, asDate, linear, options, pts);
                     } else if ("count".equals(factryFunction) && options.getTimeRange().isPresent()) {
                         pointCount += queryCount(uuid, source, key, period, periodMs, options, pts);
                     } else if ("count".equals(factryFunction) || TIME_WEIGHTED_AVERAGE.equals(factryFunction)) {
@@ -998,7 +1001,7 @@ public class FactryQueryEngine extends AbstractQueryEngine {
                         // MinMax asks Factry for min and max, and gives each bucket both.
                         List<String> functions = factryFunction == null ? List.of("min", "max") : List.of(factryFunction);
                         pointCount += queryEveryBucket(uuid, element, source, key, functions, period, periodMs,
-                                options, pts, asDate);
+                                options, pts, asDate, linear);
                     }
                     pointsByKey.put(key, pts);
                 } catch (Exception e) {
@@ -1189,27 +1192,58 @@ public class FactryQueryEngine extends AbstractQueryEngine {
      */
     private int queryTimeWeightedAverage(
             String uuid, QualifiedPath source, AggregatedQueryKey key, String period, long periodMs,
-            boolean isBoolean, boolean asDate, AggregatedQueryOptions options, List<AggregatedPoint<?, ?>> out) {
+            boolean isBoolean, boolean asDate, boolean linear, AggregatedQueryOptions options,
+            List<AggregatedPoint<?, ?>> out) {
 
         long startMs = options.getTimeRange().get().startTime().toEpochMilli();
         long rangeEndMs = options.getTimeRange().get().endTime().toEpochMilli();
+        Set<Long> withSamples = new HashSet<>();
+        java.util.concurrent.atomic.AtomicReference<List<BucketFill.Sample>> before =
+                new java.util.concurrent.atomic.AtomicReference<>();
         Map<Long, GoodTimeAverage.Result> values =
-                timeWeightedAverage(uuid, period, periodMs, isBoolean, startMs, rangeEndMs);
+                timeWeightedAverage(uuid, period, periodMs, isBoolean, startMs, rangeEndMs, withSamples, before);
+
+        List<Long> starts = new ArrayList<>();
+        for (long b = startMs; b < rangeEndMs; b += periodMs) {
+            starts.add(b);
+        }
+        Object[] linearValues = new Object[starts.size()];
+        boolean[] empty = new boolean[starts.size()];
+        for (int i = 0; i < starts.size(); i++) {
+            GoodTimeAverage.Result r = values.getOrDefault(starts.get(i), GoodTimeAverage.Result.BAD);
+            linearValues[i] = r.isBad() ? null : r.value();
+            empty[i] = !r.isBad() && !withSamples.contains(starts.get(i));
+        }
+        if (linear) {
+            // Factry's twa holds the last value through buckets without samples; an analog tag
+            // gets the straight line between its samples instead. The average of a line over a
+            // bucket is its value at the middle of the part averaged: up to the range end or now.
+            long endMs = Math.min(rangeEndMs, now.getAsLong());
+            long[] at = new long[starts.size()];
+            for (int i = 0; i < at.length; i++) {
+                long b = starts.get(i);
+                at[i] = b + (Math.min(b + periodMs, endMs) - b) / 2;
+            }
+            fillLinear(uuid, -1, at, empty, startMs, rangeEndMs, periodMs, before.get(),
+                    new Object[][]{linearValues});
+        }
 
         // Every bucket gets a point. Ignition fills a bucket without one with a neighbouring
         // value marked Good (checked through its own query path), so a bucket left out would
         // read as a held Good value: in an outage, before the first sample and after now. A
         // bucket without Good time is a Bad point instead, which the Power Chart draws as a gap.
         int count = 0;
-        for (long b = startMs; b < rangeEndMs; b += periodMs) {
+        for (int i = 0; i < starts.size(); i++) {
+            long b = starts.get(i);
             GoodTimeAverage.Result r = values.getOrDefault(b, GoodTimeAverage.Result.BAD);
+            Object value = linearValues[i];
             out.add(
                     AggregatedDataPoint.<Object, AggregationType>builder(source, key.aggregationType())
                             // A DateTime tag is stored as epoch ms; its average is a date too.
                             // A Bad bucket has no value. Not NaN: the Power Chart streams history
                             // as strict JSON, which throws at a NaN and cuts the response off. A
                             // null reads as 0.0 in a Float column, but its quality stays Bad.
-                            .value(r.isBad() ? null : asDate ? toDate(r.value()) : r.value())
+                            .value(r.isBad() ? null : asDate ? toDate(value) : value)
                             // A numeric fallback is Good: the Power Chart drops points that are
                             // not Good, and the twa over Good samples bridges Bad time inside the
                             // bucket, as Ignition's own average does there. A Boolean fallback is
@@ -1226,7 +1260,8 @@ public class FactryQueryEngine extends AbstractQueryEngine {
 
     /** The average per bucket start; buckets without Good time are Bad or absent. */
     private Map<Long, GoodTimeAverage.Result> timeWeightedAverage(
-            String uuid, String period, long periodMs, boolean isBoolean, long startMs, long rangeEndMs) {
+            String uuid, String period, long periodMs, boolean isBoolean, long startMs, long rangeEndMs,
+            Set<Long> withSamples, java.util.concurrent.atomic.AtomicReference<List<BucketFill.Sample>> before) {
         // Stop at now. Fill "previous" would carry the last value into future buckets and weight
         // it up to the bucket end, while Ignition's own Average has no value after now (its
         // interpolator returns nothing past the current time). Factry weights the last bucket
@@ -1264,6 +1299,7 @@ public class FactryQueryEngine extends AbstractQueryEngine {
                         .add(good, toDouble(pt.getValue()));
             }
         }
+        withSamples.addAll(statuses.keySet());
 
         Map<Long, Double> goodMean = new HashMap<>();
         if (isBoolean) {
@@ -1284,6 +1320,8 @@ public class FactryQueryEngine extends AbstractQueryEngine {
         }
 
         GoodTimeAverage.Sample seed = sampleBefore(uuid, startMs);
+        // Read once: the line through the first empty buckets starts here too.
+        before.set(seed == null ? List.of() : List.of(new BucketFill.Sample(seed.ts(), seed.value(), seed.good())));
 
         GoodTimeAverage.Source factry = new GoodTimeAverage.Source() {
             @Override
@@ -1456,7 +1494,7 @@ public class FactryQueryEngine extends AbstractQueryEngine {
     private int queryEveryBucket(
             String uuid, int element, QualifiedPath source, AggregatedQueryKey key, List<String> functions,
             String period, long periodMs, AggregatedQueryOptions options,
-            List<AggregatedPoint<?, ?>> out, boolean asDate) {
+            List<AggregatedPoint<?, ?>> out, boolean asDate, boolean linear) {
         TimeRange range = options.getTimeRange()
                 .orElseThrow(() -> new IllegalArgumentException("an aggregated read needs a time range"));
         long startMs = range.startTime().toEpochMilli();
@@ -1491,17 +1529,54 @@ public class FactryQueryEngine extends AbstractQueryEngine {
             }
         }
 
-        List<BucketFill.Bucket> buckets = BucketFill.fill(startMs, rangeEndMs, periodMs, nowMs, statuses,
-                ts -> samplesBefore(uuid, element, ts), RAW_BUDGET.seedReadsPerPen(), functions.contains("last"));
-        int count = 0;
-        for (BucketFill.Bucket bucket : buckets) {
-            for (int f = 0; f < functions.size(); f++) {
-                String function = functions.get(f);
-                Object value = switch (bucket.kind()) {
+        // The samples before the range, kept for the line through the first empty buckets.
+        List<List<BucketFill.Sample>> beforeRange = new ArrayList<>();
+        List<BucketFill.Bucket> buckets = BucketFill.fill(startMs, rangeEndMs, periodMs, nowMs, statuses, ts -> {
+            List<BucketFill.Sample> before = samplesBefore(uuid, element, ts);
+            if (ts == startMs) {
+                beforeRange.add(before);
+            }
+            return before;
+        }, RAW_BUDGET.seedReadsPerPen(), functions.contains("last"));
+        Object[][] values = new Object[functions.size()][buckets.size()];
+        for (int f = 0; f < functions.size(); f++) {
+            String function = functions.get(f);
+            for (int i = 0; i < buckets.size(); i++) {
+                BucketFill.Bucket bucket = buckets.get(i);
+                values[f][i] = switch (bucket.kind()) {
                     case GOOD_SAMPLES -> "last".equals(function) ? bucket.value() : good.get(f).get(bucket.start());
                     case HELD -> heldValue(function, bucket.value());
                     case BAD -> null;
                 };
+            }
+        }
+        if (linear) {
+            // One value for every function: the line's at the bucket end (or now), stamped at the
+            // bucket start, as Ignition's own historians give an empty analog block (its
+            // LastValue and MinMax see the line at the block start and end, and keep the end).
+            // The value at the start would kink the line at every sample.
+            long blockEndMs = Math.min(rangeEndMs, nowMs);
+            long[] at = new long[buckets.size()];
+            boolean[] empty = new boolean[buckets.size()];
+            for (int i = 0; i < buckets.size(); i++) {
+                at[i] = Math.min(buckets.get(i).start() + periodMs, blockEndMs);
+                empty[i] = buckets.get(i).kind() == BucketFill.Kind.HELD;
+            }
+            List<Object[]> interpolated = new ArrayList<>();
+            for (int f = 0; f < functions.size(); f++) {
+                if (INTERPOLATED.contains(functions.get(f))) {
+                    interpolated.add(values[f]);
+                }
+            }
+            fillLinear(uuid, element, at, empty, startMs, rangeEndMs, periodMs,
+                    beforeRange.isEmpty() ? null : beforeRange.get(0), interpolated.toArray(new Object[0][]));
+        }
+        int count = 0;
+        for (int i = 0; i < buckets.size(); i++) {
+            BucketFill.Bucket bucket = buckets.get(i);
+            for (int f = 0; f < functions.size(); f++) {
+                String function = functions.get(f);
+                Object value = values[f][i];
                 // No value is a Bad point. Not NaN: the Power Chart streams history as strict
                 // JSON, which throws at a NaN (a variance of one sample can be one). A null
                 // reads as 0.0 in a Float column, but its quality stays Bad.
@@ -1519,6 +1594,235 @@ public class FactryQueryEngine extends AbstractQueryEngine {
             }
         }
         return count;
+    }
+
+    /**
+     * The functions whose empty buckets an analog tag fills on the straight line between its
+     * neighbours. A sum, spread, variance or standard deviation of an empty bucket stays as it is
+     * (see {@link #heldValue}), as Ignition's own historians never interpolate those.
+     */
+    private static final Set<String> INTERPOLATED = Set.of("min", "max", "mean", "last");
+
+    /**
+     * Up to this many runs of empty buckets, each gets two one-sample reads; with more, the span
+     * from the first run to the last is read raw once. Tests change it.
+     */
+    int linearEdgeReadRuns = 4;
+
+    /**
+     * Most samples per status in that one raw read; a span holding more (a dense tag with a few
+     * gaps) falls back to the one-sample reads, capped by {@link #linearRunsPerPen}. Tests lower it.
+     */
+    int linearRawLimit = 10_000;
+
+    /** Most runs read with one-sample reads per analog pen; the rest hold. Tests lower it. */
+    int linearRunsPerPen = 10;
+
+    /** Whether a failed read around empty buckets was logged; it only costs the line. */
+    private volatile boolean linearReadFailureLogged;
+
+    /**
+     * Gives each empty bucket of an analog tag one value, for every function alike (a minimum,
+     * maximum, mean or last value of an empty bucket are all the same), on the straight line
+     * from the last sample before its run of empty buckets to the first sample after it, each at
+     * its own time, as Ignition's own historians interpolate an analog tag.
+     *
+     * <p>Those samples: with up to {@link #linearEdgeReadRuns} runs, two small reads per run, the
+     * last sample before it (descending, limit 1 per status) and the first after it (ascending,
+     * limit 1 per status). With more (a tag stored once a minute in a chart of 300 points has a
+     * run between every two samples), one raw read from the bucket before the first run to the
+     * bucket after the last, limit {@link #linearRawLimit} per status; when it reaches the limit,
+     * the small reads again, for at most {@link #linearRunsPerPen} runs. The first run reuses the
+     * sample before the range when already read, and after a past range the first sample after
+     * it is read up to now. The line needs the latest sample on each side to be Good (else Bad
+     * time), and a sample after the run: toward now nothing is extrapolated. A run without that,
+     * past the cap, or whose read fails keeps the value it had (held): the line is never worth
+     * failing a pen.
+     *
+     * @param at      per bucket, the time whose value on the line it gets
+     * @param empty   per bucket, whether it has no samples and holds a Good value
+     * @param before  the samples before the range when already read, else null
+     * @param columns per function to fill, its value per bucket; replaced in place
+     */
+    private void fillLinear(String uuid, int element, long[] at, boolean[] empty, long startMs,
+                            long rangeEndMs, long periodMs, List<BucketFill.Sample> before, Object[][] columns) {
+        if (columns.length == 0) {
+            return;
+        }
+        long nowMs = now.getAsLong();
+        long endMs = Math.min(rangeEndMs, nowMs);
+        List<int[]> runs = new ArrayList<>();
+        for (int i = 0; i < empty.length; i++) {
+            if (empty[i]) {
+                int j = i;
+                while (j + 1 < empty.length && empty[j + 1]) {
+                    j++;
+                }
+                runs.add(new int[]{i, j});
+                i = j;
+            }
+        }
+        if (runs.isEmpty()) {
+            return;
+        }
+        // The samples on each side of each run, as [before, after]; null where not read.
+        List<BucketFill.Sample[]> sides;
+        try {
+            sides = runs.size() > linearEdgeReadRuns
+                    ? spanSides(uuid, element, runs, empty.length, startMs, rangeEndMs, periodMs, before)
+                    : null;
+            if (sides == null) {
+                sides = new ArrayList<>();
+                for (int r = 0; r < runs.size(); r++) {
+                    sides.add(r < linearRunsPerPen
+                            ? edgeSides(uuid, element, runs.get(r), empty.length, startMs, rangeEndMs, periodMs, before)
+                            : null);
+                }
+            }
+        } catch (RuntimeException e) {
+            if (!linearReadFailureLogged) {
+                linearReadFailureLogged = true;
+                logger.debug("Could not read the samples around empty buckets of " + uuid
+                        + "; they hold their value instead (logged once)", e);
+            }
+            return;
+        }
+        for (int r = 0; r < runs.size(); r++) {
+            BucketFill.Sample[] side = sides.get(r);
+            if (side == null) {
+                continue;
+            }
+            for (int k = runs.get(r)[0]; k <= runs.get(r)[1]; k++) {
+                Double v = lineAt(at[k], side[0], side[1]);
+                if (v != null) {
+                    for (Object[] column : columns) {
+                        column[k] = v;
+                    }
+                }
+            }
+        }
+    }
+
+    /** Where the samples after a run are looked for: up to this time (the run's end when none). */
+    private static long afterEnd(int last, int buckets, long runEnd, long periodMs, long endMs, long rangeEndMs,
+                                 long nowMs) {
+        return last + 1 < buckets ? Math.min(runEnd + periodMs, endMs) : rangeEndMs < nowMs ? nowMs : runEnd;
+    }
+
+    /** The samples on each side of one run, from two one-sample reads. */
+    private BucketFill.Sample[] edgeSides(String uuid, int element, int[] run, int buckets, long startMs,
+                                          long rangeEndMs, long periodMs, List<BucketFill.Sample> before) {
+        long nowMs = now.getAsLong();
+        long endMs = Math.min(rangeEndMs, nowMs);
+        long runStart = startMs + run[0] * periodMs;
+        long runEnd = Math.min(startMs + (run[1] + 1) * periodMs, endMs);
+        long afterEnd = afterEnd(run[1], buckets, runEnd, periodMs, endMs, rangeEndMs, nowMs);
+        // The bucket before a run has samples; before the range, the last one may be old.
+        BucketFill.Sample a = latest(run[0] > 0 ? edgeSamples(uuid, element, runStart - periodMs, runStart, true)
+                : before != null ? before : samplesBefore(uuid, element, runStart));
+        BucketFill.Sample b = afterEnd > runEnd ? earliest(edgeSamples(uuid, element, runEnd, afterEnd, false)) : null;
+        return new BucketFill.Sample[]{a, b};
+    }
+
+    /**
+     * The samples on each side of every run, from one raw read of the span they cover; null when
+     * the span holds more than {@link #linearRawLimit} samples of one status.
+     */
+    private List<BucketFill.Sample[]> spanSides(String uuid, int element, List<int[]> runs, int buckets,
+                                                long startMs, long rangeEndMs, long periodMs,
+                                                List<BucketFill.Sample> before) {
+        long nowMs = now.getAsLong();
+        long endMs = Math.min(rangeEndMs, nowMs);
+        int[] firstRun = runs.get(0);
+        int[] lastRun = runs.get(runs.size() - 1);
+        long from = startMs + Math.max(0, firstRun[0] - 1) * periodMs;
+        long lastEnd = Math.min(startMs + (lastRun[1] + 1) * periodMs, endMs);
+        long to = Math.min(lastEnd + periodMs, endMs);
+        List<BucketFill.Sample> samples = new ArrayList<>();
+        if (to > from) {
+            QueryTimeseriesResponse reply = grpcClient.queryTimeseries(withRange(QueryTimeseriesRequest.newBuilder()
+                    .addMeasurementUUIDs(uuid).addGroupBy("status").setLimit(linearRawLimit), from, to).build());
+            for (Series series : reply.getSeriesList()) {
+                if (series.getDataPointsCount() >= linearRawLimit) {
+                    return null;
+                }
+                boolean isGood = isGoodStatus(seriesStatus(series));
+                for (SeriesPoint pt : series.getDataPointsList()) {
+                    samples.add(new BucketFill.Sample(pt.getTimestamp(), storedValue(pt.getValue(), element), isGood));
+                }
+            }
+        }
+        if (firstRun[0] == 0) {
+            samples.addAll(before != null ? before : samplesBefore(uuid, element, startMs));
+        }
+        if (lastRun[1] == buckets - 1 && rangeEndMs < nowMs) {
+            samples.addAll(edgeSamples(uuid, element, rangeEndMs, nowMs, false));
+        }
+        samples.sort(Comparator.comparingLong(BucketFill.Sample::ts));
+        List<BucketFill.Sample[]> out = new ArrayList<>();
+        int next = 0;
+        for (int[] run : runs) {
+            long runStart = startMs + run[0] * periodMs;
+            long runEnd = Math.min(startMs + (run[1] + 1) * periodMs, endMs);
+            while (next < samples.size() && samples.get(next).ts() < runStart) {
+                next++;
+            }
+            BucketFill.Sample a = next > 0 ? samples.get(next - 1) : null;
+            // The run has no samples, so the first at or after its start is the first after it,
+            // unless toward now (nothing after a range that ends at or after now).
+            BucketFill.Sample b = next < samples.size()
+                    && afterEnd(run[1], buckets, runEnd, periodMs, endMs, rangeEndMs, nowMs) > runEnd
+                    ? samples.get(next) : null;
+            out.add(new BucketFill.Sample[]{a, b});
+        }
+        return out;
+    }
+
+    /** The last ({@code desc}) or first sample of each status in [from, to). */
+    private List<BucketFill.Sample> edgeSamples(String uuid, int element, long fromMs, long toMs, boolean desc) {
+        List<BucketFill.Sample> out = new ArrayList<>();
+        for (Series series : grpcClient.queryTimeseries(withRange(QueryTimeseriesRequest.newBuilder()
+                .addMeasurementUUIDs(uuid).addGroupBy("status").setDesc(desc).setLimit(1), fromMs, toMs).build())
+                .getSeriesList()) {
+            boolean isGood = isGoodStatus(seriesStatus(series));
+            for (SeriesPoint pt : series.getDataPointsList()) {
+                out.add(new BucketFill.Sample(pt.getTimestamp(), storedValue(pt.getValue(), element), isGood));
+            }
+        }
+        return out;
+    }
+
+    private static BucketFill.Sample latest(List<BucketFill.Sample> samples) {
+        BucketFill.Sample out = null;
+        for (BucketFill.Sample s : samples) {
+            if (out == null || s.ts() > out.ts()) {
+                out = s;
+            }
+        }
+        return out;
+    }
+
+    private static BucketFill.Sample earliest(List<BucketFill.Sample> samples) {
+        BucketFill.Sample out = null;
+        for (BucketFill.Sample s : samples) {
+            if (out == null || s.ts() < out.ts()) {
+                out = s;
+            }
+        }
+        return out;
+    }
+
+    /**
+     * The value at {@code ts} on the line from {@code a} to {@code b}; null when either is
+     * missing, not Good or not a number.
+     */
+    static Double lineAt(long ts, BucketFill.Sample a, BucketFill.Sample b) {
+        if (a == null || b == null || !a.good() || !b.good() || !(a.value() instanceof Number va)
+                || !(b.value() instanceof Number vb) || b.ts() <= a.ts()) {
+            return null;
+        }
+        double from = va.doubleValue();
+        return from + (vb.doubleValue() - from) * (ts - a.ts()) / (b.ts() - a.ts());
     }
 
     /**
@@ -1797,18 +2101,69 @@ public class FactryQueryEngine extends AbstractQueryEngine {
         Measurement m = lookUp ? measurementCache.findForRead(tagPath, grpcClient) : measurementCache.cachedForRead(tagPath);
         if (m != null) {
             return Optional.of(new FactryRecord(m.getUuid(), -1, path, m.getDatatype(),
-                    MeasurementCache.ignitionDataType(m), createdTime(m)));
+                    ignitionDataType(tagPath, tagPath, m), deadbandStyle(tagPath, tagPath, m), createdTime(m)));
         }
         ArrayPointMerger.ArrayRef ref = ArrayPointMerger.parseArrayPath(tagPath);
         Measurement base = ref == null ? null : lookUp
                 ? measurementCache.findForRead(ref.basePath, grpcClient)
                 : measurementCache.cachedForRead(ref.basePath);
         if (base != null && base.getDatatype().startsWith("[]")) {
-            String ignitionType = MeasurementCache.ignitionDataType(base);
+            String ignitionType = ignitionDataType(tagPath, ref.basePath, base);
             return Optional.of(new FactryRecord(base.getUuid(), ref.index, path, base.getDatatype().substring(2),
-                    ignitionType != null ? ignitionType.replaceFirst("Array$", "") : null, createdTime(base)));
+                    ignitionType != null ? ignitionType.replaceFirst("Array$", "") : null,
+                    deadbandStyle(tagPath, ref.basePath, base), createdTime(base)));
         }
         return Optional.empty();
+    }
+
+    /** The tag's Ignition data type: from the metadata this gateway has, else the measurement's setting. */
+    private String ignitionDataType(String tagPath, String writePath, Measurement m) {
+        return measurementCache.tagProperty(tagPath, writePath, m, grpcClient.getCollectorUUID(),
+                MeasurementCache.IGNITION_DATA_TYPE, MeasurementCache.IGNITION_DATA_TYPE_SETTING);
+    }
+
+    /**
+     * The tag's Deadband Style: from the metadata, which is current on the gateway that
+     * historizes the tag, else the measurement's setting, for other gateways and before the
+     * metadata arrives.
+     */
+    private String deadbandStyle(String tagPath, String writePath, Measurement m) {
+        return measurementCache.tagProperty(tagPath, writePath, m, grpcClient.getCollectorUUID(),
+                MeasurementCache.DEADBAND_STYLE, MeasurementCache.DEADBAND_STYLE_SETTING);
+    }
+
+    /**
+     * Tells Ignition each tag's Deadband Style, as Core's historian does, so the aggregates
+     * Ignition computes itself from raw points hold a discrete tag instead of interpolating it.
+     */
+    @Override
+    protected Optional<PropertySet> getProcessorProperties(HistoricalNode node) {
+        Optional<PropertySet> properties = super.getProcessorProperties(node);
+        if (node instanceof FactryRecord r && r.deadbandStyle().isPresent()) {
+            PropertySet set = properties.orElseGet(BasicPropertySet::new);
+            set.set(TagHistoryProps.HistoricalDeadbandStyle, r.deadbandStyle().get());
+            return Optional.of(set);
+        }
+        return properties;
+    }
+
+    /**
+     * How a pen fills buckets without samples: as the query asks, else (FillMode.DERIVED, which
+     * the charts and queryTagHistory send) by the tag, as Ignition's own historians do. Only
+     * LINEAR changes what the module returns; every other mode holds as before.
+     */
+    static FillMode fillMode(AggregatedQueryKey key, HistoricalNode node) {
+        FillMode asked = key.fillMode();
+        if (node instanceof FactryRecord r) {
+            DataType type = r.dataType().orElse(null);
+            if (type == DataType.String || type == DataType.Boolean || type == DataType.DateTime) {
+                return FillMode.PREV;
+            }
+            if (asked == null || asked == FillMode.DERIVED) {
+                return r.derivedFill();
+            }
+        }
+        return asked == null || asked == FillMode.DERIVED ? FillMode.PREV : asked;
     }
 
     private static Instant createdTime(Measurement m) {

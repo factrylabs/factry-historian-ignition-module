@@ -604,6 +604,10 @@ public class FactryHistoryProvider extends AbstractHistorian<FactryHistorianSett
         }
         writeHealth.connectionChecked(check);
         boolean connected = check.isOk();
+        if (!connected) {
+            // Factry may come back upgraded: read its version again before MigrateSettings.
+            measurementCache.forgetFactryVersion();
+        }
 
         // Toggle S&F sink: when Factry is down, stop accepting so points stay in pending.
         // When Factry is back, re-initialize so forwarding resumes.
@@ -659,6 +663,7 @@ public class FactryHistoryProvider extends AbstractHistorian<FactryHistorianSett
 
     /** {@link #connect}, unless a save replaced the settings meanwhile (STALE). */
     private Reconnect reconnect(FactryHistorianSettings current, String rawToken) {
+        measurementCache.forgetFactryVersion();
         synchronized (this) {
             if (current != settings) {
                 return Reconnect.STALE;
@@ -823,6 +828,11 @@ public class FactryHistoryProvider extends AbstractHistorian<FactryHistorianSett
             }
         } catch (Exception e) {
             logger.warn("Failed to refresh measurement cache: " + e.getMessage());
+        }
+        try {
+            measurementCache.syncTagSettings(grpcClient);
+        } catch (Exception e) {
+            logger.warn("Failed to store the settings derived from the tags: " + e.getMessage());
         }
     }
 

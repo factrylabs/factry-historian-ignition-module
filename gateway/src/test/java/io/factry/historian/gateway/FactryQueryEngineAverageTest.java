@@ -164,6 +164,8 @@ class FactryQueryEngineAverageTest {
     @Test
     void lastBucketStopsAtTheRangeEnd() {
         String u = factry.addMeasurement("default/a", "number");
+        // Discrete, so the empty buckets hold 100 (an analog tag's lie on a line, see AnalogFillTest).
+        factry.setSetting(u, MeasurementCache.DEADBAND_STYLE_SETTING, "Discrete");
         factry.add(u, t("07:00"), 100, "Good");
         factry.add(u, t("08:21"), 50, "Good");
         factry.add(u, t("08:23"), 0, "Bad");
@@ -241,6 +243,8 @@ class FactryQueryEngineAverageTest {
     @Test
     void rangeEndingInTheFuture_stopsAtNow() {
         String u = factry.addMeasurement("default/a", "number");
+        // Discrete, so the empty buckets hold 100 (an analog tag's lie on a line, see AnalogFillTest).
+        factry.setSetting(u, MeasurementCache.DEADBAND_STYLE_SETTING, "Discrete");
         factry.add(u, t("07:00"), 100, "Good");
         factry.add(u, t("08:22"), 0, "Good");
         FactryQueryEngine engine = engine();

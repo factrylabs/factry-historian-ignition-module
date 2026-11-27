@@ -12,6 +12,7 @@ import com.inductiveautomation.ignition.gateway.model.GatewayContext;
 
 import io.grpc.StatusRuntimeException;
 
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -81,8 +82,10 @@ public class FactryStorageEngine extends AbstractStorageEngine {
     protected StorageResult<MetadataPoint> doStoreMetadata(List<MetadataPoint> metadataPoints) {
         // Factry doesn't support updating metadata after creation, but we cache the
         // properties so they can be applied as initial values when a measurement is
-        // first created via MeasurementCache.getOrCreateUUID().
+        // first created via MeasurementCache.getOrCreateUUID(). The settings the module derives
+        // from it (data type, Deadband Style) are kept up to date on existing measurements.
         logger.debug("doStoreMetadata called with " + metadataPoints.size() + " points");
+        List<String> stored = new ArrayList<>();
         for (MetadataPoint point : metadataPoints) {
             String tagPath = TagPathUtil.storagePathToStoredPath(point.source().toString());
             com.inductiveautomation.ignition.common.config.PropertySet ps = point.value();
@@ -94,11 +97,22 @@ public class FactryStorageEngine extends AbstractStorageEngine {
                         properties.put(pv.getProperty().getName(), val.toString());
                     }
                 }
+                // With Include Metadata on, Ignition sends what it finds iterating the tag's config
+                // (AtomicHistoryActor.calculateMetadataToStore), which can leave a style at its
+                // default, Auto, out. Without this a change from Discrete back to
+                // Auto would keep Discrete, since the cache merges what it is given.
+                if (!properties.isEmpty() && !properties.containsKey(MeasurementCache.DEADBAND_STYLE)) {
+                    properties.put(MeasurementCache.DEADBAND_STYLE, "Auto");
+                }
                 if (!properties.isEmpty()) {
                     measurementCache.storeMetadata(tagPath, properties);
+                    stored.add(tagPath);
                 }
             }
         }
+        // Factry is asked nothing here, on the store-and-forward thread: the scheduler stores the
+        // settings derived from the metadata (MeasurementCache.syncTagSettings).
+        measurementCache.markSettingsPending(stored);
         return StorageResult.success(metadataPoints);
     }
 
