@@ -495,9 +495,11 @@ public class MeasurementCache {
      * numeric ones as numbers. LimitLo and LimitHi have no plain Ignition tag property equivalent
      * (those values live in alarm setpoints) and stay unset.
      *
-     * Every other property goes to the metadata map, which stays the channel for arbitrary extras:
-     * it is the only one that round-trips back on read, since the read-side Measurement proto has
-     * no 'attributes' field. On read, Config-derived engineeringSpecs wins over the metadata map.
+     * Every other property goes to the metadata map, which stays the channel for arbitrary extras.
+     * Factry stores it and returns it over REST, but on Factry Historian v8.2.3 and v8.2.4 the gRPC
+     * read calls (GetMeasurements, GetMeasurementsByFilter) leave Measurement.metadata empty, so
+     * these extras do not come back to Ignition. The read side still merges the map in case Factry
+     * starts returning it; Config-derived engineeringSpecs wins over it.
      */
     static CreateMeasurement buildCreateMeasurement(String tagPath, String dataType,
                                                     Map<String, String> metadata) {
