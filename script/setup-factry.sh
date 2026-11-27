@@ -10,21 +10,41 @@
 # default: the first one that is not the root organization).
 
 set -e
+# The cookie jar holds a session token and the saved collector token is a credential.
+umask 077
 cd "$(dirname "$0")/.."
 
 TOKEN_FILE="./script/.collector-token"
-COOKIE_FILE="/tmp/factry-setup-cookies.txt"
 COLLECTOR_NAME="${COLLECTOR_NAME:-Ignition}"
 FACTRY_URL="${FACTRY_URL:-http://localhost:8000}"
 
 WORK_DIR=$(mktemp -d)
 trap 'rm -rf "$WORK_DIR"' EXIT
+COOKIE_FILE="$WORK_DIR/cookies.txt"
 RESP_FILE="$WORK_DIR/response"
 
 # ── Helpers ───────────────────────────────────────────────────────
-# Prints an error with the HTTP status and stops.
+# Prints an error with the HTTP status and Factry's error text. Never the raw body: responses
+# can hold session or collector tokens.
 fail() {
     echo "ERROR: $1 (HTTP $HTTP_CODE)"
+    python3 -c "
+import json, re, sys
+raw = open(sys.argv[1], errors='replace').read()
+try:
+    d = json.loads(raw)
+except ValueError:
+    d = raw
+if isinstance(d, dict):
+    msg = ' '.join(str(d[k]) for k in ('title', 'error', 'detail', 'info') if d.get(k))
+elif isinstance(d, str):
+    msg = d
+else:
+    msg = ''
+msg = re.sub(r'eyJ[\w-]*\.[\w-]*\.[\w-]*', '<token removed>', msg).strip()
+if msg:
+    print('  Factry says: ' + msg[:300])
+" "$RESP_FILE" 2>/dev/null || true
     exit 1
 }
 
@@ -50,25 +70,29 @@ factry_api() {
 
 # ── Factry credentials ────────────────────────────────────────────
 echo "Factry Historian login required."
-read -p "  Username: " FACTRY_USER
-read -s -p "  Password: " FACTRY_PASS
+read -r -p "  Username: " FACTRY_USER
+read -r -s -p "  Password: " FACTRY_PASS
 echo ""
 
 # ── Login ─────────────────────────────────────────────────────────
-HTTP_CODE=$(curl -s -o /tmp/factry-login-resp.txt -w "%{http_code}" \
+# The body goes through stdin so the password never shows in the process list.
+: > "$RESP_FILE"
+HTTP_CODE=$(printf '%s\n%s' "$FACTRY_USER" "$FACTRY_PASS" | python3 -c "
+import json, sys
+user, password = sys.stdin.read().split('\n', 1)
+print(json.dumps({'Name': user, 'Password': password}))
+" | curl -s -o "$RESP_FILE" -w "%{http_code}" \
     -c "$COOKIE_FILE" \
     -H "Content-Type: application/json" \
-    -d "{\"Name\":\"${FACTRY_USER}\",\"Password\":\"${FACTRY_PASS}\"}" \
-    "${FACTRY_URL}/api/auth/local/login")
+    -d @- \
+    "${FACTRY_URL}/api/auth/local/login") || HTTP_CODE="000"
+unset FACTRY_PASS
 
 if [ "$HTTP_CODE" != "200" ]; then
-    echo "ERROR: Login failed (HTTP $HTTP_CODE)"
-    cat /tmp/factry-login-resp.txt 2>/dev/null
-    echo ""
-    exit 1
+    fail "Login to $FACTRY_URL failed"
 fi
 
-XSRF=$(grep XSRF "$COOKIE_FILE" | awk '{print $NF}')
+XSRF=$(grep XSRF "$COOKIE_FILE" | awk '{print $NF}') || true
 echo "Logged in to Factry."
 
 # ── Get organization UUID ─────────────────────────────────────────
@@ -124,8 +148,16 @@ echo "  Using TSDB: $TSDB_UUID"
 # ── Create collector ──────────────────────────────────────────────
 # Without a default database Factry leaves new measurements Discovered and stores nothing.
 echo "Creating collector '$COLLECTOR_NAME'..."
-factry_api POST "/collectors" \
-    "{\"Name\":\"${COLLECTOR_NAME}\",\"Description\":\"Ignition historian module\",\"DefaultDatabaseUUID\":\"${TSDB_UUID}\",\"Status\":\"Active\"}"
+BODY=$(COLLECTOR_NAME="$COLLECTOR_NAME" TSDB_UUID="$TSDB_UUID" python3 -c "
+import json, os
+print(json.dumps({
+    'Name': os.environ['COLLECTOR_NAME'],
+    'Description': 'Ignition historian module',
+    'DefaultDatabaseUUID': os.environ['TSDB_UUID'],
+    'Status': 'Active',
+}))
+")
+factry_api POST "/collectors" "$BODY"
 COLLECTOR_UUID=$(python3 -c "
 import json, sys
 print(json.load(open(sys.argv[1])).get('UUID', ''))
@@ -162,6 +194,3 @@ else
     echo "  before running this script again (the name is taken)."
     exit 1
 fi
-
-# Cleanup
-rm -f "$COOKIE_FILE" /tmp/factry-login-resp.txt
