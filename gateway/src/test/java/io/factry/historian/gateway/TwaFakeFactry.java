@@ -31,8 +31,9 @@ import java.util.regex.Pattern;
  * Average path uses: raw (grouped by status, end exclusive, limit per series, desc), {@code twa}
  * with fill "previous" (holds the value from before each bucket, weights the last bucket up to
  * the query end, leaves out buckets before the first sample, refuses group by and booleans, and
- * applies a {@code status} tag filter by exact match), and {@code last}/{@code count}/{@code mean}
- * per status with fill "none". Buckets start at the query start. The gRPC channel is never used.
+ * applies a {@code status} tag filter by exact match), and {@code last}/{@code count}/{@code mean}/
+ * {@code min}/{@code max}/{@code sum}/{@code spread}/{@code stddev} per status with fill "none".
+ * Buckets start at the query start. The gRPC channel is never used.
  */
 class TwaFakeFactry extends FactryGrpcClient {
 
@@ -64,6 +65,10 @@ class TwaFakeFactry extends FactryGrpcClient {
 
     void add(String uuid, long ts, double value, String status) {
         points.get(uuid).add(new Pt(ts, Value.newBuilder().setNumberValue(value).build(), status));
+    }
+
+    void add(String uuid, long ts, String value, String status) {
+        points.get(uuid).add(new Pt(ts, Value.newBuilder().setStringValue(value).build(), status));
     }
 
     void add(String uuid, long ts, boolean value, String status) {
@@ -232,6 +237,31 @@ class TwaFakeFactry extends FactryGrpcClient {
             case "mean":
                 return Value.newBuilder().setNumberValue(
                         in.stream().mapToDouble(p -> num(p.value())).average().orElseThrow()).build();
+            case "min":
+            case "max": {
+                Comparator<Value> order = in.get(0).value().hasStringValue()
+                        ? Comparator.comparing(Value::getStringValue)
+                        : Comparator.comparingDouble(TwaFakeFactry::num);
+                return fn.equals("min") ? in.stream().map(Pt::value).min(order).orElseThrow()
+                        : in.stream().map(Pt::value).max(order).orElseThrow();
+            }
+            case "stddev": {
+                // Sample standard deviation, as InfluxQL's STDDEV. For one sample Factry 8.2.3
+                // returns the bucket without a value (checked live).
+                if (in.size() < 2) {
+                    return Value.newBuilder().setNullValue(com.google.protobuf.NullValue.NULL_VALUE).build();
+                }
+                double mean = in.stream().mapToDouble(p -> num(p.value())).average().orElseThrow();
+                double ss = in.stream().mapToDouble(p -> Math.pow(num(p.value()) - mean, 2)).sum();
+                return Value.newBuilder().setNumberValue(Math.sqrt(ss / (in.size() - 1))).build();
+            }
+            case "sum":
+                return Value.newBuilder().setNumberValue(
+                        in.stream().mapToDouble(p -> num(p.value())).sum()).build();
+            case "spread":
+                return Value.newBuilder().setNumberValue(
+                        in.stream().mapToDouble(p -> num(p.value())).max().orElseThrow()
+                                - in.stream().mapToDouble(p -> num(p.value())).min().orElseThrow()).build();
             default:
                 throw Status.UNIMPLEMENTED.withDescription("fake has no aggregate " + fn).asRuntimeException();
         }
