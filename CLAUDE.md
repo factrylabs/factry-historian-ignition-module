@@ -2,6 +2,10 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Contributing
+
+Follow `CONTRIBUTING.md` for every branch, commit and pull request. It covers PR size, stacking, descriptions and test-first bug fixes.
+
 ## Project Overview
 
 This is the **Factry Historian Module** for Inductive Automation's Ignition platform. It's an Ignition SDK module that implements a custom historian with two main components:
