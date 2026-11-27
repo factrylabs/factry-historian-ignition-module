@@ -131,6 +131,8 @@ The single point of contact with Factry. Wraps a gRPC `ManagedChannel` and expos
 | `createPoints(Points)` | `CreatePoints` | Write time-series data |
 | `getMeasurements(MeasurementRequest)` | `GetMeasurements` | List all measurements |
 | `createMeasurements(CreateMeasurementsRequest)` | `CreateMeasurements` | Auto-onboard new measurements |
+| `migrateMeasurementSettings(list)` | `GetCollector`, then `MigrateSettings` | Store a tag's data type and Deadband Style on its existing measurement. Replaces each measurement's whole settings Struct and the collector's own settings, so the collector's current settings are read just before and sent along |
+| `getInfo()` | `GetInfo` | Factry's version, checked before `MigrateSettings` |
 | `queryTimeseries(QueryTimeseriesRequest)` | `QueryTimeseries` | Read raw or aggregated data |
 | `getAssets()` | `GetAssets` | List all assets |
 | `testConnection()` | `GetMeasurements` (lightweight) | Connection health check |
@@ -273,7 +275,16 @@ Extends `AbstractStorageEngine`. Receives data points from Ignition's tag system
 
 **`isEngineUnavailable()`** — returns `true` when the gRPC connection is down. This is how S&F knows to buffer instead of attempting writes.
 
-**`doStoreMetadata()`** / **`doStoreSourceChange()`** — no-ops. Metadata is managed on the Factry platform, not pushed from Ignition.
+**`doStoreMetadata()`**: caches each tag's metadata in `MeasurementCache` and marks the tag pending; it asks Factry nothing by itself. Metadata without a Deadband Style counts as Auto: with Include Metadata on, Ignition can leave a style at its default out. When the module creates a measurement for the tag, its description, engineering units and limits (the `Config` attributes) and the settings `ignitionDataType` (the tag's Ignition data type) and `ignitionDeadbandStyle` (its History Deadband Style) come from this cache. The cache keeps the metadata after the create.
+
+**Keeping the settings up to date** (`MeasurementCache.syncTagSettings`): the settings the module derives from a tag's metadata (`MeasurementCache.derivedSettings`: `ignitionDataType` and `ignitionDeadbandStyle`) are kept up to date on the measurement this collector writes the tag to. The style is stored as the concrete mode, as the SQL historian stores it (`InterpolationMode.getConcreteMode` for the tag's type, the element type for an array): Auto becomes Analog_Compressed for a Float and Discrete otherwise, so another gateway that does not know the type still reads it right. Ignition sends the style at every start and on every change of a tag's history configuration, even with Include Metadata off. After each 30 s cache refresh the scheduler compares each pending tag's derived settings with its measurement's and sends `MigrateSettings` for those that differ: at most 500 measurements per call and 2 calls per run. Safeguards:
+- Right before the calls, this collector's measurements are listed once with `GetMeasurementsByFilter` (collector filter, paged). Each entry is built from that fresh copy plus the derived settings, so a setting an operator changed in Factry is kept (the call replaces the whole Struct). If the listing fails, nothing is sent and the tags stay pending. A measurement the cache holds but the listing lacks stays pending; a tag whose measurement the cache no longer holds, or that is another collector's, is dropped.
+- Only Active and Paused measurements are sent. While the cache has not loaded, nothing is compared and the tags stay pending.
+- Only on a Factry version `MigrateSettings` was checked live on, v8.2.3 to v8.3.x (from `GetInfo`, asked before anything else). The version is read again after a failed connection check or a settings change.
+- After PermissionDenied (a proxy in front of Factry may refuse the call on purpose) or Unimplemented, no more calls are made until the profile restarts, logged once at INFO. Other failures are logged once per gRPC status code and tried again at the next run. A failure changes nothing else.
+- `MigrateSettings`, checked live on Factry v8.2.3 and v8.3.1: it replaces the collector's own settings with its field 1, and an unset field 1 wipes them, so the module reads them with `GetCollector` just before each call and sends them along. Each measurement's settings Struct is replaced, not merged. `updatedAt` does not move. The settings sent are kept over a cache refresh whose listing was read during the call.
+
+**`doStoreSourceChange()`** — no-op.
 
 ### `FactryQueryEngine.java`
 
@@ -486,7 +497,7 @@ FactryStorageEngine.doStoreAtomic(points)
 - **History renaming** — not supported by the Factry platform
 - **Extended scripting** (e.g. `system.factry.queryEvents`) — deferred until customer demand exists
 
-**Store metadata is a no-op:** `FactryStorageEngine.doStoreMetadata()` accepts the call and returns success, but does not forward metadata to Factry. Metadata (engineering units, limits, etc.) is managed on the Factry platform directly, not pushed from Ignition.
+**Metadata only seeds new measurements:** `FactryStorageEngine.doStoreMetadata()` caches the tag metadata, and it is applied when the module creates a measurement (description, engineering units and limits, `ignitionDataType` and `ignitionDeadbandStyle` settings). Later changes to a tag's metadata in Ignition are not pushed to an existing measurement, except the settings derived from it (`ignitionDataType`, `ignitionDeadbandStyle`, with `MigrateSettings`); edit the rest on the Factry platform.
 
 **Pagination:** The design document lists pagination as a provider requirement. In practice, there is no paginated use case — charts receive the full dataset and Jython scripts get a complete `DataSet` object. The gRPC proto does define `limit`/`offset` fields on `QueryTimeseriesRequest`, so pagination can be added if Factry ever imposes response size limits.
 
