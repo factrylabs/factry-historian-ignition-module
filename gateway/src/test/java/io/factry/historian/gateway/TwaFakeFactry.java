@@ -47,6 +47,10 @@ class TwaFakeFactry extends FactryGrpcClient {
     /** Answers larger than this fail like a gRPC message over the client's limit. */
     int maxAnswerBytes = Integer.MAX_VALUE;
 
+    /** Requests that match {@link #failWhen} fail with this status, when set. */
+    Status failWith = null;
+    java.util.function.Predicate<QueryTimeseriesRequest> failWhen = q -> true;
+
     TwaFakeFactry() {
         super("localhost", 1, "collector", "token", false, false, null);
     }
@@ -54,6 +58,27 @@ class TwaFakeFactry extends FactryGrpcClient {
     /** Adds a measurement ("number" or "boolean") and returns its UUID. */
     String addMeasurement(String name, String datatype) {
         return addMeasurement(Measurement.newBuilder().setName(name).setDatatype(datatype));
+    }
+
+    /** Adds a measurement whose ignitionDataType setting is {@code ignitionDataType} (e.g. "Float8"). */
+    String addMeasurement(String name, String datatype, String ignitionDataType) {
+        return addMeasurement(Measurement.newBuilder().setName(name).setDatatype(datatype)
+                .setSettings(Struct.newBuilder().putFields(MeasurementCache.IGNITION_DATA_TYPE_SETTING,
+                        Value.newBuilder().setStringValue(ignitionDataType).build())));
+    }
+
+    /** Sets a string setting of a measurement, keeping its other settings. */
+    void setSetting(String uuid, String name, String value) {
+        Measurement m = measurements.get(uuid);
+        measurements.put(uuid, m.toBuilder().setSettings(m.getSettings().toBuilder()
+                .putFields(name, Value.newBuilder().setStringValue(value).build())).build());
+    }
+
+    /** Adds a measurement of another collector, without settings. */
+    String addMeasurementOf(String collector, String name, String datatype) {
+        String uuid = addMeasurement(name, datatype);
+        measurements.put(uuid, measurements.get(uuid).toBuilder().setCollectorUUID(collector).build());
+        return uuid;
     }
 
     private String addMeasurement(Measurement.Builder m) {
@@ -103,6 +128,9 @@ class TwaFakeFactry extends FactryGrpcClient {
     @Override
     public QueryTimeseriesResponse queryTimeseries(QueryTimeseriesRequest request) {
         queries.add(request);
+        if (failWith != null && failWhen.test(request)) {
+            throw failWith.asRuntimeException();
+        }
         long start = Timestamps.toMillis(request.getStart());
         long end = request.hasEnd() ? Timestamps.toMillis(request.getEnd()) : Long.MAX_VALUE;
         boolean byStatus = request.getGroupByList().contains("status");

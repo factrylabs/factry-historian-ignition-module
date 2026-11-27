@@ -83,6 +83,9 @@ public class FactryQueryEngine extends AbstractQueryEngine {
     private final HistorianMetrics metrics;
     /** The current time; tests replace it. */
     LongSupplier now = System::currentTimeMillis;
+    /** Limits on the reads around empty buckets of an analog tag; tests lower them. */
+    int linearRawLimit = 10_000;
+    int linearRunsPerPen = 10;
 
     public FactryQueryEngine(
         GatewayContext context,
@@ -1198,6 +1201,11 @@ public class FactryQueryEngine extends AbstractQueryEngine {
         }
 
         return Optional.empty();
+    }
+
+    @Override
+    protected Optional<PropertySet> getProcessorProperties(HistoricalNode node) {
+        return super.getProcessorProperties(node);
     }
 
     private String lookupUUID(String tagPath) {
