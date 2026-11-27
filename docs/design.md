@@ -131,6 +131,8 @@ The single point of contact with Factry. Wraps a gRPC `ManagedChannel` and expos
 | `createPoints(Points)` | `CreatePoints` | Write time-series data |
 | `getMeasurements(MeasurementRequest)` | `GetMeasurements` | List all measurements |
 | `createMeasurements(CreateMeasurementsRequest)` | `CreateMeasurements` | Auto-onboard new measurements |
+| `migrateMeasurementSettings(list)` | `GetCollector`, then `MigrateSettings` | Store a tag's data type and Deadband Style on its existing measurement. Replaces each measurement's whole settings Struct and the collector's own settings, so the collector's current settings are read just before and sent along |
+| `getInfo()` | `GetInfo` | Factry's version, checked before `MigrateSettings` |
 | `queryTimeseries(QueryTimeseriesRequest)` | `QueryTimeseries` | Read raw or aggregated data |
 | `getAssets()` | `GetAssets` | List all assets |
 | `testConnection()` | `GetMeasurements` (lightweight) | Connection health check |
@@ -273,7 +275,16 @@ Extends `AbstractStorageEngine`. Receives data points from Ignition's tag system
 
 **`isEngineUnavailable()`** — returns `true` when the gRPC connection is down. This is how S&F knows to buffer instead of attempting writes.
 
-**`doStoreMetadata()`** / **`doStoreSourceChange()`** — no-ops. Metadata is managed on the Factry platform, not pushed from Ignition.
+**`doStoreMetadata()`**: caches each tag's metadata in `MeasurementCache` and marks the tag pending; it asks Factry nothing by itself. Metadata without a Deadband Style counts as Auto: with Include Metadata on, Ignition can leave a style at its default out. When the module creates a measurement for the tag, its description, engineering units and limits (the `Config` attributes) and the settings `ignitionDataType` (the tag's Ignition data type) and `ignitionDeadbandStyle` (its History Deadband Style) come from this cache. The cache keeps the metadata after the create.
+
+**Keeping the settings up to date** (`MeasurementCache.syncTagSettings`): the settings the module derives from a tag's metadata (`MeasurementCache.derivedSettings`: `ignitionDataType` and `ignitionDeadbandStyle`) are kept up to date on the measurement this collector writes the tag to. The style is stored as the concrete mode, as the SQL historian stores it (`InterpolationMode.getConcreteMode` for the tag's type, the element type for an array): Auto becomes Analog_Compressed for a Float and Discrete otherwise, so another gateway that does not know the type still reads it right. Ignition sends the style at every start and on every change of a tag's history configuration, even with Include Metadata off. After each 30 s cache refresh the scheduler compares each pending tag's derived settings with its measurement's and sends `MigrateSettings` for those that differ: at most 500 measurements per call and 2 calls per run. Safeguards:
+- Right before the calls, this collector's measurements are listed once with `GetMeasurementsByFilter` (collector filter, paged). Each entry is built from that fresh copy plus the derived settings, so a setting an operator changed in Factry is kept (the call replaces the whole Struct). If the listing fails, nothing is sent and the tags stay pending. A measurement the cache holds but the listing lacks stays pending; a tag whose measurement the cache no longer holds, or that is another collector's, is dropped.
+- Only Active and Paused measurements are sent. While the cache has not loaded, nothing is compared and the tags stay pending.
+- Only on a Factry version `MigrateSettings` was checked live on, v8.2.3 to v8.3.x (from `GetInfo`, asked before anything else). The version is read again after a failed connection check or a settings change.
+- After PermissionDenied (a proxy in front of Factry may refuse the call on purpose) or Unimplemented, no more calls are made until the profile restarts, logged once at INFO. Other failures are logged once per gRPC status code and tried again at the next run. A failure changes nothing else.
+- `MigrateSettings`, checked live on Factry v8.2.3 and v8.3.1: it replaces the collector's own settings with its field 1, and an unset field 1 wipes them, so the module reads them with `GetCollector` just before each call and sends them along. Each measurement's settings Struct is replaced, not merged. `updatedAt` does not move. The settings sent are kept over a cache refresh whose listing was read during the call.
+
+**`doStoreSourceChange()`** — no-op.
 
 ### `FactryQueryEngine.java`
 
@@ -293,7 +304,8 @@ Extends `AbstractQueryEngine`. Handles all data retrieval from Factry.
 
 | Ignition | Factry |
 |----------|--------|
-| Average, SimpleAverage | `mean` |
+| Average | `twa` with fill `previous`, over Good time only (see below) |
+| SimpleAverage | `mean` |
 | Minimum | `min` |
 | Maximum | `max` |
 | Sum | `sum` |
@@ -302,9 +314,26 @@ Extends `AbstractQueryEngine`. Handles all data retrieval from Factry.
 | Range | `spread` |
 | Variance | `variance` |
 | StdDev | `stddev` |
-| MinMax | queries `min` and `max` separately, emits pairs |
+| MinMax | queries `min` and `max` separately, a pair per bucket |
 
-- Time window → Go duration conversion (e.g., `TimeWindow(2h30m)` → `"2h30m0s"`)
+**Other aggregates (`BucketFill`)**: every aggregate except Average and Count gives every bucket a point, like Average does. Ignition fills a bucket without a point with a neighbouring value marked Good, so a Bad stretch, the time before the first sample and the empty buckets of a tag stored on change read a value that was never there (Good 7 at 10:00:05 and 8 at 10:00:45, LastValue in 10 s buckets, read `7, 8, 8, 8, 8, 8` instead of `7, 7, 7, 7, 8, 8`).
+- Good samples in the bucket: Factry's aggregate over those samples, grouped by status with only the Good series kept. A bucket with Good and Bad samples gives the value of its Good samples (LastValue: the last Good value). Several Good statuses in one bucket (`Good`, `GoodLocalOverride`; only data from other collectors has them, the module writes plain `Good`) give one point: the smallest minimum, the largest maximum, the summed sum. LastValue reads the last sample of each status before the bucket end to find the latest Good one. SimpleAverage, Range, Variance and StdDev cannot be combined from per-status values, so such a bucket gives the value of one status, marked Uncertain (the Power Chart shows it as a gap).
+- No samples, and the status held from before is Good: the value held, as Ignition's own aggregates take the value at the block start. Range is 0 there; Sum, Variance and StdDev have no value (Bad), as in Ignition's own functions.
+- Otherwise (only Bad or Uncertain samples, a status held that is not Good, before the first sample, and from now on): a Bad point without a value. MinMax gives each bucket a minimum and a maximum point, Bad ones too.
+- Requests per pen: Factry's `last` per status (which is the LastValue itself) says which statuses each bucket holds and the value held after it, plus the aggregate per status (two for MinMax). The last sample before a bucket is read when the range starts with empty buckets (once), after a bucket holding several statuses when an empty bucket follows, and for LastValue at the end of a bucket with several Good statuses: up to 10 such reads per pen. Past that an empty bucket after a bucket holding several statuses is Bad (a gap is safer than a guess), and such a LastValue is Uncertain.
+- A String tag has only LastValue and Count: Factry 8.2.3 refuses every other aggregate of a string measurement, so the engine answers them with `Bad_Unsupported` (Ignition shows it as `Bad_NotFound`) and they read null on every row.
+- Time window → Go duration conversion (e.g., `TimeWindow(2h30m)` → `"2h30m"`, 600 ms → `"600ms"`). The bucket length in milliseconds and the period string come from the same number.
+
+**Average (time-weighted, `GoodTimeAverage`)**:
+- Factry's `twa` is only right with fill `previous`: it then holds each value until the next sample, also from before the range. Its buckets start at the query start.
+- `twa` refuses group by, so Bad and Uncertain time is masked in the module. A `last` aggregate grouped by status and the last sample before the range tell per bucket: Good throughout → Factry's `twa`; not Good throughout → a Bad point without a value (null); status changes inside → the bucket's raw samples are averaged over Good time.
+- Raw reads have a budget per pen: 50,000 samples per request, 200,000 and 10 requests per pen, spent from the range end backwards so the most recent buckets are exact. Neighbouring buckets share a request. A `count` aggregate (only when some bucket needs raw samples) sizes the requests. When the status at a bucket start is unknown (the bucket before held several statuses and was not read), the last sample before it is read: always at the start of a raw request, and up to 10 times per pen for buckets outside one.
+- A bucket beyond the budget gets `twa` over the samples with status exactly `Good`, returned as Good (the Power Chart drops values that are not Good). It leaves Bad values out but holds the last Good value through Bad time and misses Good sub-statuses.
+- Requests per pen: 3 for a healthy tag (`twa`, `last`, sample before); at most 35 (plus `count`, up to 10 raw, 20 one-sample reads, 1 fallback). Raw samples: at most 200,000.
+- The range stops at now: the current bucket is weighted up to now, and buckets after now are Bad.
+- Every bucket gets a point. Ignition fills a bucket without a point with a neighbouring value marked Good (checked through its own query path, and live on 8.3.6), so an outage, the time before the first sample and the time after now would read as a held Good value. They are Bad points instead, which the Power Chart draws as gaps and `queryTagHistory` returns with Bad quality (a null reads as 0.0 in a Float column). Not NaN: the Power Chart streams history as strict JSON, which fails at a NaN.
+- Booleans: Factry's `twa` refuses them, so they are averaged from raw samples as the fraction of Good time true (true = 1). A `mean` per status replaces `twa`: a Good mean of exactly 0 or 1 means the bucket holds one value, so it needs no raw read when that is the value held. Beyond the budget: that `mean`, no extra request, returned as Uncertain because a sample mean can be far off for a Boolean stored on change (0.5 instead of 0.017 for a bit on 1 minute of the hour). The Power Chart draws Uncertain values as gaps; with neighbouring buckets sharing a request and on-change storage this should be rare. At most 34 requests. Factry 8.2.3 accepts `last`, `count`, `mean`, `min` and `max` on a Boolean. Average of a String tag is unsupported (see above).
+- Difference with Ignition's internal historian: the module leaves all Bad and Uncertain time out (the owner's choice) and holds the previous value until the next sample (steps). Ignition's own time-weighted average uses trapezoids between values and bridges Bad time inside a block, leaving out only Bad time at the block's start and end. So the numbers differ on ramps and across short Bad stretches.
 
 **`doBrowse(browseContext, publisher)`**:
 - Root level: publishes two category folders — "Measurements" and "Assets"
@@ -468,7 +497,7 @@ FactryStorageEngine.doStoreAtomic(points)
 - **History renaming** — not supported by the Factry platform
 - **Extended scripting** (e.g. `system.factry.queryEvents`) — deferred until customer demand exists
 
-**Store metadata is a no-op:** `FactryStorageEngine.doStoreMetadata()` accepts the call and returns success, but does not forward metadata to Factry. Metadata (engineering units, limits, etc.) is managed on the Factry platform directly, not pushed from Ignition.
+**Metadata only seeds new measurements:** `FactryStorageEngine.doStoreMetadata()` caches the tag metadata, and it is applied when the module creates a measurement (description, engineering units and limits, `ignitionDataType` and `ignitionDeadbandStyle` settings). Later changes to a tag's metadata in Ignition are not pushed to an existing measurement, except the settings derived from it (`ignitionDataType`, `ignitionDeadbandStyle`, with `MigrateSettings`); edit the rest on the Factry platform.
 
 **Pagination:** The design document lists pagination as a provider requirement. In practice, there is no paginated use case — charts receive the full dataset and Jython scripts get a complete `DataSet` object. The gRPC proto does define `limit`/`offset` fields on `QueryTimeseriesRequest`, so pagination can be added if Factry ever imposes response size limits.
 
