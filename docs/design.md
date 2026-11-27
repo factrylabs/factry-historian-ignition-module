@@ -133,7 +133,7 @@ The single point of contact with Factry. Wraps a gRPC `ManagedChannel` and expos
 | `createMeasurements(CreateMeasurementsRequest)` | `CreateMeasurements` | Auto-onboard new measurements |
 | `queryTimeseries(QueryTimeseriesRequest)` | `QueryTimeseries` | Read raw or aggregated data |
 | `getAssets()` | `GetAssets` | List all assets |
-| `testConnection()` | `GetMeasurements` (lightweight) | Connection health check |
+| `testConnection()` | `GetCollector` (5 s deadline) | Connection and token check; not `GetMeasurements`, which is too slow on large sites |
 
 **Key design points:**
 - **TLS modes**: plain text, TLS with bundled CA cert, TLS with insecure trust (skip verification), fallback to system trust store
@@ -249,7 +249,7 @@ Loads tuning values from `factry-historian.properties` (bundled in the .modl). T
 | Property | Default | Controls |
 |----------|---------|----------|
 | `grpc.write.deadline.seconds` | 3 | Timeout on `createPoints()` calls |
-| `status.cache.ms` | 30000 | How long to cache historian status (avoids gRPC poll on every UI refresh) |
+| `status.cache.ms` | 30000 | How often the connection check runs; it pauses S&F while Factry is unreachable and resumes it when it is back |
 | `measurement.cache.refresh.seconds` | 30 | How often to reload measurements from Factry |
 
 ---
@@ -366,10 +366,11 @@ Extends `AbstractHistorian<FactryHistorianSettings>`. The orchestrator that ties
    - Metrics logging (every 30s)
    - Measurement cache refresh (every 30s)
    - Quarantine retry (every 30s, S&F only)
+   - Connection check (every 30s, `GetCollector`): pauses the S&F sink while Factry is unreachable, resumes it when it is back
 
 **`getStorageEngine()`** — returns S&F bridge if configured, otherwise the direct storage engine
 
-**`getStatus()`** — cached gRPC health check (30s TTL)
+**`getStatus()`** — returns the result of the last scheduled connection check
 
 **`handleSettingsChange()`** — reconfigures gRPC client, refreshes cache, updates engines. No restart needed.
 

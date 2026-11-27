@@ -45,10 +45,9 @@ public class FactryHistoryProvider extends AbstractHistorian<FactryHistorianSett
     private ScheduledExecutorService scheduledExecutor;
     private volatile String sfEngineName;
 
-    /** Cached status to avoid hitting gRPC on every gateway UI poll. */
+    /** Last connection check result; refreshed on the scheduler, not by status polls. */
     private volatile ProfileStatus cachedStatus = ProfileStatus.UNKNOWN;
-    private volatile long statusCheckedAt = 0;
-    private static final long STATUS_CACHE_MS = ModuleProperties.getStatusCacheMs();
+    private static final long STATUS_CHECK_MS = ModuleProperties.getStatusCacheMs();
 
     public FactryHistoryProvider(GatewayContext context, String historianName, FactryHistorianSettings settings) {
         super(context, historianName);
@@ -177,6 +176,11 @@ public class FactryHistoryProvider extends AbstractHistorian<FactryHistorianSett
         scheduledExecutor.scheduleWithFixedDelay(
                 this::sendHealthUpdate, 0, 30, TimeUnit.SECONDS);
 
+        // Check the connection and pause or resume the S&F sink on a schedule. getStatus() is
+        // only called when someone opens the gateway UI, so it cannot be what resumes forwarding.
+        scheduledExecutor.scheduleWithFixedDelay(
+                this::checkConnection, STATUS_CHECK_MS, STATUS_CHECK_MS, TimeUnit.MILLISECONDS);
+
         // Prime the status cache now that the connection has just been exercised
         // (registerCollector + cache refresh above), so the gateway UI shows the
         // real status on its first poll instead of waiting for the cache to expire.
@@ -258,8 +262,8 @@ public class FactryHistoryProvider extends AbstractHistorian<FactryHistorianSett
             storageEngine.updateSettings(newSettings);
             this.settings = newSettings;
 
-            // Re-test against the new endpoint and refresh the cached status so the
-            // gateway UI reflects the change on its next poll, not up to STATUS_CACHE_MS later.
+            // Re-test against the new endpoint so the gateway UI reflects the change on its
+            // next poll, not up to STATUS_CHECK_MS later.
             refreshConnectionStatus();
 
             logger.info("Settings change applied successfully");
@@ -268,36 +272,32 @@ public class FactryHistoryProvider extends AbstractHistorian<FactryHistorianSett
             logger.error("Failed to apply settings change", e);
             // Reflect the failure immediately rather than serving a stale cached status.
             cachedStatus = ProfileStatus.ERRORED;
-            statusCheckedAt = System.currentTimeMillis();
             return false;
         }
     }
 
     @Override
     public ProfileStatus getStatus() {
-        if (!started) {
-            return ProfileStatus.UNKNOWN;
-        }
+        return started ? cachedStatus : ProfileStatus.UNKNOWN;
+    }
 
-        long now = System.currentTimeMillis();
-        if (now - statusCheckedAt < STATUS_CACHE_MS) {
-            return cachedStatus;
+    private void checkConnection() {
+        try {
+            refreshConnectionStatus();
+        } catch (Exception e) {
+            // An exception would cancel the scheduled task, and forwarding would never resume.
+            logger.warn("Connection check failed: " + e.getMessage());
         }
-
-        return refreshConnectionStatus();
     }
 
     /**
-     * Actively test the Factry connection, update the cached status and its
-     * timestamp, and toggle the S&F sink to match the connection state.
+     * Actively test the Factry connection, update the cached status, and toggle the S&F
+     * sink to match the connection state.
      * <p>
-     * Called lazily from {@link #getStatus()} when the cache expires, and
-     * eagerly right after startup and settings changes so the gateway UI
-     * reflects the new state on its very next poll instead of waiting out the
-     * {@link #STATUS_CACHE_MS} window (or showing a stale value for up to that long).
+     * Runs every {@link #STATUS_CHECK_MS} on the scheduler, and right after startup and
+     * settings changes so the gateway UI reflects the new state on its next poll.
      */
     private ProfileStatus refreshConnectionStatus() {
-        statusCheckedAt = System.currentTimeMillis();
         boolean connected = grpcClient.testConnection();
         cachedStatus = connected ? ProfileStatus.RUNNING : ProfileStatus.ERRORED;
 
@@ -376,14 +376,11 @@ public class FactryHistoryProvider extends AbstractHistorian<FactryHistorianSett
 
     private void retryQuarantinedData(String engineName) {
         try {
-            // Test connection and re-enable forwarding if the server is back
+            // checkConnection() re-enables forwarding once Factry is back; until then a retry
+            // would only fail again.
             if (!grpcClient.isConnected()) {
-                if (grpcClient.testConnection()) {
-                    logger.info("Factry server is reachable again, re-enabling S&F forwarding");
-                } else {
-                    logger.debug("Factry server still unreachable, S&F will keep buffering");
-                    return;
-                }
+                logger.debug("Factry server unreachable, not retrying quarantined data yet");
+                return;
             }
 
             Optional<QuarantineInterface<?>> qi =
