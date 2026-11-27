@@ -8,9 +8,11 @@ import com.inductiveautomation.historian.gateway.interop.TagHistoryStorageEngine
 import com.inductiveautomation.ignition.common.resourcecollection.ChangeOperation;
 import com.inductiveautomation.ignition.common.resourcecollection.Resource;
 import com.inductiveautomation.ignition.common.resourcecollection.ResourceBuilder;
+import com.inductiveautomation.ignition.gateway.config.ConfigurationManager;
 import com.inductiveautomation.ignition.gateway.model.GatewayContext;
 import com.inductiveautomation.ignition.gateway.model.ProfileStatus;
 import com.inductiveautomation.ignition.gateway.storeforward.StorageKey;
+import com.inductiveautomation.ignition.gateway.storeforward.StoreAndForwardManager;
 import com.inductiveautomation.ignition.gateway.storeforward.engine.EngineInformation;
 import com.inductiveautomation.ignition.gateway.storeforward.quarantine.QuarantineInterface;
 import com.inductiveautomation.ignition.gateway.storeforward.quarantine.QuarantinedDataInfo;
@@ -336,22 +338,27 @@ public class FactryHistoryProvider extends AbstractHistorian<FactryHistorianSett
      * Ignition's default engine settings).
      */
     private void ensureStoreAndForwardEngine(String engineName) {
-        Optional<EngineInformation> existing =
-                context.getStoreAndForwardManager().getEngineInformation(engineName, true);
+        ensureStoreAndForwardEngine(context.getConfigurationManager(), context.getStoreAndForwardManager(),
+                engineName, ENGINE_CREATE_TIMEOUT_MS);
+    }
+
+    private static final long ENGINE_CREATE_TIMEOUT_MS = 10_000;
+
+    enum EngineCreation { EXISTS, CREATED, CREATED_PENDING, FAILED }
+
+    static EngineCreation ensureStoreAndForwardEngine(ConfigurationManager configurationManager,
+                                                      StoreAndForwardManager storeAndForwardManager,
+                                                      String engineName, long timeoutMs) {
+        Optional<EngineInformation> existing = storeAndForwardManager.getEngineInformation(engineName, true);
         if (existing.isPresent()) {
             logger.debug("S&F engine '{}' already exists", engineName);
-            return;
+            return EngineCreation.EXISTS;
         }
 
         // Also check if a resource already exists (covers engines not yet started)
-        List<Resource> sfResources = context.getConfigurationManager()
-                .getResources(StoreAndForwardEngineSettings.getType());
-        for (Resource r : sfResources) {
-            if (r.getResourceName().equalsIgnoreCase(engineName)) {
-                logger.debug("S&F engine resource '{}' already exists (as '{}')",
-                        engineName, r.getResourceName());
-                return;
-            }
+        if (engineResourceExists(configurationManager, engineName)) {
+            logger.debug("S&F engine resource '{}' already exists", engineName);
+            return EngineCreation.EXISTS;
         }
 
         logger.info("S&F engine '{}' does not exist — creating it automatically", engineName);
@@ -366,12 +373,19 @@ public class FactryHistoryProvider extends AbstractHistorian<FactryHistorianSett
             Resource resource = builder.build();
 
             ChangeOperation createOp = ChangeOperation.newCreateOp(resource);
-            context.getConfigurationManager().push(List.of(createOp)).get(10, TimeUnit.SECONDS);
+            configurationManager.push(List.of(createOp)).get(timeoutMs, TimeUnit.MILLISECONDS);
 
             logger.info("S&F engine '{}' created successfully", engineName);
+            return EngineCreation.CREATED;
         } catch (Exception e) {
             logger.error("Failed to create S&F engine '{}' — store-and-forward may not work", engineName, e);
+            return EngineCreation.FAILED;
         }
+    }
+
+    private static boolean engineResourceExists(ConfigurationManager configurationManager, String engineName) {
+        return configurationManager.getResources(StoreAndForwardEngineSettings.getType()).stream()
+                .anyMatch(r -> r.getResourceName().equalsIgnoreCase(engineName));
     }
 
     private void retryQuarantinedData(String engineName) {
