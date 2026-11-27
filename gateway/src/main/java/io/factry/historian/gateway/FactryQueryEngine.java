@@ -58,6 +58,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.function.LongSupplier;
 
 public class FactryQueryEngine extends AbstractQueryEngine {
 
@@ -79,6 +80,8 @@ public class FactryQueryEngine extends AbstractQueryEngine {
     private final FactryGrpcClient grpcClient;
     private final MeasurementCache measurementCache;
     private final HistorianMetrics metrics;
+    /** The current time; tests replace it. */
+    LongSupplier now = System::currentTimeMillis;
 
     public FactryQueryEngine(
         GatewayContext context,

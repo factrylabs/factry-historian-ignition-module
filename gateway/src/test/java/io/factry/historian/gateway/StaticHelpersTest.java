@@ -19,8 +19,9 @@ class StaticHelpersTest {
     class ToFactryAggregateFunction {
 
         @Test
-        void average() {
-            assertEquals("mean", FactryQueryEngine.toFactryAggregateFunction("Average"));
+        void average_isTimeWeighted() {
+            // Ignition's "Average" is time-weighted; "SimpleAverage" is the mean of the samples.
+            assertEquals("twa", FactryQueryEngine.toFactryAggregateFunction("Average"));
         }
 
         @Test
